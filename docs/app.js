@@ -1,5 +1,16 @@
 import * as pdfjsLib from './vendor/pdfjs/pdf.min.mjs';
 import { PROVIDER_PRESETS } from './providers.js';
+import {
+  shouldTranslatePdfText,
+  protectInlineMath,
+  restoreMathPlaceholders,
+  cleanLatexMathInText,
+  isUntranslatedEcho,
+  isOverlayNoOp,
+  extractPdfParagraphs,
+  sampleParagraphColors,
+  refineMaxHeightWithCanvasInk
+} from './pdf-layout.mjs';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = './vendor/pdfjs/pdf.worker.min.mjs';
 
@@ -141,11 +152,6 @@ const DEFAULT_SETTINGS = {
 };
 
 const ZOOM_STEPS = [0.75, 0.85, 1.0, 1.15, 1.25, 1.5, 1.75];
-const SERIF_FONT_REGEX = /serif|times|garamond|georgia|mincho|cambria|palatino|cmr|charter|merriweather|baskerville|book|roman|caslon|minion|nimbusrom|computer\s*modern/i;
-const SANS_FONT_REGEX = /sans|arial|helvetica|calibri|roboto|inter|lato|open\s*sans|verdana|tahoma|gothic|cmss|nimbus\s*sans/i;
-const MONO_FONT_REGEX = /mono|courier|consolas|menlo|code|cmtt|inconsolata|fira\s*code|dejavusansmono/i;
-const BOLD_FONT_REGEX = /bold|black|heavy|semibold|demi|medi|bx\d/i;
-const BULLET_PREFIX_REGEX = /^(?:[•●▪▸►‣⁃◦–—\-*]|(?:\(?\d{1,3}[.)])|(?:[a-zA-Z][.)]\s))(?:\s|$)/;
 
 function hashText(str) {
   let h1 = 0x811c9dc5;
@@ -672,9 +678,10 @@ function buildStreamSystemPrompt(settings, title = '') {
     title ? `Document topic: ${String(title).slice(0, 120)}` : '',
     buildLanguageGuidance(lang),
     'Rules:',
-    '1. Keep code identifiers, math formulas, variables, URLs, and standard abbreviations (MAE, RMSE, AUC, LLM, API, Transformer) intact.',
+    '1. Keep atomic placeholders [[C0]] (code), [[M0]] (math/citations), [[L0]] (untranslatable link) verbatim; keep code identifiers, math formulas, variables, URLs, and standard abbreviations (MAE, RMSE, AUC, LLM, API, Transformer) intact.',
     '2. Output STRICT NDJSON: exactly ONE JSON object per line in the format {"i":0,"t":"..."} matching every input index `i`, in order.',
     '3. NO markdown code fences (no ```), NO surrounding array [...], NO extra commentary.',
+    '4. NEVER leave natural-language prose untranslated or echo the source text even if it starts with formulas or [[M0]] placeholders; ALWAYS translate all prose sentences into the target language.',
     glossarySection
   ].filter(Boolean).join('\n');
 }
@@ -830,7 +837,14 @@ function buildOpenAIRequestBody(settings, endpoint, messages, stream = true) {
   return body;
 }
 
-async function streamTranslateBatchWithCache(settings, items, docTitle, onItem, signal) {
+async function streamTranslateBatchWithCache(
+  settings,
+  items,
+  docTitle,
+  onItem,
+  signal,
+  { allowEchoRetry = true } = {}
+) {
   if (!items || items.length === 0) return;
 
   const cleanKey = sanitizeApiKey(settings.apiKey);
@@ -845,6 +859,7 @@ async function streamTranslateBatchWithCache(settings, items, docTitle, onItem, 
     throw err;
   }
 
+  const langInfo = resolveTargetLanguage(settings);
   const sig = buildCacheSignature(settings);
   const cacheKeys = items.map((it) => `${sig}::${it.key}`);
   const cachedHits = await cacheGetMany(cacheKeys);
@@ -853,7 +868,7 @@ async function streamTranslateBatchWithCache(settings, items, docTitle, onItem, 
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
     const hit = cachedHits.get(cacheKeys[i]);
-    if (hit) {
+    if (hit && !isUntranslatedEcho(item.text, hit, langInfo.id)) {
       onItem(item.key, hit, true);
     } else {
       uncachedItems.push(item);
@@ -893,6 +908,7 @@ async function streamTranslateBatchWithCache(settings, items, docTitle, onItem, 
 
   const emittedIndices = new Set();
   const toCache = [];
+  const echoedItems = [];
 
   const handleDecodedLine = (line) => {
     const entries = parseNdjsonLine(line);
@@ -900,8 +916,15 @@ async function streamTranslateBatchWithCache(settings, items, docTitle, onItem, 
       if (entry.idx >= 0 && entry.idx < uncachedItems.length && !emittedIndices.has(entry.idx)) {
         emittedIndices.add(entry.idx);
         const item = uncachedItems[entry.idx];
+        const isEcho = isUntranslatedEcho(item.text, entry.text, langInfo.id);
+        if (isEcho && allowEchoRetry) {
+          echoedItems.push(item);
+          continue;
+        }
         onItem(item.key, entry.text, false);
-        toCache.push({ key: `${sig}::${item.key}`, zh: entry.text });
+        if (!isEcho) {
+          toCache.push({ key: `${sig}::${item.key}`, zh: entry.text });
+        }
       }
     }
   };
@@ -915,53 +938,56 @@ async function streamTranslateBatchWithCache(settings, items, docTitle, onItem, 
     for (const line of String(fullText || '').split('\n')) {
       handleDecodedLine(line);
     }
-    if (toCache.length > 0) await cachePutMany(toCache);
-    updateCacheCountUI();
-    return;
-  }
+  } else {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let sseBuffer = '';
+    let ndjsonBuffer = '';
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let sseBuffer = '';
-  let ndjsonBuffer = '';
-
-  const processSseLine = (rawSseLine) => {
-    const line = rawSseLine.trim();
-    if (!line.startsWith('data:')) return;
-    const dataStr = line.slice(5).trim();
-    if (!dataStr || dataStr === '[DONE]') return;
-    try {
-      const chunkObj = JSON.parse(dataStr);
-      const delta = extractStreamTextDelta(settings.protocol, chunkObj);
-      if (delta) {
-        ndjsonBuffer += delta;
-        let nlIdx;
-        while ((nlIdx = ndjsonBuffer.indexOf('\n')) !== -1) {
-          const completeLine = ndjsonBuffer.slice(0, nlIdx);
-          ndjsonBuffer = ndjsonBuffer.slice(nlIdx + 1);
-          handleDecodedLine(completeLine);
+    const processSseLine = (rawSseLine) => {
+      const line = rawSseLine.trim();
+      if (!line.startsWith('data:')) return;
+      const dataStr = line.slice(5).trim();
+      if (!dataStr || dataStr === '[DONE]') return;
+      try {
+        const chunkObj = JSON.parse(dataStr);
+        const delta = extractStreamTextDelta(settings.protocol, chunkObj);
+        if (delta) {
+          ndjsonBuffer += delta;
+          let nlIdx;
+          while ((nlIdx = ndjsonBuffer.indexOf('\n')) !== -1) {
+            const completeLine = ndjsonBuffer.slice(0, nlIdx);
+            ndjsonBuffer = ndjsonBuffer.slice(nlIdx + 1);
+            handleDecodedLine(completeLine);
+          }
         }
-      }
-    } catch (_) {}
-  };
+      } catch (_) {}
+    };
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    sseBuffer += decoder.decode(value, { stream: true });
-    let nl;
-    while ((nl = sseBuffer.indexOf('\n')) !== -1) {
-      const sseLine = sseBuffer.slice(0, nl);
-      sseBuffer = sseBuffer.slice(nl + 1);
-      processSseLine(sseLine);
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      sseBuffer += decoder.decode(value, { stream: true });
+      let nl;
+      while ((nl = sseBuffer.indexOf('\n')) !== -1) {
+        const sseLine = sseBuffer.slice(0, nl);
+        sseBuffer = sseBuffer.slice(nl + 1);
+        processSseLine(sseLine);
+      }
     }
+    if (sseBuffer.trim()) processSseLine(sseBuffer);
+    if (ndjsonBuffer.trim()) handleDecodedLine(ndjsonBuffer);
   }
-  if (sseBuffer.trim()) processSseLine(sseBuffer);
-  if (ndjsonBuffer.trim()) handleDecodedLine(ndjsonBuffer);
 
   if (toCache.length > 0) {
     await cachePutMany(toCache);
     updateCacheCountUI();
+  }
+
+  if (echoedItems.length > 0 && allowEchoRetry && !signal?.aborted) {
+    await streamTranslateBatchWithCache(settings, echoedItems, docTitle, onItem, signal, {
+      allowEchoRetry: false
+    });
   }
 }
 
@@ -1074,6 +1100,8 @@ const state = {
 
   pages: new Map(),
   translations: new Map(),
+  mathPlaceholdersByKey: new Map(),
+  skippedEchoKeys: new Set(),
   cachedKeys: new Set(),
   lastError: '',
   lastErrorCode: '',
@@ -1149,6 +1177,17 @@ function showPdfStage(stage) {
   dom.pdfPagesContainer.hidden = stage !== 'pages';
 }
 
+function computeOverlayBox(para, viewport) {
+  const padX = para.isCompactLabel ? 1.5 : 2.5;
+  const padY = para.isCompactLabel ? 0.5 : 1.0;
+  const left = Math.max(0, para.x - padX);
+  const top = Math.max(0, para.y - padY);
+  const width = Math.min(viewport.width - left, para.w + padX * 2);
+  const minHeight = para.h + padY * 2;
+  const maxHeight = Math.max(minHeight, para.maxAllowedHeight + padY);
+  return { left, top, width, minHeight, maxHeight };
+}
+
 function updatePdfStatusBadge() {
   if (state.lastError) {
     setGlobalStatus('error', state.lastError);
@@ -1165,7 +1204,7 @@ function updatePdfStatusBadge() {
     if (pageRec.translationInFlight) active += 1;
     for (const para of pageRec.translatableParagraphs || []) {
       total += 1;
-      if (state.translations.has(para.key)) translated += 1;
+      if (state.translations.has(para.key) || state.skippedEchoKeys.has(para.key)) translated += 1;
     }
   }
   if (active > 0) {
@@ -1197,583 +1236,15 @@ function setPdfMode(nextMode) {
         for (const para of pageRec.translatableParagraphs || []) {
           const el = pageRec.overlayById.get(para.id);
           if (!el) continue;
-          const padX = 2.5;
-          const padY = 1.5;
-          const left = Math.max(0, para.x - padX);
-          const width = Math.min(pageRec.viewport.width - left, para.w + padX * 2);
-          const minHeight = para.h + padY * 2;
-          const maxHeight = Math.max(minHeight, para.maxAllowedHeight + padY);
-          fitOverlayTypography(el, para, maxHeight, width);
+          const box = computeOverlayBox(para, pageRec.viewport);
+          fitOverlayTypography(el, para, box.maxHeight, box.width);
         }
       }
     });
   }
 }
 
-function shouldTranslatePdfText(text, targetLangId, meta = {}) {
-  const clean = String(text || '').replace(/\s+/g, ' ').trim();
-  if (clean.length < 4) return false;
-  if (/^(?:https?:\/\/|www\.|mailto:|ftp:\/\/)\S+$/i.test(clean)) return false;
-  if (/^[\w.+-]+@[\w.-]+\.[a-z]{2,}$/i.test(clean)) return false;
-  if (/^(?:doi:|arxiv:)\S+$/i.test(clean)) return false;
-  if (/^[\d\s.,:%+\-–—/()[\]$€£¥°×]+$/.test(clean)) return false;
-  if (/^(?:page|p\.?|pp\.?)\s*\d+(?:\s*(?:of|\/)\s*\d+)?$/i.test(clean)) return false;
-  if (/^\d+\s*\/\s*\d+$/.test(clean)) return false;
-
-  const letters = clean.match(/\p{L}/gu) || [];
-  if (letters.length < 2) return false;
-
-  if (meta.isMono && /[=(){}[\];<>]|^\s*(?:def|class|import|from|return|const|let|var|for|while|if)\b/.test(clean)) {
-    return false;
-  }
-
-  const words = clean.match(/[a-zA-Z\p{L}]{2,}/gu) || [];
-  const mathSymbols = (clean.match(/[=≈≠≤≥<>±×÷∑∏∫√∞∂∇∈∉⊂⊃∪∩∀∃^_{}\\|]/g) || []).length;
-  if (mathSymbols >= 3 && mathSymbols / clean.length > 0.16 && words.length < 6) {
-    return false;
-  }
-
-  if (
-    !meta.isHeading &&
-    meta.lineCount === 1 &&
-    meta.widthRatio !== undefined &&
-    meta.widthRatio < 0.14 &&
-    words.length <= 2 &&
-    clean.length < 16
-  ) {
-    return false;
-  }
-
-  const letterTotal = letters.length;
-  const hanCount = (clean.match(/\p{Script=Han}/gu) || []).length;
-  const kanaCount = (clean.match(/[\u3040-\u309f\u30a0-\u30ff]/g) || []).length;
-  const hangulCount = (clean.match(/[\uac00-\ud7af\u1100-\u11ff\u3130-\u318f]/g) || []).length;
-  const target = String(targetLangId || 'zh-TW');
-
-  if (target === 'zh-TW' || target === 'zh-CN') {
-    if (kanaCount / letterTotal >= 0.12) return true;
-    if (hanCount / letterTotal >= 0.55) {
-      const latinWords = clean.match(/[a-zA-Z]{2,}/g) || [];
-      if (latinWords.length < 6) return false;
-    }
-  } else if (target === 'ja') {
-    if ((kanaCount + hanCount) / letterTotal >= 0.55 && kanaCount >= 2) return false;
-  } else if (target === 'ko') {
-    if (hangulCount / letterTotal >= 0.5) return false;
-  }
-
-  return true;
-}
-
-function detectFontMeta(fontName, styles) {
-  const style = styles?.[fontName] || null;
-  const combined = `${style?.fontFamily || ''} ${fontName || ''}`;
-  const isMono = MONO_FONT_REGEX.test(combined);
-  const isSerif = !isMono && SERIF_FONT_REGEX.test(combined) && !SANS_FONT_REGEX.test(combined);
-  const isBold = BOLD_FONT_REGEX.test(combined);
-  return { isSerif, isMono, isBold };
-}
-
-function joinLineSpans(spans) {
-  let out = '';
-  let prev = null;
-  for (const sp of spans) {
-    const str = sp.str;
-    if (!str) continue;
-    if (!prev) {
-      out = str;
-    } else {
-      const gap = sp.x - prev.right;
-      const avgFs = (sp.fontSize + prev.fontSize) * 0.5;
-      const prevEndsSpace = /\s$/.test(out);
-      const currStartsSpace = /^\s/.test(str);
-      const prevLastChar = out.trimEnd().slice(-1);
-      const currFirstChar = str.trimStart().slice(0, 1);
-      const bothCjk = /[\p{Script=Han}\u3040-\u30ff]/u.test(prevLastChar) &&
-        /[\p{Script=Han}\u3040-\u30ff]/u.test(currFirstChar);
-
-      if (prevEndsSpace || currStartsSpace) {
-        out = `${out.trimEnd()} ${str.trimStart()}`;
-      } else if (!bothCjk && gap > avgFs * 0.16) {
-        out = `${out} ${str}`;
-      } else {
-        out += str;
-      }
-    }
-    prev = sp;
-  }
-  return out.replace(/\s+/g, ' ').trim();
-}
-
-function joinParagraphLines(lines) {
-  let out = '';
-  for (let i = 0; i < lines.length; i++) {
-    const seg = lines[i].text.trim();
-    if (!seg) continue;
-    if (!out) {
-      out = seg;
-      continue;
-    }
-    if (/[a-zA-Z]-$/.test(out) && /^[a-z]/.test(seg)) {
-      out = out.slice(0, -1) + seg;
-    } else {
-      const prevLast = out.slice(-1);
-      const nextFirst = seg.slice(0, 1);
-      const bothCjk = /[\p{Script=Han}\u3040-\u30ff]/u.test(prevLast) &&
-        /[\p{Script=Han}\u3040-\u30ff]/u.test(nextFirst);
-      out = bothCjk ? out + seg : `${out} ${seg}`;
-    }
-  }
-  return out.replace(/\s+/g, ' ').trim();
-}
-
-function computeMedianFontSize(paragraphs) {
-  const weighted = paragraphs
-    .filter((p) => p.text.length >= 20)
-    .map((p) => ({ fs: p.fontSize, weight: p.text.length }));
-  const source = weighted.length > 0
-    ? weighted
-    : paragraphs.map((p) => ({ fs: p.fontSize, weight: Math.max(1, p.text.length) }));
-  if (source.length === 0) return 12;
-  source.sort((a, b) => a.fs - b.fs);
-  const totalWeight = source.reduce((acc, s) => acc + s.weight, 0);
-  let acc = 0;
-  for (const s of source) {
-    acc += s.weight;
-    if (acc >= totalWeight * 0.5) return s.fs;
-  }
-  return source[Math.floor(source.length / 2)].fs;
-}
-
-function orderParagraphsReadingOrder(paragraphs, pageWidth) {
-  if (paragraphs.length <= 1) return paragraphs;
-  const midX = pageWidth * 0.5;
-  const margin = Math.max(14, pageWidth * 0.03);
-  const byTop = [...paragraphs].sort((a, b) => (a.y - b.y) || (a.x - b.x));
-  const bands = [];
-  let currentBand = [];
-  const isSpanning = (p) => p.x < midX - margin && p.right > midX + margin && p.w > pageWidth * 0.52;
-
-  for (const p of byTop) {
-    if (isSpanning(p)) {
-      if (currentBand.length > 0) {
-        bands.push({ spanning: false, items: currentBand });
-        currentBand = [];
-      }
-      bands.push({ spanning: true, items: [p] });
-    } else {
-      currentBand.push(p);
-    }
-  }
-  if (currentBand.length > 0) bands.push({ spanning: false, items: currentBand });
-
-  const ordered = [];
-  for (const band of bands) {
-    if (band.spanning || band.items.length <= 1) {
-      ordered.push(...band.items);
-      continue;
-    }
-    const leftCol = [];
-    const rightCol = [];
-    const other = [];
-    for (const p of band.items) {
-      if (p.right <= midX + margin) leftCol.push(p);
-      else if (p.x >= midX - margin) rightCol.push(p);
-      else other.push(p);
-    }
-    if (leftCol.length > 0 && rightCol.length > 0 && other.length === 0) {
-      leftCol.sort((a, b) => a.y - b.y);
-      rightCol.sort((a, b) => a.y - b.y);
-      ordered.push(...leftCol, ...rightCol);
-    } else {
-      band.items.sort((a, b) => (a.y - b.y) || (a.x - b.x));
-      ordered.push(...band.items);
-    }
-  }
-  return ordered;
-}
-
-function extractPdfParagraphs(textContent, viewport) {
-  const rawItems = textContent?.items || [];
-  const styles = textContent?.styles || {};
-  if (rawItems.length === 0) return [];
-
-  const spans = [];
-  for (const item of rawItems) {
-    if (!item || typeof item.str !== 'string') continue;
-    const trimmed = item.str.trim();
-    if (!trimmed) continue;
-    if (!Array.isArray(item.transform) || item.transform.length < 6) continue;
-
-    const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
-    const angle = Math.atan2(tx[1], tx[0]);
-    if (Math.abs(angle) > 0.25) continue;
-
-    const fontSize = Math.hypot(tx[2], tx[3]) || Math.hypot(tx[0], tx[1]) || (item.height * viewport.scale) || 12;
-    if (!Number.isFinite(fontSize) || fontSize < 4.5 * viewport.scale) continue;
-
-    const x = tx[4];
-    const baselineY = tx[5];
-    let w = (item.width || 0) * viewport.scale;
-    if (!Number.isFinite(w) || w <= 0) {
-      w = trimmed.length * fontSize * 0.52;
-    }
-    const h = Math.max(fontSize * 1.14, (item.height || 0) * viewport.scale);
-    const top = baselineY - fontSize * 0.88;
-    const bottom = baselineY + fontSize * 0.24;
-
-    if (x + w < 0 || x > viewport.width || bottom < 0 || top > viewport.height) continue;
-
-    const fontMeta = detectFontMeta(item.fontName, styles);
-    spans.push({
-      str: item.str,
-      charLen: trimmed.length,
-      x,
-      right: x + w,
-      w,
-      top,
-      bottom,
-      h,
-      baselineY,
-      fontSize,
-      ...fontMeta
-    });
-  }
-
-  if (spans.length === 0) return [];
-
-  spans.sort((a, b) => (a.baselineY - b.baselineY) || (a.x - b.x));
-  const rows = [];
-  for (const sp of spans) {
-    let matchedRow = null;
-    for (let i = rows.length - 1; i >= 0; i--) {
-      const row = rows[i];
-      const tol = 0.45 * Math.min(row.avgFontSize, sp.fontSize);
-      if (Math.abs(sp.baselineY - row.baselineY) <= tol) {
-        matchedRow = row;
-        break;
-      }
-      if (sp.baselineY - row.baselineY > Math.max(row.avgFontSize, sp.fontSize) * 1.2) break;
-    }
-    if (matchedRow) {
-      const prevW = matchedRow.weight;
-      const nextW = prevW + sp.charLen;
-      matchedRow.baselineY = (matchedRow.baselineY * prevW + sp.baselineY * sp.charLen) / nextW;
-      matchedRow.avgFontSize = (matchedRow.avgFontSize * prevW + sp.fontSize * sp.charLen) / nextW;
-      matchedRow.weight = nextW;
-      matchedRow.spans.push(sp);
-    } else {
-      rows.push({
-        baselineY: sp.baselineY,
-        avgFontSize: sp.fontSize,
-        weight: sp.charLen,
-        spans: [sp]
-      });
-    }
-  }
-
-  const lines = [];
-  for (const row of rows) {
-    row.spans.sort((a, b) => a.x - b.x);
-    let segSpans = [row.spans[0]];
-
-    const flushSegment = (group) => {
-      const text = joinLineSpans(group);
-      if (!text) return;
-      let minX = Infinity;
-      let maxRight = -Infinity;
-      let minTop = Infinity;
-      let maxBottom = -Infinity;
-      let totalWeight = 0;
-      let fsSum = 0;
-      let baselineSum = 0;
-      let serifWeight = 0;
-      let boldWeight = 0;
-      let monoWeight = 0;
-
-      for (const s of group) {
-        if (s.x < minX) minX = s.x;
-        if (s.right > maxRight) maxRight = s.right;
-        if (s.top < minTop) minTop = s.top;
-        if (s.bottom > maxBottom) maxBottom = s.bottom;
-        totalWeight += s.charLen;
-        fsSum += s.fontSize * s.charLen;
-        baselineSum += s.baselineY * s.charLen;
-        if (s.isSerif) serifWeight += s.charLen;
-        if (s.isBold) boldWeight += s.charLen;
-        if (s.isMono) monoWeight += s.charLen;
-      }
-
-      lines.push({
-        text,
-        x: minX,
-        right: maxRight,
-        w: Math.max(1, maxRight - minX),
-        top: minTop,
-        bottom: maxBottom,
-        h: Math.max(1, maxBottom - minTop),
-        baselineY: baselineSum / totalWeight,
-        fontSize: fsSum / totalWeight,
-        weight: totalWeight,
-        isSerif: serifWeight > totalWeight * 0.5,
-        isBold: boldWeight > totalWeight * 0.5,
-        isMono: monoWeight > totalWeight * 0.6
-      });
-    };
-
-    for (let i = 1; i < row.spans.length; i++) {
-      const prev = segSpans[segSpans.length - 1];
-      const curr = row.spans[i];
-      const gap = curr.x - prev.right;
-      const maxFs = Math.max(prev.fontSize, curr.fontSize);
-      const fsRatioDiff = Math.abs(prev.fontSize - curr.fontSize) / maxFs;
-      const shouldSplit =
-        gap > 1.5 * maxFs ||
-        (gap > 1.15 * maxFs && fsRatioDiff > 0.25);
-
-      if (shouldSplit) {
-        flushSegment(segSpans);
-        segSpans = [curr];
-      } else {
-        segSpans.push(curr);
-      }
-    }
-    flushSegment(segSpans);
-  }
-
-  lines.sort((a, b) => (a.top - b.top) || (a.x - b.x));
-  const rawParagraphs = [];
-
-  for (const line of lines) {
-    let bestPara = null;
-    let bestGap = Infinity;
-
-    for (let i = rawParagraphs.length - 1; i >= 0; i--) {
-      const p = rawParagraphs[i];
-      const avgFs = (p.fontSize + line.fontSize) * 0.5;
-      const vGap = line.top - p.bottom;
-      if (vGap > 1.65 * avgFs || vGap < -0.55 * avgFs) continue;
-      if (line.baselineY - p.lastBaselineY < 0.45 * avgFs) continue;
-
-      const fsDiff = Math.abs(line.fontSize - p.fontSize) / Math.max(line.fontSize, p.fontSize);
-      if (fsDiff > 0.20) continue;
-
-      const overlap = Math.min(line.right, p.right) - Math.max(line.x, p.x);
-      const minW = Math.min(line.w, p.w);
-      const leftDiff = Math.abs(line.x - p.x);
-      const centerDiff = Math.abs((line.x + line.right) * 0.5 - (p.x + p.right) * 0.5);
-      const sameColumn =
-        (overlap > 0 && (overlap >= 0.22 * minW || leftDiff <= 2.4 * avgFs)) ||
-        centerDiff <= 2.2 * avgFs;
-      if (!sameColumn) continue;
-
-      const widthRatio = Math.max(line.w, p.w) / Math.max(1, minW);
-      if (widthRatio > 2.2 && leftDiff > 4.0 * avgFs && centerDiff > 2.5 * avgFs) continue;
-      if (BULLET_PREFIX_REGEX.test(line.text)) continue;
-      if (p.isMono !== line.isMono) continue;
-      if (p.isBold !== line.isBold && p.lines.length === 1 && p.w < viewport.width * 0.65) continue;
-
-      const lastLine = p.lines[p.lines.length - 1];
-      if (line.x - p.x > 1.25 * avgFs && lastLine.right < p.right - 1.8 * avgFs) continue;
-      if (
-        p.lines.length >= 2 &&
-        lastLine.w < p.w * 0.72 &&
-        /[.?!。？！:]$/.test(lastLine.text) &&
-        vGap > 0.35 * avgFs
-      ) {
-        continue;
-      }
-
-      let blocked = false;
-      for (let j = i + 1; j < rawParagraphs.length; j++) {
-        const other = rawParagraphs[j];
-        const xOver = Math.min(other.right, Math.max(line.right, p.right)) - Math.max(other.x, Math.min(line.x, p.x));
-        if (xOver > avgFs && other.y >= p.bottom - 2 && other.bottom <= line.top + 2) {
-          blocked = true;
-          break;
-        }
-      }
-      if (blocked) continue;
-
-      if (vGap < bestGap) {
-        bestGap = vGap;
-        bestPara = p;
-      }
-    }
-
-    if (bestPara) {
-      bestPara.lines.push(line);
-      bestPara.x = Math.min(bestPara.x, line.x);
-      bestPara.right = Math.max(bestPara.right, line.right);
-      bestPara.w = bestPara.right - bestPara.x;
-      bestPara.y = Math.min(bestPara.y, line.top);
-      bestPara.bottom = Math.max(bestPara.bottom, line.bottom);
-      bestPara.h = bestPara.bottom - bestPara.y;
-      bestPara.lastBaselineY = line.baselineY;
-
-      const nextW = bestPara.weight + line.weight;
-      bestPara.fontSize = (bestPara.fontSize * bestPara.weight + line.fontSize * line.weight) / nextW;
-      bestPara.serifWeight += line.isSerif ? line.weight : 0;
-      bestPara.boldWeight += line.isBold ? line.weight : 0;
-      bestPara.monoWeight += line.isMono ? line.weight : 0;
-      bestPara.weight = nextW;
-      bestPara.isSerif = bestPara.serifWeight > nextW * 0.5;
-      bestPara.isBold = bestPara.boldWeight > nextW * 0.5;
-      bestPara.isMono = bestPara.monoWeight > nextW * 0.6;
-    } else {
-      rawParagraphs.push({
-        lines: [line],
-        x: line.x,
-        right: line.right,
-        w: line.w,
-        y: line.top,
-        bottom: line.bottom,
-        h: line.h,
-        lastBaselineY: line.baselineY,
-        fontSize: line.fontSize,
-        weight: line.weight,
-        serifWeight: line.isSerif ? line.weight : 0,
-        boldWeight: line.isBold ? line.weight : 0,
-        monoWeight: line.isMono ? line.weight : 0,
-        isSerif: line.isSerif,
-        isBold: line.isBold,
-        isMono: line.isMono
-      });
-    }
-  }
-
-  const finalized = rawParagraphs.map((p) => {
-    const text = joinParagraphLines(p.lines);
-    let avgLineHeightRatio = 1.32;
-    if (p.lines.length >= 2) {
-      let deltaSum = 0;
-      for (let i = 1; i < p.lines.length; i++) {
-        deltaSum += Math.max(p.fontSize, p.lines[i].baselineY - p.lines[i - 1].baselineY);
-      }
-      avgLineHeightRatio = (deltaSum / (p.lines.length - 1)) / Math.max(1, p.fontSize);
-      avgLineHeightRatio = Math.max(1.18, Math.min(1.55, avgLineHeightRatio));
-    }
-    return {
-      text,
-      key: hashText(text),
-      x: p.x,
-      y: p.y,
-      right: p.right,
-      bottom: p.bottom,
-      w: p.w,
-      h: p.h,
-      fontSize: p.fontSize,
-      avgLineHeightRatio,
-      lineCount: p.lines.length,
-      isSerif: p.isSerif,
-      isBold: p.isBold,
-      isMono: p.isMono,
-      isHeading: false,
-      maxAllowedHeight: p.h + 4
-    };
-  });
-
-  const medianFs = computeMedianFontSize(finalized);
-  const ordered = orderParagraphsReadingOrder(finalized, viewport.width);
-
-  for (let i = 0; i < ordered.length; i++) {
-    const p = ordered[i];
-    p.isHeading =
-      (p.fontSize >= 1.22 * medianFs && p.lineCount <= 3 && p.text.length <= 220) ||
-      (p.isBold && p.fontSize >= 1.08 * medianFs && p.lineCount <= 2 && p.text.length <= 120 && !/[.,;]$/.test(p.text));
-
-    let nearestBelowY = viewport.height - 6;
-    for (let j = 0; j < ordered.length; j++) {
-      if (i === j) continue;
-      const other = ordered[j];
-      if (other.y < p.bottom - 2) continue;
-      const xOverlap = Math.min(p.right, other.right) - Math.max(p.x, other.x);
-      if (xOverlap > 4 && other.y < nearestBelowY) {
-        nearestBelowY = other.y;
-      }
-    }
-    const availableGap = Math.max(0, nearestBelowY - p.bottom);
-    const extraAllowance = Math.min(availableGap * 0.72, Math.max(4, p.fontSize * 0.85));
-    p.maxAllowedHeight = p.h + 3 + extraAllowance;
-  }
-
-  return ordered;
-}
-
-// Single ctx.getImageData per page perimeter color sampling
-function computeLuminance(r, g, b) {
-  const srgb = [r, g, b].map((v) => {
-    const c = v / 255;
-    return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
-  });
-  return 0.2126 * srgb[0] + 0.7152 * srgb[1] + 0.0722 * srgb[2];
-}
-
-function contrastRatio(lumA, lumB) {
-  const lighter = Math.max(lumA, lumB);
-  const darker = Math.min(lumA, lumB);
-  return (lighter + 0.05) / (darker + 0.05);
-}
-
-function medianValue(arr) {
-  if (!arr.length) return 255;
-  const sorted = arr.slice().sort((a, b) => a - b);
-  return sorted[Math.floor(sorted.length / 2)];
-}
-
-function sampleParagraphColors(pageImageData, para, cssWidth, cssHeight, canvasWidth, canvasHeight) {
-  if (!pageImageData || !pageImageData.data) {
-    return { bg: '#ffffff', fg: '#111827', isDarkBg: false };
-  }
-  const data = pageImageData.data;
-  const scaleX = canvasWidth / Math.max(1, cssWidth);
-  const scaleY = canvasHeight / Math.max(1, cssHeight);
-  const clampX = (px) => Math.max(0, Math.min(canvasWidth - 1, Math.round(px)));
-  const clampY = (py) => Math.max(0, Math.min(canvasHeight - 1, Math.round(py)));
-
-  const leftPx = para.x * scaleX;
-  const rightPx = para.right * scaleX;
-  const topPx = para.y * scaleY;
-  const bottomPx = para.bottom * scaleY;
-  const pad = Math.max(2, Math.round(2.5 * scaleX));
-
-  const points = [];
-  for (let i = 0; i <= 8; i++) {
-    const t = i / 8;
-    const px = leftPx + (rightPx - leftPx) * t;
-    points.push([clampX(px), clampY(topPx - pad)]);
-    points.push([clampX(px), clampY(bottomPx + pad)]);
-  }
-  for (let i = 1; i < 5; i++) {
-    const t = i / 5;
-    const py = topPx + (bottomPx - topPx) * t;
-    points.push([clampX(leftPx - pad), clampY(py)]);
-    points.push([clampX(rightPx + pad), clampY(py)]);
-  }
-
-  const rs = [];
-  const gs = [];
-  const bs = [];
-  for (const [px, py] of points) {
-    const offset = (py * canvasWidth + px) * 4;
-    if (data[offset + 3] < 20) continue;
-    rs.push(data[offset]);
-    gs.push(data[offset + 1]);
-    bs.push(data[offset + 2]);
-  }
-  if (rs.length === 0) return { bg: '#ffffff', fg: '#111827', isDarkBg: false };
-
-  const r = medianValue(rs);
-  const g = medianValue(gs);
-  const b = medianValue(bs);
-  const bgLum = computeLuminance(r, g, b);
-  const isDarkBg = contrastRatio(bgLum, computeLuminance(248, 250, 252)) > contrastRatio(bgLum, computeLuminance(17, 24, 39));
-  return {
-    bg: `rgb(${r}, ${g}, ${b})`,
-    fg: isDarkBg ? '#f8fafc' : '#111827',
-    isDarkBg
-  };
-}
+// PDF extraction/math/sampling helpers live in ./pdf-layout.mjs
 
 function fitOverlayTypography(el, para, maxHeight, boxWidth) {
   const startScale = para.isHeading ? 0.96 : 0.94;
@@ -1804,13 +1275,19 @@ function fitOverlayTypography(el, para, maxHeight, boxWidth) {
 function renderParagraphOverlay(pageRec, para, zh) {
   if (!pageRec.overlayLayer || !pageRec.viewport) return;
   const langInfo = resolveTargetLanguage(state.settings);
-  const padX = 2.0;
-  const padY = 1.2;
-  const left = Math.max(0, para.x - padX);
-  const top = Math.max(0, para.y - padY);
-  const width = Math.min(pageRec.viewport.width - left, para.w + padX * 2);
-  const minHeight = para.h + padY * 2;
-  const maxHeight = Math.max(minHeight, para.maxAllowedHeight + padY);
+  const cleanedZh = cleanLatexMathInText(zh);
+  const targetLangId = state.settings?.targetLang || 'zh-TW';
+
+  if (isUntranslatedEcho(para.text, cleanedZh, targetLangId) || isOverlayNoOp(para.text, cleanedZh)) {
+    const staleEl = pageRec.overlayById.get(para.id);
+    if (staleEl) {
+      staleEl.remove();
+      pageRec.overlayById.delete(para.id);
+    }
+    return;
+  }
+
+  const box = computeOverlayBox(para, pageRec.viewport);
 
   let el = pageRec.overlayById.get(para.id);
   if (!el) {
@@ -1819,27 +1296,30 @@ function renderParagraphOverlay(pageRec, para, zh) {
     el.dataset.paraId = String(para.id);
     el.addEventListener('click', (e) => {
       e.stopPropagation();
-      toggleComparePopover(el, para, state.translations.get(para.key) || zh);
+      toggleComparePopover(el, para, state.translations.get(para.key) || cleanedZh);
     });
     pageRec.overlayLayer.appendChild(el);
     pageRec.overlayById.set(para.id, el);
   }
 
   const colors = para.colors || { bg: '#ffffff', fg: '#111827', isDarkBg: false };
-  el.textContent = zh;
-  el.style.left = `${left.toFixed(1)}px`;
-  el.style.top = `${top.toFixed(1)}px`;
-  el.style.width = `${width.toFixed(1)}px`;
-  el.style.minHeight = `${minHeight.toFixed(1)}px`;
+  el.textContent = cleanedZh;
+  el.style.left = `${box.left.toFixed(1)}px`;
+  el.style.top = `${box.top.toFixed(1)}px`;
+  el.style.width = `${box.width.toFixed(1)}px`;
+  el.style.minHeight = `${box.minHeight.toFixed(1)}px`;
   el.style.backgroundColor = colors.bg;
   el.style.color = colors.fg;
   el.style.fontFamily = para.isSerif ? langInfo.serifFontStack : langInfo.sansFontStack;
   el.style.fontWeight = (para.isBold || para.isHeading) ? '700' : '400';
+  el.style.textAlign = (para.lineCount === 1 && para.isCentered && (para.isHeading || para.isBold)) ? 'center' : '';
+  el.classList.toggle('is-dark-bg', Boolean(colors.isDarkBg));
+  el.classList.toggle('is-compact-label', Boolean(para.isCompactLabel));
 
   if (state.pdfMode !== 'overlay') {
     pageRec.needsOverlayRefit = true;
   } else {
-    fitOverlayTypography(el, para, maxHeight, width);
+    fitOverlayTypography(el, para, box.maxHeight, box.width);
   }
 }
 
@@ -1881,12 +1361,12 @@ function updateSplitParagraph(pageRec, para, zh) {
   const pEl = pageRec.splitElById.get(para.id);
   if (!pEl) return;
   const langInfo = resolveTargetLanguage(state.settings);
-  pEl.textContent = zh;
+  pEl.textContent = cleanLatexMathInText(zh);
   pEl.classList.remove('is-pending');
   pEl.style.fontFamily = para.isSerif ? langInfo.serifFontStack : langInfo.sansFontStack;
 
   const doneCount = pageRec.translatableParagraphs.reduce(
-    (acc, item) => acc + (state.translations.has(item.key) ? 1 : 0),
+    (acc, item) => acc + ((state.translations.has(item.key) || state.skippedEchoKeys.has(item.key)) ? 1 : 0),
     0
   );
   const total = pageRec.translatableParagraphs.length;
@@ -1962,7 +1442,10 @@ async function translatePageParagraphs(pageRec, epoch) {
       isHeading: para.isHeading,
       isMono: para.isMono,
       lineCount: para.lineCount,
-      widthRatio: para.w / Math.max(1, viewportWidth)
+      widthRatio: para.w / Math.max(1, viewportWidth),
+      mathFontRatio: para.mathFontRatio,
+      isCentered: para.isCentered,
+      endsWithEqNum: para.endsWithEqNum
     })
   );
 
@@ -1984,12 +1467,29 @@ async function translatePageParagraphs(pageRec, epoch) {
   }
 
   const uncachedByKey = new Map();
+  const reqKeyToParaKey = new Map();
   for (const para of translatable) {
     const existing = state.translations.get(para.key);
     if (existing) {
       applyTranslationToPage(pageRec, para.key, existing);
-    } else if (!uncachedByKey.has(para.key)) {
-      uncachedByKey.set(para.key, { key: para.key, text: para.text });
+      continue;
+    }
+    if (state.skippedEchoKeys.has(para.key)) {
+      const pEl = pageRec.splitElById.get(para.id);
+      if (pEl) pEl.classList.remove('is-pending');
+      continue;
+    }
+    const protectedRes = protectInlineMath(para.text);
+    para.mathPlaceholders = protectedRes.placeholders;
+    if (protectedRes.placeholders.size > 0) {
+      state.mathPlaceholdersByKey.set(para.key, protectedRes.placeholders);
+    }
+    if (!uncachedByKey.has(para.key)) {
+      const reqKey = protectedRes.placeholders.size > 0
+        ? `${para.key}_m${hashText(protectedRes.text)}`
+        : para.key;
+      reqKeyToParaKey.set(reqKey, para.key);
+      uncachedByKey.set(para.key, { key: reqKey, text: protectedRes.text });
     }
   }
 
@@ -2007,14 +1507,53 @@ async function translatePageParagraphs(pageRec, epoch) {
   const controller = new AbortController();
   state.activeAbortControllers.add(controller);
 
-  const onItemArrived = (key, zh, cached) => {
+  const markEchoSettledOnPages = (key) => {
+    for (const p of state.pages.values()) {
+      const matched = p.paragraphsByKey.get(key);
+      if (!matched) continue;
+      for (const mp of matched) {
+        const sEl = p.splitElById.get(mp.id);
+        if (sEl) sEl.classList.remove('is-pending');
+      }
+      const done = p.translatableParagraphs.reduce(
+        (acc, it) => acc + ((state.translations.has(it.key) || state.skippedEchoKeys.has(it.key)) ? 1 : 0),
+        0
+      );
+      if (p.splitStatusEl) {
+        const total = p.translatableParagraphs.length;
+        p.splitStatusEl.textContent = done >= total ? `已完成 ${total} 段` : `翻譯中 ${done} / ${total}`;
+      }
+    }
+  };
+
+  const onItemArrived = (reqKey, zh, cached) => {
     if (epoch !== state.translationEpoch) return;
-    state.translations.set(key, zh);
+    const key = reqKeyToParaKey.get(reqKey) || reqKey;
+    let samplePara = pageRec.paragraphsByKey.get(key)?.[0] || null;
+    if (!samplePara) {
+      for (const other of state.pages.values()) {
+        const hit = other.paragraphsByKey.get(key)?.[0];
+        if (hit) {
+          samplePara = hit;
+          break;
+        }
+      }
+    }
+    const placeholders = state.mathPlaceholdersByKey.get(key) || samplePara?.mathPlaceholders;
+    const restored = restoreMathPlaceholders(zh, placeholders);
+    const cleanZh = cleanLatexMathInText(restored);
+    if (samplePara && isUntranslatedEcho(samplePara.text, cleanZh, targetLangId)) {
+      state.skippedEchoKeys.add(key);
+      markEchoSettledOnPages(key);
+      updatePdfStatusBadge();
+      return;
+    }
+    state.translations.set(key, cleanZh);
     if (cached) state.cachedKeys.add(key);
-    applyTranslationToPage(pageRec, key, zh);
+    applyTranslationToPage(pageRec, key, cleanZh);
     for (const other of state.pages.values()) {
       if (other !== pageRec && other.paragraphsByKey.has(key)) {
-        applyTranslationToPage(other, key, zh);
+        applyTranslationToPage(other, key, cleanZh);
       }
     }
     updatePdfStatusBadge();
@@ -2106,7 +1645,11 @@ async function renderAndTranslatePage(pageNum, { forceCanvas = false } = {}) {
       const textContent = await pdfPage.getTextContent();
       if (renderSeq !== pageRec.renderSeq || loadToken !== state.docLoadToken) return;
 
-      const paragraphs = extractPdfParagraphs(textContent, viewport);
+      const paragraphs = extractPdfParagraphs(textContent, viewport, {
+        commonObjs: pdfPage.commonObjs,
+        transformFn: pdfjsLib.Util.transform,
+        hashFn: hashText
+      });
       for (let i = 0; i < paragraphs.length; i++) {
         paragraphs[i].id = `p${pageNum}_${i}`;
         paragraphs[i].colors = sampleParagraphColors(
@@ -2118,6 +1661,14 @@ async function renderAndTranslatePage(pageNum, { forceCanvas = false } = {}) {
           canvas.height
         );
       }
+      refineMaxHeightWithCanvasInk(
+        pageImageData,
+        paragraphs,
+        viewport.width,
+        viewport.height,
+        canvas.width,
+        canvas.height
+      );
 
       pageRec.allParagraphs = paragraphs;
       pageRec.overlayLayer.replaceChildren();
@@ -2130,7 +1681,10 @@ async function renderAndTranslatePage(pageNum, { forceCanvas = false } = {}) {
             isHeading: para.isHeading,
             isMono: para.isMono,
             lineCount: para.lineCount,
-            widthRatio: para.w / Math.max(1, viewport.width)
+            widthRatio: para.w / Math.max(1, viewport.width),
+            mathFontRatio: para.mathFontRatio,
+            isCentered: para.isCentered,
+            endsWithEqNum: para.endsWithEqNum
           })
         );
         pageRec.paragraphsByKey.clear();
@@ -2139,6 +1693,7 @@ async function renderAndTranslatePage(pageNum, { forceCanvas = false } = {}) {
             pageRec.paragraphsByKey.set(para.key, []);
           }
           pageRec.paragraphsByKey.get(para.key).push(para);
+          para.mathPlaceholders = state.mathPlaceholdersByKey.get(para.key) || protectInlineMath(para.text).placeholders;
           const zh = state.translations.get(para.key);
           if (zh) renderParagraphOverlay(pageRec, para, zh);
         }
@@ -2315,6 +1870,8 @@ async function openPdfFromArrayBuffer(arrayBuffer, { title, sourceUrl = '' }) {
   }
 
   state.translations.clear();
+  state.mathPlaceholdersByKey.clear();
+  state.skippedEchoKeys.clear();
   state.cachedKeys.clear();
   state.lastError = '';
   state.docTitle = title || 'PDF Document';
@@ -2578,6 +2135,8 @@ function resetAndRetranslatePdf() {
   abortAllActiveRequests();
   closeComparePopover();
   state.translations.clear();
+  state.mathPlaceholdersByKey.clear();
+  state.skippedEchoKeys.clear();
   state.cachedKeys.clear();
   state.totalParagraphs = 0;
   state.translatedParagraphs = 0;

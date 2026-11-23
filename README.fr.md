@@ -2,7 +2,7 @@
 
 [English](README.md) · [繁體中文](README.zh-TW.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · [Español](README.es.md) · **Français** · [Deutsch](README.de.md)
 
-**NativeRead (v2.6.0)** est une extension de navigateur Manifest V3 et une PWA mobile qui traduit les pages web, les PDF, les commentaires de code et les infographies intégrées tout en préservant la typographie et la mise en page d'origine. Elle reste silencieuse par défaut, s'exécute à la demande avec votre propre clé API LLM et diffuse les traductions paragraphe par paragraphe sans interrompre le rythme de lecture.
+**NativeRead (v2.6.1)** est une extension de navigateur Manifest V3 et une PWA mobile qui traduit les pages web, les PDF, les commentaires de code et les infographies intégrées tout en préservant la typographie et la mise en page d'origine. Elle reste silencieuse par défaut, s'exécute à la demande avec votre propre clé API LLM et diffuse les traductions paragraphe par paragraphe sans interrompre le rythme de lecture.
 
 ---
 
@@ -208,7 +208,8 @@ native-read/
 ├── manifest.json                 # Manifeste MV3, source de vérité de la version, permissions, commande Alt+T
 ├── shared/
 │   ├── config.js                 # Paramètres Schema v5, registre de 32 fournisseurs (PROVIDER_PRESETS), configuration de réflexion, utilitaires URL/PDF
-│   └── cache-db.js               # Cache LRU IndexedDB kct_cache_db_v2 à 20 000 entrées
+│   ├── cache-db.js               # Cache LRU IndexedDB kct_cache_db_v2 à 20 000 entrées
+│   └── pdf-layout.mjs            # Moteur pur de géométrie PDF, protection math/LaTeX, détection serif Computer Modern et anti-écho
 ├── background/
 │   └── service-worker.js         # Injecteur dynamique, streamer SSE/NDJSON, limiteur 429, moteur Vision, garde #nr_sync
 ├── content/

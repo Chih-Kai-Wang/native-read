@@ -157,6 +157,47 @@ function buildRoleAndTopicLines(pageContext) {
 const PLACEHOLDER_PRESERVE_RULE =
   '1. Keep atomic placeholders [[C0]] (code), [[M0]] (math/citations), [[L0]] (untranslatable link) verbatim; paired tags [[A0]]…[[/A0]] (link) and [[S0]]…[[/S0]] (bold/italic/emphasis) must each appear exactly once, wrapping the TRANSLATED words that correspond to the original wrapped words, properly nested, never translated, renamed, re-numbered, or removed; do not add tags that were not in the input.';
 
+function isUntranslatedEcho(sourceText, translatedText, targetLangId = 'zh-TW') {
+  const stripTokens = (s) =>
+    String(s || '')
+      .replace(/\[\[\s*\/?[CMLAS]\d*\s*\]\]/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+  const cleanSrc = stripTokens(sourceText);
+  const cleanTrans = stripTokens(translatedText);
+  if (!cleanSrc || !cleanTrans) return false;
+
+  const srcLatinWords = cleanSrc.match(/[A-Za-z]{3,}/g) || [];
+  if (srcLatinWords.length < 6) return false;
+
+  const srcLowerProseWords = cleanSrc.match(/\b[a-z]{3,}\b/g) || [];
+  if (srcLowerProseWords.length < 3) return false;
+
+  const target = String(targetLangId || 'zh-TW');
+  if (target === 'zh-TW' || target === 'zh-CN') {
+    const hanCount = (cleanTrans.match(/\p{Script=Han}/gu) || []).length;
+    if (hanCount === 0) return true;
+    if (srcLatinWords.length >= 12 && hanCount < 3) return true;
+    return false;
+  }
+  if (target === 'ja') {
+    const jpCount = (cleanTrans.match(/[\p{Script=Han}\u3040-\u309f\u30a0-\u30ff]/gu) || []).length;
+    if (srcLatinWords.length >= 8 && jpCount < 2) return true;
+    return false;
+  }
+  if (target === 'ko') {
+    const koCount = (cleanTrans.match(/[\uac00-\ud7af\u1100-\u11ff\u3130-\u318f]/gu) || []).length;
+    if (srcLatinWords.length >= 8 && koCount < 2) return true;
+    return false;
+  }
+
+  if (srcLatinWords.length >= 10 && cleanTrans.toLowerCase() === cleanSrc.toLowerCase()) {
+    return true;
+  }
+  return false;
+}
+
 function buildSystemPrompt(settings, pageContext) {
   const lang = resolveTargetLanguage(settings);
   const { roleLine, topicLine } = buildRoleAndTopicLines(pageContext);
@@ -171,6 +212,7 @@ function buildSystemPrompt(settings, pageContext) {
     '2. Keep code identifiers, package/class/function names, URLs, and standard abbreviations (MAE, RMSE, AUC, CV, SQL, API) intact.',
     '3. For `"kind":"comment"`, keep the leading `# ` prefix and return only the concise translated comment text.',
     '4. Output ONLY valid JSON: {"translations":[{"id":0,"zh":"..."},...]} matching all input ids.',
+    '5. NEVER leave natural-language prose untranslated or echo the source text even if it starts with formulas or [[M0]] placeholders; ALWAYS translate all prose sentences into the target language.',
     glossarySection
   ].filter(Boolean).join('\n');
 }
@@ -190,6 +232,7 @@ function buildStreamSystemPrompt(settings, pageContext) {
     '3. For `"kind":"comment"`, keep the leading `# ` prefix and return only the concise translated comment text.',
     '4. Output STRICT NDJSON: exactly ONE JSON object per line in the format {"i":0,"t":"..."} matching every input index `i`, in order.',
     '5. NO markdown code fences (no ```), NO surrounding array [...], NO wrapper object, NO extra text.',
+    '6. NEVER leave natural-language prose untranslated or echo the source text even if it starts with formulas or [[M0]] placeholders; ALWAYS translate all prose sentences into the target language.',
     glossarySection
   ].filter(Boolean).join('\n');
 }
@@ -1402,7 +1445,7 @@ async function translateItemsWithFallback(settings, items, pageContext = null, e
 
     for (let idx = 0; idx < items.length; idx++) {
       const zh = byId.get(idx);
-      if (zh) {
+      if (zh && !isUntranslatedEcho(items[idx].text, zh, lang.id)) {
         mapped[items[idx].key] = zh;
       } else {
         missing.push(items[idx]);
@@ -1499,7 +1542,7 @@ async function translateItemsWithFallback(settings, items, pageContext = null, e
     const single = items[0];
     const singleRule = single.kind === 'comment'
       ? `You are a Python & technical translator. Translate this single-line # comment into ${lang.promptName}. Preserve the leading "# " prefix and output only the translated comment line.`
-      : `You are a web & technical translator. Translate the user text into ${lang.promptName}. Keep atomic placeholders [[C0]] (code), [[M0]] (math/citations), [[L0]] (untranslatable link) verbatim; paired tags [[A0]]…[[/A0]] (link) and [[S0]]…[[/S0]] (bold/italic/emphasis) must each appear exactly once wrapping the translated words corresponding to the original wrapped words, properly nested, never translated/renamed/re-numbered/removed, without adding new tags; output only the translation.`;
+      : `You are a web & technical translator. Translate the user text into ${lang.promptName}. Keep atomic placeholders [[C0]] (code), [[M0]] (math/citations), [[L0]] (untranslatable link) verbatim; paired tags [[A0]]…[[/A0]] (link) and [[S0]]…[[/S0]] (bold/italic/emphasis) must each appear exactly once wrapping the translated words corresponding to the original wrapped words, properly nested, never translated/renamed/re-numbered/removed, without adding new tags; ALWAYS translate all natural-language prose even if mixed with formulas or [[M0]] placeholders (never echo untranslated source prose); output only the translation.`;
     const plain = await callLLMChat(
       settings,
       [
@@ -1536,6 +1579,7 @@ async function handleTranslateBatch(items, pageContext = null) {
     };
   }
 
+  const lang = resolveTargetLanguage(settings);
   const sig = buildCacheSignature(settings, pageContext);
   const cacheKeys = items.map((item) => `${sig}::${item.key}`);
   const cachedMap = await CacheDB.getMany(cacheKeys);
@@ -1546,7 +1590,11 @@ async function handleTranslateBatch(items, pageContext = null) {
   for (const item of items) {
     const cacheKey = `${sig}::${item.key}`;
     const cachedZh = cachedMap.get(cacheKey);
-    if (typeof cachedZh === 'string' && cachedZh.trim()) {
+    if (
+      typeof cachedZh === 'string' &&
+      cachedZh.trim() &&
+      !isUntranslatedEcho(item.text, cachedZh, lang.id)
+    ) {
       results[item.key] = { zh: cachedZh, cached: true };
     } else {
       uncached.push({ ...item, cacheKey });
@@ -1562,7 +1610,9 @@ async function handleTranslateBatch(items, pageContext = null) {
         const zh = translatedMap[item.key];
         if (zh) {
           results[item.key] = { zh, cached: false };
-          toPersist.push({ key: item.cacheKey, zh });
+          if (!isUntranslatedEcho(item.text, zh, lang.id)) {
+            toPersist.push({ key: item.cacheKey, zh });
+          }
         }
       }
       if (toPersist.length > 0) {
@@ -2472,6 +2522,7 @@ chrome.runtime.onConnect.addListener((port) => {
           return;
         }
 
+        const lang = resolveTargetLanguage(settings);
         const sig = buildCacheSignature(settings, pageContext);
         const cacheKeys = items.map((item) => `${sig}::${item.key}`);
         const cachedMap = await CacheDB.getMany(cacheKeys);
@@ -2485,7 +2536,11 @@ chrome.runtime.onConnect.addListener((port) => {
         for (const item of items) {
           const cacheKey = `${sig}::${item.key}`;
           const cachedZh = cachedMap.get(cacheKey);
-          if (typeof cachedZh === 'string' && cachedZh.trim()) {
+          if (
+            typeof cachedZh === 'string' &&
+            cachedZh.trim() &&
+            !isUntranslatedEcho(item.text, cachedZh, lang.id)
+          ) {
             translatedCount += 1;
             safePost({
               type: 'ITEM',
@@ -2512,12 +2567,18 @@ chrome.runtime.onConnect.addListener((port) => {
         });
 
         const emittedKeys = new Set();
-        const emitItem = (item, text) => {
+        const emitItem = (item, text, { allowEcho = false } = {}) => {
           const cleanZh = String(text || '').trim();
           if (!cleanZh || emittedKeys.has(item.key)) return;
+          const isEcho = isUntranslatedEcho(item.text, cleanZh, lang.id);
+          if (isEcho && !allowEcho) {
+            return;
+          }
           emittedKeys.add(item.key);
           translatedCount += 1;
-          toPersist.push({ key: item.cacheKey, zh: cleanZh });
+          if (!isEcho) {
+            toPersist.push({ key: item.cacheKey, zh: cleanZh });
+          }
           safePost({
             type: 'ITEM',
             requestId,
@@ -2575,7 +2636,7 @@ chrome.runtime.onConnect.addListener((port) => {
           for (const item of remaining) {
             const zh = fallbackMap[item.key];
             if (zh) {
-              emitItem(item, zh);
+              emitItem(item, zh, { allowEcho: true });
             }
           }
         }

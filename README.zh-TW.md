@@ -2,7 +2,7 @@
 
 [English](README.md) · **繁體中文** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · [Español](README.es.md) · [Français](README.fr.md) · [Deutsch](README.de.md)
 
-**NativeRead（v2.6.0）** 是一款 Manifest V3 瀏覽器擴充功能與行動版 PWA，可翻譯網頁、PDF、程式碼註解與嵌入式資訊圖表，同時完整保留原始頁面字體與排版。它預設保持靜默，僅在使用者主動觸發時透過自備的 LLM API 金鑰運作，並逐段串流輸出譯文，不中斷閱讀節奏。
+**NativeRead（v2.6.1）** 是一款 Manifest V3 瀏覽器擴充功能與行動版 PWA，可翻譯網頁、PDF、程式碼註解與嵌入式資訊圖表，同時完整保留原始頁面字體與排版。它預設保持靜默，僅在使用者主動觸發時透過自備的 LLM API 金鑰運作，並逐段串流輸出譯文，不中斷閱讀節奏。
 
 ---
 
@@ -208,7 +208,8 @@ native-read/
 ├── manifest.json                 # MV3 manifest、版本號單一來源、權限與 Alt+T 快捷鍵
 ├── shared/
 │   ├── config.js                 # Schema v5 設定、32 家供應商登錄表（PROVIDER_PRESETS）、思考參數、URL/PDF 工具
-│   └── cache-db.js               # IndexedDB kct_cache_db_v2（20,000 筆 LRU 快取）
+│   ├── cache-db.js               # IndexedDB kct_cache_db_v2（20,000 筆 LRU 快取）
+│   └── pdf-layout.mjs            # 純 PDF 幾何排版、公式／LaTeX 數學保護、Computer Modern 襯線偵測與防回音模組
 ├── background/
 │   └── service-worker.js         # 動態注入器、SSE/NDJSON 串流、429 限流、視覺引擎、#nr_sync 防護
 ├── content/

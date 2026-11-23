@@ -2,7 +2,7 @@
 
 [English](README.md) · [繁體中文](README.zh-TW.md) · **简体中文** · [日本語](README.ja.md) · [한국어](README.ko.md) · [Español](README.es.md) · [Français](README.fr.md) · [Deutsch](README.de.md)
 
-**NativeRead (v2.6.0)** 是一款基于 Manifest V3 的浏览器扩展程序与移动端 PWA，可在保留原始页面排版与布局的前提下，翻译网页、PDF、代码注释及嵌入式信息图。它默认保持静默，仅在需要时使用你自己的 LLM API 密钥按需运行，并逐段流式输出译文，不打断阅读节奏。
+**NativeRead (v2.6.1)** 是一款基于 Manifest V3 的浏览器扩展程序与移动端 PWA，可在保留原始页面排版与布局的前提下，翻译网页、PDF、代码注释及嵌入式信息图。它默认保持静默，仅在需要时使用你自己的 LLM API 密钥按需运行，并逐段流式输出译文，不打断阅读节奏。
 
 ---
 
@@ -208,7 +208,8 @@ native-read/
 ├── manifest.json                 # MV3 清单、版本号唯一来源、权限、Alt+T 快捷键
 ├── shared/
 │   ├── config.js                 # Schema v5 设置、32 个提供商注册表（PROVIDER_PRESETS）、思考配置、URL/PDF 辅助函数
-│   └── cache-db.js               # IndexedDB kct_cache_db_v2 20,000 条目 LRU 缓存
+│   ├── cache-db.js               # IndexedDB kct_cache_db_v2 20,000 条目 LRU 缓存
+│   └── pdf-layout.mjs            # 纯 PDF 几何布局、公式/LaTeX 数学保护、Computer Modern 衬线检测与防回音模块
 ├── background/
 │   └── service-worker.js         # 动态注入器、SSE/NDJSON 流式器、429 限流器、视觉引擎、#nr_sync 校验
 ├── content/

@@ -1,10 +1,11 @@
-const CACHE_NAME = 'nativeread-pwa-v2.6.0';
+const CACHE_NAME = 'nativeread-pwa-v2.6.1';
 
 const APP_SHELL_ASSETS = [
   './',
   './index.html',
   './app.css',
   './app.js',
+  './pdf-layout.mjs',
   './providers.js',
   './manifest.webmanifest',
   './nativeread.user.js',

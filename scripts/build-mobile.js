@@ -1428,9 +1428,10 @@ function main() {
 
   ensureDir(DOCS_DIR);
 
-  // 1. Copy vendor/pdfjs/* -> docs/vendor/pdfjs/ and icons/* -> docs/icons/
+  // 1. Copy vendor/pdfjs/* -> docs/vendor/pdfjs/, icons/* -> docs/icons/, and shared/pdf-layout.mjs -> docs/pdf-layout.mjs
   copyDirectory(path.join(ROOT, 'vendor', 'pdfjs'), path.join(DOCS_DIR, 'vendor', 'pdfjs'));
   copyDirectory(path.join(ROOT, 'icons'), path.join(DOCS_DIR, 'icons'));
+  fs.copyFileSync(path.join(ROOT, 'shared', 'pdf-layout.mjs'), path.join(DOCS_DIR, 'pdf-layout.mjs'));
 
   // 2. Write docs/.nojekyll so GitHub Pages serves .mjs and all assets without Jekyll filtering
   fs.writeFileSync(path.join(DOCS_DIR, '.nojekyll'), '', 'utf8');

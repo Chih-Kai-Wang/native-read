@@ -2,7 +2,7 @@
 
 [English](README.md) · [繁體中文](README.zh-TW.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · [Español](README.es.md) · [Français](README.fr.md) · **Deutsch**
 
-**NativeRead (v2.6.0)** ist eine Manifest-V3-Browser-Erweiterung und mobile PWA, die Webseiten, PDFs, Codekommentare und eingebettete Infografiken übersetzt und dabei die ursprüngliche Typografie und das Seitenlayout beibehält. Sie bleibt standardmäßig inaktiv, läuft bei Bedarf mit Ihrem eigenen LLM-API-Schlüssel und streamt Übersetzungen Absatz für Absatz, ohne den Lesefluss zu unterbrechen.
+**NativeRead (v2.6.1)** ist eine Manifest-V3-Browser-Erweiterung und mobile PWA, die Webseiten, PDFs, Codekommentare und eingebettete Infografiken übersetzt und dabei die ursprüngliche Typografie und das Seitenlayout beibehält. Sie bleibt standardmäßig inaktiv, läuft bei Bedarf mit Ihrem eigenen LLM-API-Schlüssel und streamt Übersetzungen Absatz für Absatz, ohne den Lesefluss zu unterbrechen.
 
 ---
 
@@ -208,7 +208,8 @@ native-read/
 ├── manifest.json                 # MV3-Manifest, Versions-Single-Source-of-Truth, Berechtigungen, Alt+T-Befehl
 ├── shared/
 │   ├── config.js                 # Schema-v5-Einstellungen, 32-Anbieter-Verzeichnis (PROVIDER_PRESETS), Thinking-Konfiguration, URL-/PDF-Helfer
-│   └── cache-db.js               # IndexedDB kct_cache_db_v2 LRU-Cache für 20.000 Einträge
+│   ├── cache-db.js               # IndexedDB kct_cache_db_v2 LRU-Cache für 20.000 Einträge
+│   └── pdf-layout.mjs            # Reine PDF-Geometrie-Engine, Formel-/LaTeX-Schutz, Computer-Modern-Serif-Erkennung & Anti-Echo-Wächter
 ├── background/
 │   └── service-worker.js         # Dynamischer Injektor, SSE/NDJSON-Streamer, 429-Limiter, Vision-Engine, #nr_sync-Guard
 ├── content/

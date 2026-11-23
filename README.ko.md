@@ -2,7 +2,7 @@
 
 [English](README.md) · [繁體中文](README.zh-TW.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · **한국어** · [Español](README.es.md) · [Français](README.fr.md) · [Deutsch](README.de.md)
 
-**NativeRead (v2.6.0)**는 웹 페이지, PDF, 코드 주석, 내장 인포그래픽을 원본 페이지의 타이포그래피와 레이아웃을 유지한 채 번역하는 Manifest V3 브라우저 확장 프로그램이자 모바일 PWA입니다. 기본적으로는 아무 동작도 하지 않으며, 사용자의 LLM API 키를 이용해 필요할 때만 실행되고 읽기 흐름을 방해하지 않도록 문단 단위로 스트리밍 번역합니다.
+**NativeRead (v2.6.1)**는 웹 페이지, PDF, 코드 주석, 내장 인포그래픽을 원본 페이지의 타이포그래피와 레이아웃을 유지한 채 번역하는 Manifest V3 브라우저 확장 프로그램이자 모바일 PWA입니다. 기본적으로는 아무 동작도 하지 않으며, 사용자의 LLM API 키를 이용해 필요할 때만 실행되고 읽기 흐름을 방해하지 않도록 문단 단위로 스트리밍 번역합니다.
 
 ---
 
@@ -208,7 +208,8 @@ native-read/
 ├── manifest.json                 # MV3 매니페스트, 버전 단일 진실 공급원, 권한, Alt+T 명령
 ├── shared/
 │   ├── config.js                 # Schema v5 설정, 32개 제공자 레지스트리(PROVIDER_PRESETS), 사고 설정, URL/PDF 도우미
-│   └── cache-db.js               # IndexedDB kct_cache_db_v2 20,000개 항목 LRU 캐시
+│   ├── cache-db.js               # IndexedDB kct_cache_db_v2 20,000개 항목 LRU 캐시
+│   └── pdf-layout.mjs            # 순수 PDF 기하 레이아웃, 수식/LaTeX 보호, Computer Modern 세리프 감지 및 에코 방지 모듈
 ├── background/
 │   └── service-worker.js         # 동적 인젝터, SSE/NDJSON 스트리머, 429 리미터, Vision 엔진, #nr_sync 가드
 ├── content/

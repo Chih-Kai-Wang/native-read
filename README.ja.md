@@ -2,7 +2,7 @@
 
 [English](README.md) · [繁體中文](README.zh-TW.md) · [简体中文](README.zh-CN.md) · **日本語** · [한국어](README.ko.md) · [Español](README.es.md) · [Français](README.fr.md) · [Deutsch](README.de.md)
 
-**NativeRead (v2.6.0)** は、元のページのタイポグラフィとレイアウトを保持したまま、Webページ、PDF、コードコメント、埋め込みインフォグラフィックを翻訳する Manifest V3 ブラウザ拡張機能およびモバイル PWA です。デフォルトではサイレント（非稼働）で、自身の LLM API キーを使ってオンデマンドで動作し、読書のリズムを崩さずに段落単位でストリーミング翻訳を行います。
+**NativeRead (v2.6.1)** は、元のページのタイポグラフィとレイアウトを保持したまま、Webページ、PDF、コードコメント、埋め込みインフォグラフィックを翻訳する Manifest V3 ブラウザ拡張機能およびモバイル PWA です。デフォルトではサイレント（非稼働）で、自身の LLM API キーを使ってオンデマンドで動作し、読書のリズムを崩さずに段落単位でストリーミング翻訳を行います。
 
 ---
 
@@ -208,7 +208,8 @@ native-read/
 ├── manifest.json                 # MV3 マニフェスト、バージョンの単一情報源、権限、Alt+T コマンド
 ├── shared/
 │   ├── config.js                 # Schema v5 設定、32 プロバイダーレジストリ（PROVIDER_PRESETS）、思考設定、URL/PDF ヘルパー
-│   └── cache-db.js               # IndexedDB kct_cache_db_v2 20,000 エントリ LRU キャッシュ
+│   ├── cache-db.js               # IndexedDB kct_cache_db_v2 20,000 エントリ LRU キャッシュ
+│   └── pdf-layout.mjs            # 純粋な PDF 幾何レイアウト、数式・LaTeX 保護、Computer Modern セリフ検出およびエコー防止モジュール
 ├── background/
 │   └── service-worker.js         # 動的インジェクター、SSE/NDJSON ストリーマー、429 リミッター、Vision エンジン、#nr_sync ガード
 ├── content/
