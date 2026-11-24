@@ -20,7 +20,9 @@ const {
   saveSettings,
   hashText,
   resolveTargetLanguage,
-  formatApiError
+  formatApiError,
+  resolvePdfSourceUrl,
+  resolveAssociatedPdfUrl
 } = globalThis.KCTConfig;
 
 const ZOOM_STEPS = [0.75, 0.85, 1.0, 1.15, 1.25, 1.5, 1.75];
@@ -57,6 +59,7 @@ const dom = {
   errorTitle: document.getElementById('errorTitle'),
   errorDetail: document.getElementById('errorDetail'),
   retryUrlBtn: document.getElementById('retryUrlBtn'),
+  openSourceUrlBtn: document.getElementById('openSourceUrlBtn'),
   errorOpenFileBtn: document.getElementById('errorOpenFileBtn'),
 
   pagesContainer: document.getElementById('pagesContainer'),
@@ -87,9 +90,11 @@ const state = {
   docTitle: '',
   docHost: 'local-pdf',
   sourceUrl: '',
+  sourceTabId: null,
   defaultPageWidth: 612,
   defaultPageHeight: 792,
   activeFetchController: null,
+  activePdfFetchPort: null,
 
   pages: new Map(), // pageNum -> PageRecord
   translations: new Map(), // hashKey -> translated string
@@ -1447,11 +1452,14 @@ async function openPdfFromArrayBuffer(arrayBuffer, { title, host, sourceUrl = ''
   }
 }
 
-function showError(title, detail, canRetryUrl) {
+function showError(title, detail, canRetryUrl, { canOpenSource = false } = {}) {
   showStage('error');
   dom.errorTitle.textContent = title;
   dom.errorDetail.textContent = detail;
   dom.retryUrlBtn.hidden = !canRetryUrl;
+  if (dom.openSourceUrlBtn) {
+    dom.openSourceUrlBtn.hidden = !(canOpenSource && /^https?:\/\//i.test(state.sourceUrl || ''));
+  }
   dom.pageIndicator.hidden = true;
   updateStatusBadge();
 }
@@ -1463,12 +1471,229 @@ function abortActiveFetch() {
     } catch (_) {}
     state.activeFetchController = null;
   }
+  if (state.activePdfFetchPort) {
+    try {
+      state.activePdfFetchPort.disconnect();
+    } catch (_) {}
+    state.activePdfFetchPort = null;
+  }
 }
 
-async function loadPdfFromUrl(rawUrl) {
-  const normalizedUrl = typeof globalThis.KCTConfig?.resolvePdfSourceUrl === 'function'
-    ? (globalThis.KCTConfig.resolvePdfSourceUrl(rawUrl) || rawUrl)
-    : rawUrl;
+const MAX_REMOTE_PDF_BYTES = 100 * 1024 * 1024;
+
+function fetchPdfViaPort(type, payload, signal, onProgress = null) {
+  if (typeof chrome?.runtime?.connect !== 'function') {
+    return Promise.resolve({ ok: false, authRequired: false, reason: 'NO_RUNTIME_CONNECT' });
+  }
+  if (signal?.aborted) {
+    return Promise.resolve({ ok: false, aborted: true, authRequired: false, reason: 'ABORTED' });
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let assembled = null;
+    let totalBytes = 0;
+    let writeOffset = 0;
+    let transferFinalUrl = payload?.url || '';
+    const requestId = `pdf_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+    let port = null;
+    const cleanup = () => {
+      if (signal) signal.removeEventListener('abort', onAbort);
+      if (port && state.activePdfFetchPort === port) {
+        state.activePdfFetchPort = null;
+      }
+      if (port) {
+        try { port.disconnect(); } catch (_) {}
+      }
+    };
+    const finish = (res) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(res);
+    };
+    const onAbort = () => {
+      finish({ ok: false, aborted: true, authRequired: false, reason: 'ABORTED' });
+    };
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+
+    try {
+      port = chrome.runtime.connect({ name: 'kct-pdf-fetch' });
+      state.activePdfFetchPort = port;
+    } catch (err) {
+      finish({ ok: false, authRequired: false, reason: err?.message || 'PORT_CONNECT_FAILED' });
+      return;
+    }
+
+    port.onDisconnect.addListener(() => {
+      void chrome.runtime.lastError;
+      finish({ ok: false, authRequired: false, reason: 'PORT_DISCONNECTED' });
+    });
+
+    port.onMessage.addListener((msg) => {
+      if (!msg || typeof msg !== 'object' || msg.requestId !== requestId) return;
+      if (msg.type === 'PDF_META') {
+        const size = Number(msg.totalBytes || 0);
+        if (!Number.isFinite(size) || size <= 0 || size > MAX_REMOTE_PDF_BYTES) {
+          finish({
+            ok: false,
+            authRequired: false,
+            tooLarge: size > MAX_REMOTE_PDF_BYTES,
+            reason: size > MAX_REMOTE_PDF_BYTES ? 'TOO_LARGE' : 'INVALID_PDF_SIZE'
+          });
+          return;
+        }
+        totalBytes = size;
+        assembled = new Uint8Array(totalBytes);
+        writeOffset = 0;
+        if (msg.finalUrl) transferFinalUrl = msg.finalUrl;
+      } else if (msg.type === 'PDF_CHUNK') {
+        if (!assembled) {
+          finish({ ok: false, authRequired: false, reason: 'MISSING_META' });
+          return;
+        }
+        try {
+          const raw = atob(msg.data || '');
+          const len = raw.length;
+          if (writeOffset + len > assembled.length) {
+            finish({ ok: false, authRequired: false, reason: 'CHUNK_OVERFLOW' });
+            return;
+          }
+          for (let i = 0; i < len; i++) {
+            assembled[writeOffset + i] = raw.charCodeAt(i);
+          }
+          writeOffset += len;
+          onProgress?.(writeOffset, totalBytes);
+        } catch (decodeErr) {
+          finish({ ok: false, authRequired: false, reason: decodeErr?.message || 'CHUNK_DECODE_FAILED' });
+        }
+      } else if (msg.type === 'PDF_END') {
+        if (!assembled || writeOffset <= 0) {
+          finish({ ok: false, authRequired: false, reason: 'EMPTY_TRANSFER' });
+          return;
+        }
+        const finalBytes = writeOffset === assembled.length ? assembled : assembled.subarray(0, writeOffset);
+        if (!hasPdfMagicHeader(finalBytes)) {
+          finish({ ok: false, authRequired: false, isHtml: true, reason: 'NON_PDF_TRANSFER' });
+          return;
+        }
+        finish({
+          ok: true,
+          buffer: finalBytes.slice().buffer,
+          finalUrl: transferFinalUrl || payload?.url || ''
+        });
+      } else if (msg.type === 'PDF_AUTH_REQUIRED') {
+        finish({
+          ok: false,
+          authRequired: true,
+          status: Number(msg.status || 403),
+          finalUrl: msg.finalUrl || payload?.url || '',
+          reason: msg.reason || 'AUTH_REQUIRED'
+        });
+      } else if (msg.type === 'PDF_FALLBACK') {
+        finish({
+          ok: false,
+          authRequired: false,
+          status: Number(msg.status || 0),
+          isHtml: Boolean(msg.isHtml),
+          tooLarge: Boolean(msg.tooLarge),
+          finalUrl: msg.finalUrl || payload?.url || '',
+          reason: msg.reason || 'FALLBACK'
+        });
+      }
+    });
+
+    try {
+      port.postMessage({ type, requestId, ...payload });
+    } catch (postErr) {
+      finish({ ok: false, authRequired: false, reason: postErr?.message || 'PORT_POST_FAILED' });
+    }
+  });
+}
+
+async function fetchDirectRemotePdf(url, signal) {
+  const attempts = ['include', 'omit'];
+  let lastResult = { ok: false, status: 0, isHtml: false, tooLarge: false, error: '' };
+  for (const creds of attempts) {
+    if (signal?.aborted) {
+      return { ...lastResult, aborted: true };
+    }
+    try {
+      const resp = await fetch(url, {
+        credentials: creds,
+        headers: { Accept: 'application/pdf,application/octet-stream,*/*' },
+        signal
+      });
+      if (!resp.ok) {
+        lastResult = {
+          ok: false,
+          status: resp.status,
+          isHtml: false,
+          tooLarge: false,
+          finalUrl: resp.url || url,
+          error: `HTTP ${resp.status} ${resp.statusText || ''}`.trim()
+        };
+        if (resp.status !== 401 && resp.status !== 403) {
+          return lastResult;
+        }
+        continue;
+      }
+      const contentLen = Number(resp.headers.get('Content-Length') || 0);
+      if (contentLen > MAX_REMOTE_PDF_BYTES) {
+        return {
+          ok: false,
+          status: resp.status,
+          isHtml: false,
+          tooLarge: true,
+          error: 'PDF 檔案超過 100 MB 上限，請下載後拆分再載入。'
+        };
+      }
+      const buffer = await resp.arrayBuffer();
+      if (buffer.byteLength > MAX_REMOTE_PDF_BYTES) {
+        return {
+          ok: false,
+          status: resp.status,
+          isHtml: false,
+          tooLarge: true,
+          error: 'PDF 檔案超過 100 MB 上限，請下載後拆分再載入。'
+        };
+      }
+      const u8 = new Uint8Array(buffer);
+      if (!hasPdfMagicHeader(u8)) {
+        lastResult = {
+          ok: false,
+          status: resp.status,
+          isHtml: true,
+          tooLarge: false,
+          finalUrl: resp.url || url,
+          error: '網站回傳非 PDF 內容（可能需要登入或驗證）。'
+        };
+        continue;
+      }
+      return { ok: true, buffer, finalUrl: resp.url || url };
+    } catch (err) {
+      if (signal?.aborted) {
+        return { ok: false, aborted: true, status: 0, isHtml: false, tooLarge: false, error: 'AbortError' };
+      }
+      lastResult = {
+        ok: false,
+        status: 0,
+        isHtml: false,
+        tooLarge: false,
+        networkErr: true,
+        error: err?.message || '網路連線失敗'
+      };
+    }
+  }
+  return lastResult;
+}
+
+async function loadPdfFromUrl(rawUrl, { sourceTabId = null } = {}) {
+  const normalizedUrl =
+    (typeof resolveAssociatedPdfUrl === 'function' ? resolveAssociatedPdfUrl(rawUrl) : '') ||
+    (typeof resolvePdfSourceUrl === 'function' ? resolvePdfSourceUrl(rawUrl) : '') ||
+    rawUrl;
   let parsed;
   try {
     parsed = new URL(normalizedUrl);
@@ -1487,42 +1712,136 @@ async function loadPdfFromUrl(rawUrl) {
   const loadToken = ++state.docLoadToken;
   const controller = new AbortController();
   state.activeFetchController = controller;
-  const fetchTimer = setTimeout(() => controller.abort(), 45000);
+  const fetchTimer = setTimeout(() => controller.abort(), 50000);
 
-  state.sourceUrl = parsed.toString();
+  const resolvedTabId = Number.isInteger(sourceTabId)
+    ? sourceTabId
+    : (Number.isInteger(state.sourceTabId) ? state.sourceTabId : null);
+  const urlString = parsed.toString();
+
+  state.sourceUrl = urlString;
   showStage('loading');
   dom.loadingTitle.textContent = isFileUrl ? '正在讀取本機 PDF...' : '正在下載 PDF 文件...';
-  dom.loadingSub.textContent = parsed.toString();
+  dom.loadingSub.textContent = urlString;
 
   try {
-    let response;
-    try {
-      response = await fetch(parsed.toString(), { credentials: 'include', signal: controller.signal });
-    } catch (innerErr) {
-      if (controller.signal.aborted) throw innerErr;
-      response = await fetch(parsed.toString(), { credentials: 'omit', signal: controller.signal });
+    if (isFileUrl) {
+      let response;
+      try {
+        response = await fetch(urlString, { credentials: 'include', signal: controller.signal });
+      } catch (innerErr) {
+        if (controller.signal.aborted) throw innerErr;
+        response = await fetch(urlString, { credentials: 'omit', signal: controller.signal });
+      }
+      if (loadToken !== state.docLoadToken) return;
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status} ${response.statusText || ''}`.trim());
+      }
+      const buffer = await response.arrayBuffer();
+      if (loadToken !== state.docLoadToken) return;
+      await openPdfFromArrayBuffer(buffer, {
+        title: deriveFilenameFromUrl(urlString),
+        host: 'local-pdf',
+        sourceUrl: ''
+      });
+      return;
     }
 
-    if (loadToken !== state.docLoadToken) return;
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status} ${response.statusText || ''}`.trim());
+    const updateProgress = (loaded, total) => {
+      if (loadToken !== state.docLoadToken || total <= 0) return;
+      const pct = Math.min(100, Math.round((loaded / total) * 100));
+      dom.loadingTitle.textContent = `正在載入 PDF (${pct}%)...`;
+    };
+
+    // Tier 1: Same-origin tab/frame bridge fetch (uses active Chrome cache, Referer, Sec-Fetch-Site, cookies)
+    const tier1 = await fetchPdfViaPort(
+      'FETCH_PDF_FROM_TAB',
+      { url: urlString, ...(resolvedTabId !== null ? { tabId: resolvedTabId } : {}) },
+      controller.signal,
+      updateProgress
+    );
+    if (loadToken !== state.docLoadToken || controller.signal.aborted || tier1?.aborted) return;
+
+    if (tier1?.ok && tier1.buffer) {
+      const finalUrl = tier1.finalUrl || urlString;
+      const finalHost = (() => { try { return new URL(finalUrl).hostname; } catch (_) { return parsed.hostname; } })();
+      await openPdfFromArrayBuffer(tier1.buffer, {
+        title: deriveFilenameFromUrl(finalUrl),
+        host: finalHost,
+        sourceUrl: urlString
+      });
+      return;
     }
-    const contentLen = Number(response.headers.get('Content-Length') || 0);
-    if (contentLen > 100 * 1024 * 1024) {
+    if (tier1?.tooLarge) {
       throw new Error('PDF 檔案超過 100 MB 上限，請下載後拆分再載入。');
     }
 
-    const buffer = await response.arrayBuffer();
-    if (loadToken !== state.docLoadToken) return;
-    await openPdfFromArrayBuffer(buffer, {
-      title: deriveFilenameFromUrl(parsed.toString()),
-      host: isFileUrl ? 'local-pdf' : parsed.hostname,
-      sourceUrl: isFileUrl ? '' : parsed.toString()
-    });
+    // Tier 2: Direct extension fetch with credentials fallback
+    const tier2 = await fetchDirectRemotePdf(urlString, controller.signal);
+    if (loadToken !== state.docLoadToken || controller.signal.aborted || tier2?.aborted) return;
+
+    if (tier2?.ok && tier2.buffer) {
+      const finalUrl = tier2.finalUrl || urlString;
+      const finalHost = (() => { try { return new URL(finalUrl).hostname; } catch (_) { return parsed.hostname; } })();
+      await openPdfFromArrayBuffer(tier2.buffer, {
+        title: deriveFilenameFromUrl(finalUrl),
+        host: finalHost,
+        sourceUrl: urlString
+      });
+      return;
+    }
+    if (tier2?.tooLarge) {
+      throw new Error(tier2.error || 'PDF 檔案超過 100 MB 上限，請下載後拆分再載入。');
+    }
+
+    const needBgTab =
+      tier2.status === 401 ||
+      tier2.status === 403 ||
+      tier2.isHtml ||
+      tier2.networkErr ||
+      tier1?.status === 401 ||
+      tier1?.status === 403 ||
+      tier1?.isHtml;
+
+    if (needBgTab) {
+      // Tier 3: Temporary background tab navigation using full browser session (no bypass of HTML/login walls)
+      dom.loadingTitle.textContent = '正在透過瀏覽器工作階段載入 PDF...';
+      const tier3 = await fetchPdfViaPort(
+        'FETCH_PDF_VIA_BG_TAB',
+        { url: urlString },
+        controller.signal,
+        updateProgress
+      );
+      if (loadToken !== state.docLoadToken || controller.signal.aborted || tier3?.aborted) return;
+
+      if (tier3?.ok && tier3.buffer) {
+        const finalUrl = tier3.finalUrl || urlString;
+        const finalHost = (() => { try { return new URL(finalUrl).hostname; } catch (_) { return parsed.hostname; } })();
+        await openPdfFromArrayBuffer(tier3.buffer, {
+          title: deriveFilenameFromUrl(finalUrl),
+          host: finalHost,
+          sourceUrl: urlString
+        });
+        return;
+      }
+
+      if (tier3?.finalUrl && /^https?:\/\//i.test(tier3.finalUrl)) {
+        state.sourceUrl = tier3.finalUrl;
+      }
+      showError(
+        '需要於原網頁開啟或驗證此 PDF',
+        '此網站需要登入或瀏覽器驗證。請點擊下方「前往原網頁開啟／登入」，待畫面顯示 PDF 後按 Alt+T 或回來點「重試載入」即可直接翻譯，無需下載；或改用「開啟本機 PDF 檔案」。',
+        true,
+        { canOpenSource: true }
+      );
+      return;
+    }
+
+    throw new Error(tier2?.error || '無法取得 PDF 檔案');
   } catch (err) {
     if (loadToken !== state.docLoadToken) return;
     if (isFileUrl) {
-      const fileName = deriveFilenameFromUrl(parsed.toString());
+      const fileName = deriveFilenameFromUrl(urlString);
       showError(
         '請直接選擇本機 PDF 檔案',
         `無法直接讀取本機路徑（${fileName}）。請點擊下方「開啟本機 PDF 檔案」、拖曳檔案至此視窗，或於擴充功能設定啟用「允許存取檔案網址」。`,
@@ -1532,8 +1851,9 @@ async function loadPdfFromUrl(rawUrl) {
     }
     showError(
       '無法從網址載入 PDF',
-      `${err?.message || '網路或存取限制'}。若為需要登入的私密文件，請先下載後點選下方「開啟本機 PDF 檔案」。`,
-      true
+      `${err?.message || '網路或存取限制'}。請點「重試載入」、「前往原網頁開啟／登入」，或改用「開啟本機 PDF 檔案」。`,
+      true,
+      { canOpenSource: true }
     );
   } finally {
     clearTimeout(fetchTimer);
@@ -1730,13 +2050,20 @@ function bindEvents() {
     e.preventDefault();
     const val = dom.urlInput.value.trim();
     if (val) {
-      loadPdfFromUrl(val);
+      state.sourceTabId = null;
+      loadPdfFromUrl(val, { sourceTabId: null });
     }
   });
 
   dom.retryUrlBtn.addEventListener('click', () => {
     if (state.sourceUrl) {
-      loadPdfFromUrl(state.sourceUrl);
+      loadPdfFromUrl(state.sourceUrl, { sourceTabId: state.sourceTabId });
+    }
+  });
+
+  dom.openSourceUrlBtn?.addEventListener('click', () => {
+    if (state.sourceUrl && /^https?:\/\//i.test(state.sourceUrl)) {
+      chrome.tabs.create({ url: state.sourceUrl, active: true }).catch(() => {});
     }
   });
 
@@ -1927,9 +2254,20 @@ async function init() {
   bindEvents();
 
   const params = new URLSearchParams(window.location.search);
+  const tabIdParam = params.get('tabId');
+  const parsedTabId = tabIdParam ? Number(tabIdParam) : NaN;
+  state.sourceTabId = Number.isInteger(parsedTabId) && parsedTabId > 0 ? parsedTabId : null;
+
   const srcParam = params.get('src');
   if (srcParam && srcParam.trim()) {
-    await loadPdfFromUrl(srcParam.trim());
+    await loadPdfFromUrl(srcParam.trim(), { sourceTabId: state.sourceTabId });
+  } else if (params.get('fileAccess') === 'denied') {
+    const fileName = params.get('name') || 'local.pdf';
+    showError(
+      '請選擇本機 PDF 檔案',
+      `瀏覽器目前未開啟「允許存取檔案網址」權限（${fileName}）。請點擊下方「開啟本機 PDF 檔案」、拖曳檔案至此視窗，或至擴充功能管理頁開啟該權限。`,
+      false
+    );
   } else {
     showStage('empty');
   }

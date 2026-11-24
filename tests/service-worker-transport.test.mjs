@@ -9,13 +9,15 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, '..');
 
-function loadServiceWorker({ initialSettings = {}, fetchImpl } = {}) {
+function loadServiceWorker({ initialSettings = {}, fetchImpl, tabsById = {}, executeScriptImpl } = {}) {
   const configCode = fs.readFileSync(path.join(REPO_ROOT, 'shared/config.js'), 'utf8');
   const swCode = fs.readFileSync(path.join(REPO_ROOT, 'background/service-worker.js'), 'utf8');
   const store = { ...initialSettings };
   let onMessageListener = null;
-  let onConnectListener = null;
+  const onConnectListeners = [];
   const cacheMap = new Map();
+  const createdTabs = [];
+  let fileSchemeAllowed = false;
 
   let currentFetch = fetchImpl || (async () => new Response('{}', { status: 200 }));
 
@@ -45,8 +47,11 @@ function loadServiceWorker({ initialSettings = {}, fetchImpl } = {}) {
         getURL: (p) => `chrome-extension://native-read-test-ext/${String(p || '').replace(/^\//, '')}`,
         onInstalled: noopEvent(),
         onStartup: noopEvent(),
-        onConnect: { addListener(fn) { onConnectListener = fn; } },
+        onConnect: { addListener(fn) { onConnectListeners.push(fn); } },
         onMessage: { addListener(fn) { onMessageListener = fn; } }
+      },
+      extension: {
+        isAllowedFileSchemeAccess(cb) { if (typeof cb === 'function') cb(fileSchemeAllowed); }
       },
       contextMenus: {
         create() {},
@@ -54,7 +59,23 @@ function loadServiceWorker({ initialSettings = {}, fetchImpl } = {}) {
         onClicked: noopEvent()
       },
       commands: { onCommand: noopEvent() },
-      tabs: { onUpdated: noopEvent() },
+      tabs: {
+        onUpdated: noopEvent(),
+        onRemoved: noopEvent(),
+        async get(id) {
+          if (!(id in tabsById)) throw new Error('Tab not found');
+          return tabsById[id];
+        },
+        async create(props) {
+          createdTabs.push(props);
+          return { id: 900 + createdTabs.length, ...props };
+        }
+      },
+      scripting: {
+        async executeScript(opts) {
+          return executeScriptImpl ? executeScriptImpl(opts) : [];
+        }
+      },
       permissions: { async contains() { return true; } },
       storage: {
         local: {
@@ -104,6 +125,8 @@ function loadServiceWorker({ initialSettings = {}, fetchImpl } = {}) {
   return {
     context,
     store,
+    createdTabs,
+    setFileSchemeAllowed(val) { fileSchemeAllowed = Boolean(val); },
     setFetch(fn) { currentFetch = fn; },
     sendMessage(message, sender = { id: 'native-read-test-ext' }) {
       return new Promise((resolve) => {
@@ -111,7 +134,9 @@ function loadServiceWorker({ initialSettings = {}, fetchImpl } = {}) {
         if (keepAsync !== true) resolve(undefined);
       });
     },
-    getOnConnect: () => onConnectListener
+    getOnConnect: () => (port) => {
+      for (const fn of onConnectListeners) fn(port);
+    }
   };
 }
 
@@ -289,4 +314,83 @@ test('tryImportNrSyncFromUrl accepts anthropic and rejects invalid payloads', as
   })).toString('base64url');
   const bad = await context.tryImportNrSyncFromUrl(`https://chih-kai-wang.github.io/native-read/#nr_sync=${badKeyPayload}`);
   assert.equal(bad, false);
+});
+
+test('hasPdfSignature validates %PDF- magic, openPdfViewer attaches tabId / preserves fileAccess=denied, and kct-pdf-fetch blocks untrusted senders', async () => {
+  const { context, createdTabs, getOnConnect } = loadServiceWorker();
+
+  const validBytes = Buffer.from('%PDF-1.7\n1 0 obj');
+  const leadingWsBytes = Buffer.from('  \n\r\t%PDF-1.4\n');
+  const htmlBytes = Buffer.from('<!DOCTYPE html><html><body>Login</body></html>');
+  assert.equal(context.hasPdfSignature(validBytes), true);
+  assert.equal(context.hasPdfSignature(leadingWsBytes), true);
+  assert.equal(context.hasPdfSignature(htmlBytes), false);
+
+  await context.openPdfViewer('https://arxiv.org/pdf/2501.00001', { id: 42, index: 3, windowId: 1 });
+  assert.equal(
+    createdTabs[0].url,
+    'chrome-extension://native-read-test-ext/viewer/pdf-viewer.html?src=https%3A%2F%2Farxiv.org%2Fpdf%2F2501.00001&tabId=42'
+  );
+
+  const fileMeta = await context.openPdfViewer('file:///tmp/paper.pdf', { id: 43, index: 4, windowId: 1 });
+  assert.equal(fileMeta.fileAccessAllowed, false);
+  assert.equal(
+    createdTabs[1].url,
+    'chrome-extension://native-read-test-ext/viewer/pdf-viewer.html?fileAccess=denied&name=paper.pdf'
+  );
+
+  let disconnected = false;
+  const untrustedPort = {
+    name: 'kct-pdf-fetch',
+    sender: { url: 'https://evil.example/page.html', tab: { id: 99 } },
+    onDisconnect: { addListener() {} },
+    onMessage: { addListener() {} },
+    postMessage() { throw new Error('must not post to untrusted sender'); },
+    disconnect() { disconnected = true; }
+  };
+  getOnConnect()(untrustedPort);
+  assert.equal(disconnected, true, 'kct-pdf-fetch immediately disconnects non-extension senders');
+});
+
+test('OPEN_PDF_VIEWER prefers explicit message.tabId over sender.tab for detectFromTab', async () => {
+  const executeCalls = [];
+  const { sendMessage, createdTabs } = loadServiceWorker({
+    tabsById: {
+      77: { id: 77, index: 2, windowId: 1, url: 'https://paper.example/abs' },
+      88: { id: 88, index: 3, windowId: 1, url: 'chrome-extension://native-read-test-ext/popup/popup.html' }
+    },
+    executeScriptImpl: (opts) => {
+      executeCalls.push(opts);
+      return [
+        {
+          frameId: 0,
+          result: {
+            isPdf: false,
+            url: 'https://paper.example/abs',
+            origin: 'https://paper.example',
+            detectedHref: 'https://paper.example/protected.pdf'
+          }
+        }
+      ];
+    }
+  });
+
+  const senderFromExtensionTab = {
+    id: 'native-read-test-ext',
+    url: 'chrome-extension://native-read-test-ext/popup/popup.html',
+    tab: { id: 88, index: 3, windowId: 1, url: 'chrome-extension://native-read-test-ext/popup/popup.html' }
+  };
+  const res = await sendMessage(
+    { type: 'OPEN_PDF_VIEWER', tabId: 77, detectFromTab: true },
+    senderFromExtensionTab
+  );
+
+  assert.equal(res.ok, true);
+  assert.equal(executeCalls.length, 1);
+  assert.equal(executeCalls[0]?.target?.tabId, 77);
+  assert.equal(createdTabs.length, 1);
+  assert.equal(
+    createdTabs[0].url,
+    'chrome-extension://native-read-test-ext/viewer/pdf-viewer.html?src=https%3A%2F%2Fpaper.example%2Fprotected.pdf&tabId=77'
+  );
 });

@@ -16,6 +16,7 @@ const {
   isInjectableUrl,
   isFilePdfUrl,
   isPdfUrl,
+  resolveAssociatedPdfUrl,
   buildProviderAuthHeaders,
   buildListModelsUrl,
   parseListModelsResponse,
@@ -2050,6 +2051,36 @@ async function isFileSchemeAccessAllowed() {
   });
 }
 
+const PDF_MAX_BYTES = 100 * 1024 * 1024;
+const PDF_CHUNK_BYTES = 1572864; // Exact multiple of 3 for clean base64 slices
+const BG_TAB_LOAD_TIMEOUT_MS = 18000;
+
+function hasPdfSignature(bytes) {
+  if (!bytes || typeof bytes.length !== 'number') return false;
+  const limit = Math.min(bytes.length, 1024);
+  for (let i = 0; i <= limit - 5; i++) {
+    if (
+      bytes[i] === 0x25 &&
+      bytes[i + 1] === 0x50 &&
+      bytes[i + 2] === 0x44 &&
+      bytes[i + 3] === 0x46 &&
+      bytes[i + 4] === 0x2d
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function getSiteKeyFromHost(hostname) {
+  const host = String(hostname || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (!host) return '';
+  if (/^\d+(?:\.\d+){3}$/.test(host) || host.includes(':')) return host;
+  const parts = host.split('.').filter(Boolean);
+  if (parts.length <= 2) return host;
+  return parts.slice(-2).join('.');
+}
+
 async function openPdfViewer(pdfUrl, sourceTab = null) {
   const baseUrl = chrome.runtime.getURL('viewer/pdf-viewer.html');
   let cleanUrl = typeof pdfUrl === 'string' ? pdfUrl.trim() : '';
@@ -2090,7 +2121,10 @@ async function openPdfViewer(pdfUrl, sourceTab = null) {
       resultMeta = { isFileUrl: true, fileAccessAllowed: false, fileName };
     }
   } else if (cleanUrl) {
-    targetUrl = `${baseUrl}?src=${encodeURIComponent(cleanUrl)}`;
+    const tabSuffix = sourceTab && typeof sourceTab.id === 'number'
+      ? `&tabId=${encodeURIComponent(String(sourceTab.id))}`
+      : '';
+    targetUrl = `${baseUrl}?src=${encodeURIComponent(cleanUrl)}${tabSuffix}`;
   }
 
   const createProps = { url: targetUrl, active: true };
@@ -2102,6 +2136,229 @@ async function openPdfViewer(pdfUrl, sourceTab = null) {
   }
   await chrome.tabs.create(createProps);
   return resultMeta;
+}
+
+async function probeTabFramesForPdf(tabId) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: () => {
+        const isPdfDoc =
+          document.contentType === 'application/pdf' ||
+          (Boolean(document.body) &&
+            document.body.children.length === 1 &&
+            Boolean(document.body.querySelector(':scope > embed[type="application/pdf"]')));
+        let detectedHref = '';
+        if (!isPdfDoc && window === window.top) {
+          const resolveAbs = (raw) => {
+            if (!raw || typeof raw !== 'string') return '';
+            try {
+              const u = new URL(raw.trim(), location.href);
+              return (u.protocol === 'http:' || u.protocol === 'https:') ? u.toString() : '';
+            } catch (_) {
+              return '';
+            }
+          };
+          const embedEl =
+            document.querySelector('embed[type="application/pdf"][src]') ||
+            document.querySelector('object[type="application/pdf"][data]');
+          if (embedEl) {
+            detectedHref = resolveAbs(embedEl.getAttribute('src') || embedEl.getAttribute('data'));
+          }
+          if (!detectedHref) {
+            const iframes = document.querySelectorAll('iframe[src]');
+            for (const f of iframes) {
+              const cand = resolveAbs(f.getAttribute('src'));
+              if (cand && (/\.pdf(?:$|[?#])|\/pdf\/|getpdf|format=pdf/i.test(cand))) {
+                detectedHref = cand;
+                break;
+              }
+            }
+          }
+          if (!detectedHref) {
+            const metaPdf = document.querySelector('meta[name="citation_pdf_url"][content]');
+            if (metaPdf) {
+              detectedHref = resolveAbs(metaPdf.getAttribute('content'));
+            }
+          }
+          if (!detectedHref) {
+            const links = document.querySelectorAll('a[href]');
+            for (const a of links) {
+              const txt = String(a.textContent || '').replace(/\s+/g, ' ').trim();
+              const href = resolveAbs(a.getAttribute('href'));
+              if (!href) continue;
+              const isPdfLabel = /\b(?:view|download|full\s*text|open)\s*pdf\b/i.test(txt) || /^pdf$/i.test(txt);
+              const isPdfHref = /\.pdf(?:$|[?#])|\/(?:export\.arxiv\.org|arxiv\.org)\/pdf\/|openreview\.net\/pdf\?|\/doi\/pdf\//i.test(href) ||
+                /^https?:\/\/(?:export\.)?arxiv\.org\/pdf\//i.test(href);
+              if (isPdfLabel || (isPdfHref && /pdf/i.test(txt))) {
+                detectedHref = href;
+                break;
+              }
+            }
+          }
+        }
+        return {
+          isPdf: isPdfDoc,
+          url: location.href,
+          origin: location.origin,
+          detectedHref
+        };
+      }
+    });
+    if (!Array.isArray(results)) return [];
+    return results
+      .filter((r) => typeof r?.frameId === 'number' && r.result)
+      .map((r) => ({
+        frameId: r.frameId,
+        isPdf: Boolean(r.result.isPdf),
+        url: String(r.result.url || ''),
+        origin: String(r.result.origin || ''),
+        detectedHref: String(r.result.detectedHref || '')
+      }));
+  } catch (_) {
+    return [];
+  }
+}
+
+async function detectPdfUrlInTab(tabId, tabUrl = '') {
+  const assoc = typeof resolveAssociatedPdfUrl === 'function' ? resolveAssociatedPdfUrl(tabUrl) : '';
+  if (assoc) return assoc;
+  if (typeof tabId !== 'number') return '';
+  const frames = await probeTabFramesForPdf(tabId);
+  const pdfFrame = frames.find((f) => f.isPdf && /^https?:\/\//i.test(f.url));
+  if (pdfFrame) return pdfFrame.url;
+  const topFrame = frames.find((f) => f.frameId === 0);
+  if (topFrame?.detectedHref && /^https?:\/\//i.test(topFrame.detectedHref)) {
+    return topFrame.detectedHref;
+  }
+  return '';
+}
+
+// Self-contained injected fetcher (must have ZERO outer scope references)
+async function fetchPdfInTabAndStream(transferId, targetUrl, maxBytes, chunkBytes) {
+  const hasPdfMagic = (u8) => {
+    const limit = Math.min(u8.length, 1024);
+    for (let i = 0; i <= limit - 5; i++) {
+      if (
+        u8[i] === 0x25 &&
+        u8[i + 1] === 0x50 &&
+        u8[i + 2] === 0x44 &&
+        u8[i + 3] === 0x46 &&
+        u8[i + 4] === 0x2d
+      ) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const uint8SliceToBase64 = (slice) => {
+    let binary = '';
+    const step = 0x8000;
+    for (let i = 0; i < slice.length; i += step) {
+      const sub = slice.subarray(i, Math.min(i + step, slice.length));
+      binary += String.fromCharCode.apply(null, sub);
+    }
+    return btoa(binary);
+  };
+
+  const attemptFetch = async (cacheMode) => {
+    try {
+      const resp = await fetch(targetUrl, {
+        credentials: 'include',
+        cache: cacheMode,
+        headers: { Accept: 'application/pdf,application/octet-stream,*/*' }
+      });
+      if (!resp.ok) {
+        return { ok: false, status: resp.status, isHtml: false, error: `HTTP ${resp.status}` };
+      }
+      const ct = String(resp.headers.get('content-type') || '').toLowerCase();
+      const clen = Number(resp.headers.get('content-length') || 0);
+      if (clen > maxBytes) {
+        return { ok: false, status: 0, isHtml: false, tooLarge: true, error: 'PDF 檔案超過 100 MB 上限' };
+      }
+      const buf = await resp.arrayBuffer();
+      if (!buf || buf.byteLength === 0) {
+        return { ok: false, status: resp.status, isHtml: ct.includes('html'), error: 'Empty response' };
+      }
+      if (buf.byteLength > maxBytes) {
+        return { ok: false, status: 0, isHtml: false, tooLarge: true, error: 'PDF 檔案超過 100 MB 上限' };
+      }
+      const u8 = new Uint8Array(buf);
+      if (!hasPdfMagic(u8)) {
+        return {
+          ok: false,
+          status: resp.status,
+          isHtml: ct.includes('html') || u8[0] === 0x3c,
+          finalUrl: resp.url || targetUrl,
+          error: 'Non-PDF response'
+        };
+      }
+      return { ok: true, bytes: u8, finalUrl: resp.url || targetUrl };
+    } catch (err) {
+      return { ok: false, status: 0, isHtml: false, error: err?.message || 'Fetch failed' };
+    }
+  };
+
+  let fetched = await attemptFetch('force-cache');
+  if (!fetched.ok) {
+    if (fetched.tooLarge) return fetched;
+    fetched = await attemptFetch('default');
+  }
+  if (!fetched.ok) {
+    return fetched;
+  }
+
+  const bytes = fetched.bytes;
+  const totalBytes = bytes.byteLength;
+  const port = chrome.runtime.connect({ name: 'kct-pdf-bridge' });
+  try {
+    const ackPromise = new Promise((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(finish, 2000);
+      port.onMessage.addListener((m) => {
+        if (m?.type === 'PDF_ACK' && m.transferId === transferId) finish();
+      });
+      port.onDisconnect.addListener(finish);
+    });
+
+    port.postMessage({
+      type: 'PDF_META',
+      transferId,
+      totalBytes,
+      finalUrl: fetched.finalUrl || targetUrl
+    });
+
+    let chunkIdx = 0;
+    for (let offset = 0; offset < totalBytes; offset += chunkBytes) {
+      const slice = bytes.subarray(offset, Math.min(offset + chunkBytes, totalBytes));
+      port.postMessage({
+        type: 'PDF_CHUNK',
+        transferId,
+        index: chunkIdx++,
+        data: uint8SliceToBase64(slice)
+      });
+      if (offset + chunkBytes < totalBytes) {
+        await new Promise((r) => setTimeout(r, 0));
+      }
+    }
+
+    port.postMessage({ type: 'PDF_END', transferId });
+    await ackPromise;
+    return { ok: true, streamed: true, totalBytes, finalUrl: fetched.finalUrl || targetUrl };
+  } catch (portErr) {
+    return { ok: false, status: 0, isHtml: false, error: portErr?.message || 'Bridge transfer failed' };
+  } finally {
+    try {
+      port.disconnect();
+    } catch (_) {}
+  }
 }
 
 async function ensureInjected(tabId, preferredFrameId = null) {
@@ -2294,6 +2551,28 @@ function setupContextMenus() {
           void chrome.runtime.lastError;
         }
       );
+      chrome.contextMenus.create(
+        {
+          id: 'kct-open-pdf-link',
+          title: '以 NativeRead 閱讀並翻譯此 PDF',
+          contexts: ['link'],
+          targetUrlPatterns: [
+            '*://*/*.pdf',
+            '*://*/*.pdf?*',
+            '*://*/*.PDF',
+            '*://*/*.PDF?*',
+            '*://arxiv.org/pdf/*',
+            '*://export.arxiv.org/pdf/*',
+            '*://openreview.net/pdf*',
+            '*://*/doi/pdf/*',
+            '*://proceedings.mlr.press/*',
+            '*://drive.google.com/file/d/*'
+          ]
+        },
+        () => {
+          void chrome.runtime.lastError;
+        }
+      );
     });
   } catch (err) {
     console.warn('[KCT] setupContextMenus error:', err?.message);
@@ -2371,6 +2650,11 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         },
         sendOpts
       );
+    } else if (info.menuItemId === 'kct-open-pdf-link') {
+      const linkUrl = typeof info.linkUrl === 'string' ? info.linkUrl.trim() : '';
+      if (linkUrl) {
+        await openPdfViewer(linkUrl, tab);
+      }
     }
   } catch (err) {
     console.warn('[KCT] contextMenus action failed:', err?.message);
@@ -2898,6 +3182,395 @@ chrome.runtime.onConnect.addListener((port) => {
         activeControllers.delete(requestId);
       }
     })();
+  });
+});
+
+// ============================================================
+// Seamless PDF Transfer Ports ('kct-pdf-fetch' & 'kct-pdf-bridge')
+// ============================================================
+
+const activePdfTransfers = new Map(); // transferId -> { viewerPort, requestId, aborted, resolve, reject }
+
+function createTransferId() {
+  return `${Date.now()}_${Math.random().toString(36).slice(2)}_${Math.random().toString(36).slice(2)}`;
+}
+
+async function findCandidatePdfFrame(targetUrl, preferredTabId = null) {
+  let parsedTarget;
+  try {
+    parsedTarget = new URL(targetUrl);
+  } catch (_) {
+    return null;
+  }
+  const targetOrigin = parsedTarget.origin;
+  const targetSite = getSiteKeyFromHost(parsedTarget.hostname);
+  const inspectedTabIds = new Set();
+
+  const inspectTab = async (tabId) => {
+    if (typeof tabId !== 'number' || inspectedTabIds.has(tabId)) return null;
+    inspectedTabIds.add(tabId);
+    let tab;
+    try {
+      tab = await chrome.tabs.get(tabId);
+    } catch (_) {
+      return null;
+    }
+    if (!tab?.url || !/^https?:\/\//i.test(tab.url)) return null;
+
+    const frames = await probeTabFramesForPdf(tab.id);
+    const exactMatch = frames.find((f) => f.url === targetUrl) ||
+      frames.find((f) => f.isPdf && f.origin === targetOrigin);
+    if (exactMatch) {
+      return { tabId: tab.id, frameId: exactMatch.frameId, url: exactMatch.url || targetUrl };
+    }
+    const sameOriginFrame = frames.find((f) => f.origin === targetOrigin);
+    if (sameOriginFrame) {
+      return { tabId: tab.id, frameId: sameOriginFrame.frameId, url: targetUrl };
+    }
+    try {
+      const tabUrlObj = new URL(tab.url);
+      const tabSite = getSiteKeyFromHost(tabUrlObj.hostname);
+      if (tabUrlObj.origin === targetOrigin || (targetSite && tabSite === targetSite)) {
+        return { tabId: tab.id, frameId: 0, url: targetUrl };
+      }
+    } catch (_) {}
+    return null;
+  };
+
+  if (typeof preferredTabId === 'number') {
+    const preferredHit = await inspectTab(preferredTabId);
+    if (preferredHit) return preferredHit;
+  }
+
+  let allTabs = [];
+  try {
+    allTabs = await chrome.tabs.query({});
+  } catch (_) {}
+
+  for (const t of allTabs) {
+    if (!t?.url || inspectedTabIds.has(t.id) || !/^https?:\/\//i.test(t.url)) continue;
+    try {
+      if (t.url === targetUrl || new URL(t.url).origin === targetOrigin) {
+        const hit = await inspectTab(t.id);
+        if (hit) return hit;
+      }
+    } catch (_) {}
+  }
+
+  for (const t of allTabs) {
+    if (!t?.url || inspectedTabIds.has(t.id) || !/^https?:\/\//i.test(t.url)) continue;
+    try {
+      const tabSite = getSiteKeyFromHost(new URL(t.url).hostname);
+      if (targetSite && tabSite === targetSite) {
+        const hit = await inspectTab(t.id);
+        if (hit) return hit;
+      }
+    } catch (_) {}
+  }
+
+  return null;
+}
+
+async function runTabPdfTransfer(viewerPort, requestId, tabId, frameId, fetchUrl) {
+  const transferId = createTransferId();
+  let transferSettled = false;
+  let resolveTransfer;
+  let rejectTransfer;
+  const transferPromise = new Promise((resolve, reject) => {
+    resolveTransfer = (val) => {
+      if (transferSettled) return;
+      transferSettled = true;
+      resolve(val);
+    };
+    rejectTransfer = (err) => {
+      if (transferSettled) return;
+      transferSettled = true;
+      reject(err);
+    };
+  });
+
+  activePdfTransfers.set(transferId, {
+    viewerPort,
+    requestId,
+    aborted: false,
+    resolve: resolveTransfer,
+    reject: rejectTransfer
+  });
+
+  try {
+    const execRes = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [frameId] },
+      world: 'ISOLATED',
+      func: fetchPdfInTabAndStream,
+      args: [transferId, fetchUrl, PDF_MAX_BYTES, PDF_CHUNK_BYTES]
+    });
+    const scriptOut = execRes?.[0]?.result;
+    if (!scriptOut?.ok) {
+      activePdfTransfers.delete(transferId);
+      rejectTransfer(new Error(scriptOut?.error || 'Tab fetch failed'));
+      return {
+        ok: false,
+        status: Number(scriptOut?.status || 0),
+        isHtml: Boolean(scriptOut?.isHtml),
+        tooLarge: Boolean(scriptOut?.tooLarge),
+        finalUrl: scriptOut?.finalUrl || fetchUrl,
+        error: scriptOut?.error || 'Tab fetch failed'
+      };
+    }
+    await transferPromise;
+    return { ok: true, finalUrl: scriptOut.finalUrl || fetchUrl };
+  } catch (err) {
+    activePdfTransfers.delete(transferId);
+    return {
+      ok: false,
+      status: 0,
+      isHtml: false,
+      error: err?.message || 'Script transfer failed'
+    };
+  }
+}
+
+function waitForTabLoadComplete(tabId, timeoutMs, isAbortedFn) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearInterval(abortPoll);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      chrome.tabs.onRemoved.removeListener(onRemoved);
+      resolve(ok);
+    };
+    const onUpdated = (updatedId, changeInfo) => {
+      if (updatedId === tabId && changeInfo.status === 'complete') {
+        finish(true);
+      }
+    };
+    const onRemoved = (removedId) => {
+      if (removedId === tabId) {
+        finish(false);
+      }
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    const abortPoll = setInterval(() => {
+      if (isAbortedFn?.()) finish(false);
+    }, 250);
+
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    chrome.tabs.onRemoved.addListener(onRemoved);
+    chrome.tabs.get(tabId).then((t) => {
+      if (isAbortedFn?.()) {
+        finish(false);
+      } else if (t?.status === 'complete') {
+        finish(true);
+      }
+    }).catch(() => finish(false));
+  });
+}
+
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name === 'kct-pdf-bridge') {
+    let boundTransferId = null;
+    port.onMessage.addListener((msg) => {
+      if (!msg || typeof msg !== 'object') return;
+      const transferId = msg.transferId;
+      if (!transferId) return;
+      const entry = activePdfTransfers.get(transferId);
+      if (!entry || entry.aborted) return;
+      boundTransferId = transferId;
+
+      if (msg.type === 'PDF_META') {
+        try {
+          entry.viewerPort.postMessage({
+            type: 'PDF_META',
+            requestId: entry.requestId,
+            totalBytes: msg.totalBytes,
+            finalUrl: msg.finalUrl || ''
+          });
+        } catch (_) {
+          entry.aborted = true;
+          activePdfTransfers.delete(transferId);
+          entry.reject(new Error('Viewer port closed'));
+        }
+      } else if (msg.type === 'PDF_CHUNK') {
+        try {
+          entry.viewerPort.postMessage({
+            type: 'PDF_CHUNK',
+            requestId: entry.requestId,
+            index: msg.index,
+            data: msg.data
+          });
+        } catch (_) {
+          entry.aborted = true;
+          activePdfTransfers.delete(transferId);
+          entry.reject(new Error('Viewer port closed'));
+        }
+      } else if (msg.type === 'PDF_END') {
+        try {
+          entry.viewerPort.postMessage({
+            type: 'PDF_END',
+            requestId: entry.requestId
+          });
+        } catch (_) {}
+        activePdfTransfers.delete(transferId);
+        entry.resolve({ ok: true });
+        try {
+          port.postMessage({ type: 'PDF_ACK', transferId });
+        } catch (_) {}
+      }
+    });
+    port.onDisconnect.addListener(() => {
+      void chrome.runtime.lastError;
+      if (boundTransferId && activePdfTransfers.has(boundTransferId)) {
+        const entry = activePdfTransfers.get(boundTransferId);
+        activePdfTransfers.delete(boundTransferId);
+        entry?.reject(new Error('PDF bridge disconnected early'));
+      }
+    });
+    return;
+  }
+
+  if (port.name !== 'kct-pdf-fetch') return;
+  if (!isExtensionSender(port.sender)) {
+    try {
+      port.disconnect();
+    } catch (_) {}
+    return;
+  }
+
+  let portDisconnected = false;
+  const activeBgTabIds = new Set();
+
+  const safePost = (msg) => {
+    if (portDisconnected) return false;
+    try {
+      port.postMessage(msg);
+      return true;
+    } catch (_) {
+      portDisconnected = true;
+      return false;
+    }
+  };
+
+  port.onDisconnect.addListener(() => {
+    void chrome.runtime.lastError;
+    portDisconnected = true;
+    for (const [tid, entry] of activePdfTransfers.entries()) {
+      if (entry.viewerPort === port) {
+        entry.aborted = true;
+        activePdfTransfers.delete(tid);
+        entry.reject(new Error('Viewer disconnected'));
+      }
+    }
+    for (const bgId of activeBgTabIds) {
+      chrome.tabs.remove(bgId).catch(() => {});
+    }
+    activeBgTabIds.clear();
+  });
+
+  port.onMessage.addListener((msg) => {
+    if (!msg || typeof msg !== 'object') return;
+    const requestId = msg.requestId || `pdf_${Date.now()}`;
+    const rawUrl = String(msg.url || '').trim();
+    if (!/^https?:\/\//i.test(rawUrl)) {
+      safePost({ type: 'PDF_FALLBACK', requestId, reason: 'INVALID_URL' });
+      return;
+    }
+
+    if (msg.type === 'FETCH_PDF_FROM_TAB') {
+      (async () => {
+        try {
+          const preferredTabId = typeof msg.tabId === 'number' ? msg.tabId : null;
+          const cand = await findCandidatePdfFrame(rawUrl, preferredTabId);
+          if (!cand || portDisconnected) {
+            safePost({ type: 'PDF_FALLBACK', requestId, reason: 'NO_CANDIDATE_TAB' });
+            return;
+          }
+          const res = await runTabPdfTransfer(port, requestId, cand.tabId, cand.frameId, cand.url || rawUrl);
+          if (!res.ok && !portDisconnected) {
+            safePost({
+              type: 'PDF_FALLBACK',
+              requestId,
+              reason: res.error || 'TAB_FETCH_FAILED',
+              status: res.status || 0,
+              isHtml: Boolean(res.isHtml),
+              tooLarge: Boolean(res.tooLarge),
+              finalUrl: res.finalUrl || rawUrl
+            });
+          }
+        } catch (err) {
+          if (!portDisconnected) {
+            safePost({ type: 'PDF_FALLBACK', requestId, reason: err?.message || 'TAB_FETCH_FAILED' });
+          }
+        }
+      })();
+      return;
+    }
+
+    if (msg.type === 'FETCH_PDF_VIA_BG_TAB') {
+      (async () => {
+        let bgTabId = null;
+        try {
+          const bgTab = await chrome.tabs.create({ url: rawUrl, active: false });
+          bgTabId = bgTab?.id ?? null;
+          if (typeof bgTabId !== 'number') {
+            safePost({ type: 'PDF_FALLBACK', requestId, reason: 'BG_TAB_CREATE_FAILED' });
+            return;
+          }
+          if (portDisconnected) {
+            await chrome.tabs.remove(bgTabId).catch(() => {});
+            return;
+          }
+          activeBgTabIds.add(bgTabId);
+
+          const loaded = await waitForTabLoadComplete(bgTabId, BG_TAB_LOAD_TIMEOUT_MS, () => portDisconnected);
+          if (portDisconnected) return;
+
+          let currentUrl = rawUrl;
+          try {
+            const tabState = await chrome.tabs.get(bgTabId);
+            if (tabState?.url && /^https?:\/\//i.test(tabState.url)) {
+              currentUrl = tabState.url;
+            }
+          } catch (_) {}
+
+          if (!loaded) {
+            safePost({ type: 'PDF_AUTH_REQUIRED', requestId, finalUrl: currentUrl, reason: 'BG_TAB_TIMEOUT' });
+            return;
+          }
+
+          const frames = await probeTabFramesForPdf(bgTabId);
+          const pdfFrame = frames.find((f) => f.isPdf);
+          if (!pdfFrame) {
+            // Site returned an HTML login page, paywall, or verification gate instead of rendering PDF
+            safePost({ type: 'PDF_AUTH_REQUIRED', requestId, finalUrl: currentUrl });
+            return;
+          }
+
+          const transferUrl = /^https?:\/\//i.test(pdfFrame.url) ? pdfFrame.url : currentUrl;
+          const res = await runTabPdfTransfer(port, requestId, bgTabId, pdfFrame.frameId, transferUrl);
+          if (!res.ok && !portDisconnected) {
+            safePost({
+              type: 'PDF_AUTH_REQUIRED',
+              requestId,
+              finalUrl: res.finalUrl || transferUrl,
+              status: res.status || 0,
+              reason: res.error || 'BG_TAB_STREAM_FAILED'
+            });
+          }
+        } catch (err) {
+          if (!portDisconnected) {
+            safePost({ type: 'PDF_AUTH_REQUIRED', requestId, finalUrl: rawUrl, reason: err?.message || 'BG_TAB_ERROR' });
+          }
+        } finally {
+          if (typeof bgTabId === 'number') {
+            activeBgTabIds.delete(bgTabId);
+            await chrome.tabs.remove(bgTabId).catch(() => {});
+          }
+        }
+      })();
+    }
   });
 });
 
@@ -4325,13 +4998,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             sendResponse({ ok: false, error: '拒絕未授權來源呼叫' });
             break;
           }
-          let sourceTab = sender?.tab || null;
-          if (!sourceTab && typeof message.tabId === 'number') {
+          let sourceTab = null;
+          if (typeof message.tabId === 'number') {
             try {
               sourceTab = await chrome.tabs.get(message.tabId);
             } catch (_) {}
           }
-          const pdfUrl = typeof message.url === 'string' && message.url.trim() ? message.url.trim() : '';
+          if (!sourceTab) {
+            sourceTab = sender?.tab || null;
+          }
+          let pdfUrl = typeof message.url === 'string' && message.url.trim() ? message.url.trim() : '';
+          if (!pdfUrl && message.detectFromTab && sourceTab?.id && isInjectableUrl(sourceTab.url)) {
+            pdfUrl = await detectPdfUrlInTab(sourceTab.id, sourceTab.url);
+          }
           const viewerRes = await openPdfViewer(pdfUrl, sourceTab);
           sendResponse({ ok: true, ...viewerRes });
           break;

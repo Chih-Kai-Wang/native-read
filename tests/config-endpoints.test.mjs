@@ -119,8 +119,34 @@ test('isLocalEndpoint, isInjectableUrl, and isRemotePdfUrl handle edge cases', (
 
   assert.equal(KCTConfig.isRemotePdfUrl('https://openreview.net/pdf?id=abcXYZ123'), true);
   assert.equal(KCTConfig.isRemotePdfUrl('https://arxiv.org/pdf/2401.00001'), true);
+  assert.equal(KCTConfig.isRemotePdfUrl('https://dl.acm.org/doi/pdf/10.1145/12345.67890'), true);
+  assert.equal(KCTConfig.isRemotePdfUrl('https://dl.acm.org/doi/pdf/10.1145/paper.html'), false);
   assert.equal(KCTConfig.isRemotePdfUrl('https://example.com/DOCS/REPORT.PDF?dl=1'), true);
   assert.equal(KCTConfig.isRemotePdfUrl('https://example.com/article.html'), false);
+});
+
+test('resolveAssociatedPdfUrl resolves arXiv /abs, OpenReview /forum, Drive & direct PDFs cleanly', () => {
+  const { KCTConfig } = loadConfig();
+
+  assert.equal(
+    KCTConfig.resolveAssociatedPdfUrl('https://arxiv.org/abs/2501.12345v2'),
+    'https://arxiv.org/pdf/2501.12345v2'
+  );
+  assert.equal(
+    KCTConfig.resolveAssociatedPdfUrl('https://export.arxiv.org/abs/hep-th/9901001'),
+    'https://export.arxiv.org/pdf/hep-th/9901001'
+  );
+  assert.equal(
+    KCTConfig.resolveAssociatedPdfUrl('https://openreview.net/forum?id=xyz987'),
+    'https://openreview.net/pdf?id=xyz987'
+  );
+  assert.equal(
+    KCTConfig.resolveAssociatedPdfUrl('https://drive.google.com/file/d/1IR7CddF_2FyQo_PdfBNTaEA50EGiVt2r/view'),
+    'https://drive.google.com/uc?export=download&id=1IR7CddF_2FyQo_PdfBNTaEA50EGiVt2r'
+  );
+  assert.equal(KCTConfig.resolveAssociatedPdfUrl('https://arxiv.org/pdf/2501.12345'), 'https://arxiv.org/pdf/2501.12345');
+  assert.equal(KCTConfig.resolveAssociatedPdfUrl('https://example.com/article.html'), '');
+  assert.equal(KCTConfig.isPdfUrl('https://arxiv.org/abs/2501.12345'), false);
 });
 
 test('formatApiError prioritizes explicit HTTP 401/403/404/429 over overload prose', () => {

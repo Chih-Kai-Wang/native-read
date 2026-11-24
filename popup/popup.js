@@ -8,6 +8,7 @@ const {
   toggleHostWhitelist,
   isInjectableUrl,
   isPdfUrl,
+  resolveAssociatedPdfUrl,
   isLocalEndpoint,
   validateApiKey,
   resolveFallbackSettings,
@@ -414,10 +415,11 @@ async function queryActiveTabStatus() {
   }
 }
 
-async function openPdfViewerFromPopup(pdfUrl = '') {
+async function openPdfViewerFromPopup(pdfUrl = '', { detectFromTab = false } = {}) {
   try {
     const payload = { type: 'OPEN_PDF_VIEWER' };
     if (pdfUrl) payload.url = pdfUrl;
+    if (detectFromTab) payload.detectFromTab = true;
     if (typeof activeTab?.id === 'number') payload.tabId = activeTab.id;
     const res = await chrome.runtime.sendMessage(payload);
     if (res?.ok) {
@@ -668,6 +670,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   } else if (!activeTabInjectable) {
     setStatusText(UNSUPPORTED_STATUS_TEXT);
   } else {
+    const assocPdfUrl = typeof resolveAssociatedPdfUrl === 'function'
+      ? resolveAssociatedPdfUrl(activeTab?.url || '')
+      : '';
+    const pdfBtn = document.getElementById('btn-open-pdf');
+    if (assocPdfUrl && pdfBtn) {
+      pdfBtn.textContent = '開啟此篇 PDF ↗';
+      pdfBtn.title = '直接開啟並翻譯此頁論文 PDF，無需下載';
+    }
     await queryActiveTabStatus();
   }
 
@@ -804,10 +814,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   document.getElementById('btn-open-pdf')?.addEventListener('click', async () => {
-    const resolvedPdfUrl = typeof globalThis.KCTConfig?.resolvePdfSourceUrl === 'function'
-      ? globalThis.KCTConfig.resolvePdfSourceUrl(activeTab?.url || '')
-      : '';
-    await openPdfViewerFromPopup(resolvedPdfUrl);
+    const resolvedPdfUrl =
+      (typeof resolveAssociatedPdfUrl === 'function' ? resolveAssociatedPdfUrl(activeTab?.url || '') : '') ||
+      (typeof globalThis.KCTConfig?.resolvePdfSourceUrl === 'function'
+        ? globalThis.KCTConfig.resolvePdfSourceUrl(activeTab?.url || '')
+        : '');
+    await openPdfViewerFromPopup(resolvedPdfUrl, { detectFromTab: !resolvedPdfUrl && activeTabInjectable });
   });
 
   const openOptions = async () => {

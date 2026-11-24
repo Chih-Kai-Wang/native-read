@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NativeRead — 原版美感 AI 網頁翻譯 (Mobile & Desktop)
 // @namespace    https://chih-kai-wang.github.io/native-read/
-// @version      2.8.0
+// @version      2.8.1
 // @description  保留原網站 Serif / Sans 排版氣質的 AI 串流網頁與程式碼註解翻譯器（支援 iOS Safari Stay / Userscripts 與 Android Tampermonkey / 狐猴 / Kiwi）
 // @author       Chih-Kai Wang
 // @homepageURL  https://github.com/Chih-Kai-Wang/native-read
@@ -1132,6 +1132,7 @@
       return false;
     }
     if (/\.pdf$/i.test(pathname)) return true;
+    if (/\/doi\/pdf\//i.test(pathname)) return true;
     if (EXTENSIONLESS_PDF_HOSTS.has(host) && /^\/pdf\/[^/]+/i.test(pathname)) return true;
     if (host === 'openreview.net' && /^\/pdf\/?$/i.test(pathname) && parsed.searchParams.has('id')) return true;
     for (const [k, v] of parsed.searchParams.entries()) {
@@ -1168,6 +1169,39 @@
       return `https://drive.google.com/uc?export=download&id=${encodeURIComponent(gdriveId)}`;
     }
     if (isPdfUrl(url)) return url;
+    return '';
+  }
+
+  function resolveAssociatedPdfUrl(url) {
+    if (!url || typeof url !== 'string') return '';
+    const direct = resolvePdfSourceUrl(url);
+    if (direct) return direct;
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch (_) {
+      return '';
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return '';
+    }
+    const host = parsed.hostname.toLowerCase();
+    const pathname = parsed.pathname || '';
+    if (host === 'arxiv.org' || host === 'export.arxiv.org') {
+      const m = pathname.match(/^\/abs\/([^?#]+)$/i);
+      if (m && m[1]) {
+        const paperId = m[1].replace(/\/+$/, '');
+        if (paperId) {
+          return `https://${host}/pdf/${paperId}`;
+        }
+      }
+    }
+    if (host === 'openreview.net' && /^\/forum\/?$/i.test(pathname)) {
+      const id = parsed.searchParams.get('id');
+      if (id) {
+        return `https://openreview.net/pdf?id=${encodeURIComponent(id)}`;
+      }
+    }
     return '';
   }
 
@@ -1675,6 +1709,7 @@
     isPdfUrl,
     extractGoogleDriveFileId,
     resolvePdfSourceUrl,
+    resolveAssociatedPdfUrl,
     isAzureOpenAIEndpoint,
     buildListModelsUrl,
     parseListModelsResponse,
