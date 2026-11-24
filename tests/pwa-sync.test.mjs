@@ -129,3 +129,43 @@ test('docs/app.js defers #nr_sync scrub until after load, sets syncedAt, and nev
   assert.ok(generatedUrl.startsWith('https://chih-kai-wang.github.io/native-read/#nr_sync='), 'Builds shareable sync URL');
   assert.ok(ctx.extractNrSyncTokenFromInput(generatedUrl).length > 10, 'Extracts token back from full URL');
 });
+
+test('docs/app.js resolveAssociatedPdfUrl converts arXiv /abs & OpenReview /forum links and ignores plain pages', () => {
+  const appJs = fs.readFileSync(path.join(REPO_ROOT, 'docs/app.js'), 'utf8');
+  const match = appJs.match(
+    /function extractGoogleDriveFileId[\s\S]*?function resolveAssociatedPdfUrl[\s\S]*?\n\}/
+  );
+  assert.ok(match, 'Could not extract resolveAssociatedPdfUrl block from docs/app.js');
+
+  const ctx = { URL, encodeURIComponent };
+  vm.runInNewContext(match[0], ctx);
+
+  assert.equal(
+    ctx.resolveAssociatedPdfUrl('https://arxiv.org/abs/1706.03762'),
+    'https://arxiv.org/pdf/1706.03762'
+  );
+  assert.equal(
+    ctx.resolveAssociatedPdfUrl('https://export.arxiv.org/abs/2501.00001v2'),
+    'https://export.arxiv.org/pdf/2501.00001v2'
+  );
+  assert.equal(
+    ctx.resolveAssociatedPdfUrl('https://openreview.net/forum?id=xyz123'),
+    'https://openreview.net/pdf?id=xyz123'
+  );
+  assert.equal(
+    ctx.resolveAssociatedPdfUrl('https://example.com/blog'),
+    ''
+  );
+});
+
+test('viewer/pdf-viewer exposes #providerSelect toolbar switcher and visibilitychange deferred re-translation', () => {
+  const html = fs.readFileSync(path.join(REPO_ROOT, 'viewer/pdf-viewer.html'), 'utf8');
+  assert.ok(html.includes('id="providerSelectWrap"'), 'pdf-viewer.html exposes #providerSelectWrap');
+  assert.ok(html.includes('id="providerSelect"'), 'pdf-viewer.html exposes #providerSelect');
+
+  const js = fs.readFileSync(path.join(REPO_ROOT, 'viewer/pdf-viewer.js'), 'utf8');
+  assert.ok(js.includes('switchActiveProviderSettings'), 'pdf-viewer.js uses switchActiveProviderSettings');
+  assert.ok(js.includes('pendingVisibilitySync'), 'pdf-viewer.js tracks pendingVisibilitySync');
+  assert.ok(js.includes('snapshotPdfRenderSettings'), 'pdf-viewer.js snapshots applied PDF render settings');
+  assert.ok(js.includes("'visibilitychange'"), 'pdf-viewer.js defers hidden tab updates until visibilitychange');
+});

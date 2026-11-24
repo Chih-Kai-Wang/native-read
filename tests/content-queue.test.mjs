@@ -223,6 +223,7 @@ function createDomSandbox({ pageUrl = 'https://example.com/article', storageInit
 
   const messageListeners = [];
   const storageListeners = [];
+  const docEventListeners = new Map();
   const connectLog = [];
   let onMessageRuntime = [];
   let portHandler = null;
@@ -236,6 +237,7 @@ function createDomSandbox({ pageUrl = 'https://example.com/article', storageInit
     body,
     title: 'Test Page',
     readyState: 'complete',
+    hidden: false,
     defaultView: null,
     createDocumentFragment: () => new MockElement('#fragment'),
     createElement: (tag) => new MockElement(tag),
@@ -261,8 +263,13 @@ function createDomSandbox({ pageUrl = 'https://example.com/article', storageInit
         }
       };
     },
-    addEventListener() {},
-    removeEventListener() {}
+    addEventListener(type, fn) {
+      if (!docEventListeners.has(type)) docEventListeners.set(type, new Set());
+      docEventListeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) {
+      docEventListeners.get(type)?.delete(fn);
+    }
   };
 
   class MockIntersectionObserver {
@@ -421,6 +428,7 @@ function createDomSandbox({ pageUrl = 'https://example.com/article', storageInit
 
   return {
     context,
+    document: documentObj,
     body,
     store,
     MockElement,
@@ -438,6 +446,17 @@ function createDomSandbox({ pageUrl = 'https://example.com/article', storageInit
           if (keep !== true) resolve(undefined);
         }
       });
+    },
+    triggerStorageChange(nextSettings) {
+      store.kct_settings_v1 = nextSettings;
+      for (const fn of storageListeners) {
+        fn({ kct_settings_v1: { newValue: nextSettings } }, 'local');
+      }
+    },
+    triggerVisibilityChange() {
+      for (const fn of docEventListeners.get('visibilitychange') || []) {
+        fn();
+      }
     },
     triggerMutations(addedNodes) {
       for (const cb of mutationCbs) {
@@ -600,5 +619,81 @@ test('tryImportMobileSyncHash imports #nr_sync only on trusted GitHub Pages PWA 
     }
   } finally {
     untrusted.dispose();
+  }
+});
+
+test('background-tab storage.onChanged defers re-translation until tab becomes visible and skips no-op reverts', async () => {
+  const baseSettings = {
+    settingsSchemaVersion: 6,
+    enabled: true,
+    scope: 'course',
+    targetLang: 'zh-TW',
+    customTargetLang: '',
+    translateCodeComments: true,
+    customGlossary: '',
+    lazyViewport: false,
+    providerId: 'openai',
+    protocol: 'openai',
+    baseUrl: 'https://api.openai.com/v1',
+    apiKey: 'sk-visibility-test-1',
+    model: 'gpt-4o-mini',
+    streamTranslation: true
+  };
+
+  const env = createDomSandbox({
+    pageUrl: 'https://example.com/paper',
+    storageInit: { kct_settings_v1: { ...baseSettings } }
+  });
+  const main = new env.MockElement('main');
+  const p1 = new env.MockElement('p');
+  p1.textContent = 'First sentence requiring translation while tab visibility transitions occur.';
+  main.appendChild(p1);
+  env.body.appendChild(main);
+
+  let streamCalls = 0;
+  env.setPortHandler((msg, emit) => {
+    if (msg.type === 'TRANSLATE_STREAM') {
+      streamCalls += 1;
+      for (const it of msg.items || []) {
+        emit({ type: 'ITEM', requestId: msg.requestId, key: it.key, zh: `譯文_${streamCalls}:${it.text}`, cached: false });
+      }
+      emit({ type: 'DONE', requestId: msg.requestId, translatedCount: (msg.items || []).length });
+    }
+  });
+
+  try {
+    env.loadContentScript();
+    await new Promise((r) => setTimeout(r, 30));
+
+    // 1. Initial active translation
+    await env.triggerContentMessage({ type: 'KCT_COMMAND', action: 'TRANSLATE_NOW' });
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(streamCalls, 1, 'Initial active translation fires 1 stream call');
+
+    // 2. While tab is hidden, storage changes targetLang to 'ja' -> ZERO calls
+    env.document.hidden = true;
+    env.triggerStorageChange({ ...baseSettings, targetLang: 'ja' });
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(streamCalls, 1, 'Hidden tab fires ZERO API calls when storage changes');
+
+    // 3. Storage reverts to 'zh-TW' before tab becomes visible -> restoring visibility fires ZERO redundant calls
+    env.triggerStorageChange({ ...baseSettings, targetLang: 'zh-TW' });
+    env.document.hidden = false;
+    env.triggerVisibilityChange();
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(streamCalls, 1, 'Reverted settings while hidden skip redundant re-translation on visibility restore');
+
+    // 4. Hidden change to 'ja' followed by returning to tab DOES trigger re-translation
+    env.document.hidden = true;
+    env.triggerStorageChange({ ...baseSettings, targetLang: 'ja' });
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(streamCalls, 1, 'Still zero calls while hidden');
+
+    env.document.hidden = false;
+    env.triggerVisibilityChange();
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(streamCalls, 2, 'Triggers deferred re-translation once tab becomes visible again');
+  } finally {
+    env.dispose();
   }
 });

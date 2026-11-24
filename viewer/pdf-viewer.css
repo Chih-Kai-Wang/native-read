@@ -217,6 +217,11 @@ body {
   max-width: 136px;
 }
 
+.nr-select-provider {
+  max-width: 148px;
+  text-overflow: ellipsis;
+}
+
 .nr-select:focus-visible,
 .nr-icon-btn:focus-visible,
 .nr-action-btn:focus-visible,

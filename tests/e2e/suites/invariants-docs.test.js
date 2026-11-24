@@ -813,8 +813,14 @@ export function registerTests(ctx) {
     name: 'System prompt instructs preserving [[C#]], [[M#]], and [[L#]] placeholders in both stream & batch modes',
     usesBrowser: true,
     async run() {
+      const nonce = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
       const capturedPrompts = [];
       const mockLlm = await startMockLlmServer((req, res) => {
+        if (!JSON.stringify(req.body || '').includes(nonce)) {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
         const sys = req.body?.messages?.find((m) => m.role === 'system')?.content || '';
         capturedPrompts.push({ stream: Boolean(req.body?.stream), sys });
         if (req.body?.stream) {
@@ -828,7 +834,6 @@ export function registerTests(ctx) {
         }
       });
 
-      const nonce = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
       try {
         await runEgoScript(
           async ({ page, args, helpers }) => {
@@ -907,7 +912,15 @@ export function registerTests(ctx) {
     name: 'kct-stream Port emits ITEM/DONE and populates kct_cache_db_v2 so 2nd request hits cache without LLM call',
     usesBrowser: true,
     async run() {
+      const nonce = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      let matchedCalls = 0;
       const mockLlm = await startMockLlmServer((req, res) => {
+        if (!JSON.stringify(req.body || '').includes(nonce)) {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+        matchedCalls += 1;
         res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
         res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: '{"i":0,"t":"你好 [[C0]] 世界"}\n' } }] })}\n\n`);
         res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: '{"i":1,"t":"第二 [[L0]] 項目"}\n' } }] })}\n\n`);
@@ -915,7 +928,6 @@ export function registerTests(ctx) {
         res.end();
       });
 
-      const nonce = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
       try {
         const res = await runEgoScript(
           async ({ page, args, helpers }) => {
@@ -976,7 +988,7 @@ export function registerTests(ctx) {
           { args: { v1Url: mockLlm.v1Url, nonceVal: nonce } }
         );
 
-        assertEqual(mockLlm.requests.length, 1, 'LLM called exactly once (2nd call served from cache)');
+        assertEqual(matchedCalls, 1, 'LLM called exactly once (2nd call served from cache)');
         const firstItems = res.first.filter((e) => e.type === 'ITEM' || e.type === 'CHUNK');
         const firstDone = res.first.find((e) => e.type === 'DONE');
         assertEqual(firstItems.length, 2, 'First stream delivered 2 items');
@@ -1001,31 +1013,39 @@ export function registerTests(ctx) {
     name: 'kct-stream ERROR on fatal HTTP 401 & missing-item release allows re-translation on next trigger',
     usesBrowser: true,
     async run() {
+      const nonce = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
       let mode = 'fatal401';
-      let pageReqCount = 0;
       const mockLlm = await startMockLlmServer((req, res) => {
         if (mode === 'fatal401') {
           res.writeHead(401, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: { message: 'Invalid API key' } }));
           return;
         }
-        pageReqCount++;
+        if (!JSON.stringify(req.body || '').includes(nonce)) {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
         const userMsg = req.body?.messages?.find((m) => m.role === 'user')?.content || '';
-        let itemCount = 0;
+        let parsedItems = [];
         try {
           const parsed = JSON.parse(userMsg);
-          if (Array.isArray(parsed)) itemCount = parsed.length;
+          if (Array.isArray(parsed)) parsedItems = parsed;
         } catch (_) {}
-        if (mode === 'omitSecond' && pageReqCount === 1) {
-          // Return only index 0 in stream and omit index 1 everywhere
+        const itemCount = parsedItems.length;
+        if (mode === 'omitSecond') {
+          // Omit p2 across SSE stream, JSON batch fallback, and single-item plain-text fallback until /allow-second
           if (req.body?.stream) {
             res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
-            res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: '{"i":0,"t":"僅第一段完成"}\n' } }] })}\n\n`);
+            if (String(parsedItems[0]?.text || '').includes('First paragraph')) {
+              res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: '{"i":0,"t":"僅第一段完成"}\n' } }] })}\n\n`);
+            }
             res.write('data: [DONE]\n\n');
             res.end();
           } else {
+            const content = parsedItems.length > 0 ? JSON.stringify({ translations: [] }) : '';
             res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ translations: [] }) } }] }));
+            res.end(JSON.stringify({ choices: [{ message: { content } }] }));
           }
           return;
         }
@@ -1036,6 +1056,9 @@ export function registerTests(ctx) {
           }
           res.write('data: [DONE]\n\n');
           res.end();
+        } else if (parsedItems.length === 0) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ choices: [{ message: { content: '補齊譯文 0' } }] }));
         } else {
           const translations = Array.from({ length: itemCount }, (_, i) => ({ id: i, zh: `補齊譯文 ${i}` }));
           res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1043,9 +1066,14 @@ export function registerTests(ctx) {
         }
       });
 
-      const nonce = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
       const pageServer = await startFixtureServer({
         onRequest(req, res, rawPath) {
+          if (rawPath === '/allow-second') {
+            mode = 'completeAll';
+            res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Content-Length': 2 });
+            res.end('ok');
+            return true;
+          }
           if (rawPath === '/missing-release.html') {
             const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Missing Item Release</title></head><body><main><article><p id="p1">First paragraph unique ${nonce}.</p><p id="p2">Second paragraph unique ${nonce}.</p></article></main></body></html>`;
             res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': Buffer.byteLength(html) });
@@ -1069,6 +1097,7 @@ export function registerTests(ctx) {
                       ...(orig.kct_settings_v1 || {}),
                       settingsSchemaVersion: 5,
                       providerId: 'custom',
+                      fallbackProviderId: '',
                       protocol: 'openai',
                       baseUrl: v1Url,
                       apiKey: '',
@@ -1128,6 +1157,7 @@ export function registerTests(ctx) {
                     enabled: true,
                     autoTranslate: false,
                     providerId: 'custom',
+                    fallbackProviderId: '',
                     protocol: 'openai',
                     baseUrl: v1Url,
                     apiKey: '',
@@ -1152,6 +1182,7 @@ export function registerTests(ctx) {
                 p2: document.getElementById('p2')?.hasAttribute('data-kct-has-trans')
               }));
 
+              await page.evaluate(() => fetch('/allow-second'));
               await helpers.triggerExtensionOnTab(task, args.pageUrl, 'TRANSLATE_NOW');
               await page.waitForFunction(
                 () => Boolean(document.getElementById('p2')?.hasAttribute('data-kct-has-trans')),
@@ -1194,7 +1225,15 @@ export function registerTests(ctx) {
     name: 'Multi-object & pretty-printed JSON parsed cleanly without duplicate emission or double-billing',
     usesBrowser: true,
     async run() {
+      const nonce = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      let matchedCalls = 0;
       const mockLlm = await startMockLlmServer((req, res) => {
+        if (!JSON.stringify(req.body || '').includes(nonce)) {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+        matchedCalls += 1;
         const prettyObjects = '{\n  "i": 0,\n  "t": "第一物件譯文"\n}\n{\n  "i": 1,\n  "t": "第二物件譯文"\n}\n';
         if (req.body?.stream) {
           res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
@@ -1221,7 +1260,6 @@ export function registerTests(ctx) {
         }
       });
 
-      const nonce = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
       try {
         const res = await runEgoScript(
           async ({ page, args, helpers }) => {
@@ -1289,7 +1327,7 @@ export function registerTests(ctx) {
           { args: { v1Url: mockLlm.v1Url, nonceVal: nonce } }
         );
 
-        assertEqual(mockLlm.requests.length, 2, 'Exactly 1 stream request + 1 batch request (zero fallback double-billing)');
+        assertEqual(matchedCalls, 2, 'Exactly 1 stream request + 1 batch request (zero fallback double-billing)');
         const items = res.streamEvents.filter((e) => e.type === 'ITEM' || e.type === 'CHUNK');
         const done = res.streamEvents.find((e) => e.type === 'DONE');
         assertEqual(items.length, 2, 'Pretty-printed multi-object stream emitted 2 unique items');

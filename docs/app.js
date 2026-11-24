@@ -3091,6 +3091,52 @@ function resolvePdfSourceUrl(url) {
   return url;
 }
 
+function resolveAssociatedPdfUrl(url) {
+  if (!url || typeof url !== 'string') return '';
+  const trimmed = url.trim();
+  if (!trimmed) return '';
+  const gdriveId = extractGoogleDriveFileId(trimmed);
+  if (gdriveId) {
+    return resolvePdfSourceUrl(trimmed);
+  }
+  let parsed;
+  try {
+    parsed = new URL(trimmed);
+  } catch (_) {
+    return '';
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return '';
+  }
+  const host = parsed.hostname.toLowerCase();
+  const pathname = parsed.pathname || '';
+  if (host === 'arxiv.org' || host === 'export.arxiv.org') {
+    const absMatch = pathname.match(/^\/abs\/([^?#]+)$/i);
+    if (absMatch && absMatch[1]) {
+      const paperId = absMatch[1].replace(/\/+$/, '');
+      if (paperId) {
+        return `https://${host}/pdf/${paperId}`;
+      }
+    }
+    if (/^\/pdf\//i.test(pathname)) {
+      return parsed.toString();
+    }
+  }
+  if (host === 'openreview.net') {
+    const id = parsed.searchParams.get('id');
+    if (/^\/forum\/?$/i.test(pathname) && id) {
+      return `https://openreview.net/pdf?id=${encodeURIComponent(id)}`;
+    }
+    if (/^\/pdf\/?$/i.test(pathname) && id) {
+      return parsed.toString();
+    }
+  }
+  if (/\.pdf$/i.test(pathname) || /\/doi\/pdf\//i.test(pathname)) {
+    return parsed.toString();
+  }
+  return '';
+}
+
 function showPdfError(title, detail, canRetry, openUrl = '') {
   let safeOpenUrl = '';
   if (openUrl && typeof openUrl === 'string') {
@@ -3128,7 +3174,7 @@ async function loadPdfFromUrl(rawUrl) {
 
   const originalUrl = parsed.toString();
   const gdriveId = extractGoogleDriveFileId(originalUrl);
-  const fetchUrl = resolvePdfSourceUrl(originalUrl);
+  const fetchUrl = resolveAssociatedPdfUrl(originalUrl) || resolvePdfSourceUrl(originalUrl);
 
   state.sourceUrl = originalUrl;
   showPdfStage('loading');
@@ -4089,8 +4135,8 @@ function bindEvents() {
     e.preventDefault();
     const url = dom.webUrlInput.value.trim();
     if (!url) return;
-    // If user pasted a direct PDF link into Web tab, automatically route to PDF tab!
-    if (/\.pdf(?:$|\?)/i.test(url) || /arxiv\.org\/pdf\//i.test(url) || /openreview\.net\/pdf\?id=/i.test(url)) {
+    // If user pasted a direct or associated PDF link (arXiv /abs/, OpenReview /forum, Drive, /doi/pdf/) into Web tab, route to PDF tab!
+    if (resolveAssociatedPdfUrl(url)) {
       switchTab('pdf');
       dom.pdfUrlInput.value = url;
       loadPdfFromUrl(url);
@@ -4478,7 +4524,7 @@ async function init() {
     await loadPdfFromUrl(srcPdf.trim());
   } else if (rawShare && /https?:\/\/\S+/i.test(rawShare.trim())) {
     const cleanUrl = rawShare.trim().match(/https?:\/\/\S+/i)[0].replace(/[),.;:!?'"\]>]+$/, '');
-    if (/\.pdf(?:$|\?)/i.test(cleanUrl) || /arxiv\.org\/pdf\//i.test(cleanUrl) || /openreview\.net\/pdf\?id=/i.test(cleanUrl)) {
+    if (resolveAssociatedPdfUrl(cleanUrl)) {
       switchTab('pdf');
       dom.pdfUrlInput.value = cleanUrl;
       await loadPdfFromUrl(cleanUrl);

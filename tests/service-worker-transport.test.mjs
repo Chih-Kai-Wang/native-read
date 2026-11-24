@@ -17,6 +17,7 @@ function loadServiceWorker({ initialSettings = {}, fetchImpl, tabsById = {}, tab
   const onConnectListeners = [];
   const cacheMap = new Map();
   const createdTabs = [];
+  const dynamicTabs = { ...tabsById };
   let fileSchemeAllowed = false;
 
   let currentFetch = fetchImpl || (async () => new Response('{}', { status: 200 }));
@@ -39,6 +40,8 @@ function loadServiceWorker({ initialSettings = {}, fetchImpl, tabsById = {}, tab
     btoa: (s) => Buffer.from(s, 'binary').toString('base64'),
     setTimeout: (fn, ms, ...a) => setTimeout(fn, ms >= 300 ? 15 : ms, ...a),
     clearTimeout,
+    setInterval: (fn, ms, ...a) => setInterval(fn, ms >= 200 ? 15 : ms, ...a),
+    clearInterval,
     fetch: (...args) => currentFetch(...args),
     importScripts() {},
     chrome: {
@@ -48,7 +51,30 @@ function loadServiceWorker({ initialSettings = {}, fetchImpl, tabsById = {}, tab
         onInstalled: noopEvent(),
         onStartup: noopEvent(),
         onConnect: { addListener(fn) { onConnectListeners.push(fn); } },
-        onMessage: { addListener(fn) { onMessageListener = fn; } }
+        onMessage: { addListener(fn) { onMessageListener = fn; } },
+        connect(connectInfo = {}) {
+          const clientMsgListeners = [];
+          const clientDiscListeners = [];
+          const serverMsgListeners = [];
+          const serverDiscListeners = [];
+          const serverPort = {
+            name: connectInfo.name || '',
+            sender: { id: 'native-read-test-ext' },
+            onMessage: { addListener(fn) { serverMsgListeners.push(fn); } },
+            onDisconnect: { addListener(fn) { serverDiscListeners.push(fn); } },
+            postMessage(m) { for (const fn of clientMsgListeners) fn(m); },
+            disconnect() { for (const fn of clientDiscListeners) fn(); }
+          };
+          const clientPort = {
+            name: connectInfo.name || '',
+            onMessage: { addListener(fn) { clientMsgListeners.push(fn); } },
+            onDisconnect: { addListener(fn) { clientDiscListeners.push(fn); } },
+            postMessage(m) { for (const fn of serverMsgListeners) fn(m); },
+            disconnect() { for (const fn of serverDiscListeners) fn(); }
+          };
+          for (const fn of onConnectListeners) fn(serverPort);
+          return clientPort;
+        }
       },
       extension: {
         isAllowedFileSchemeAccess(cb) { if (typeof cb === 'function') cb(fileSchemeAllowed); }
@@ -63,15 +89,20 @@ function loadServiceWorker({ initialSettings = {}, fetchImpl, tabsById = {}, tab
         onUpdated: noopEvent(),
         onRemoved: noopEvent(),
         async get(id) {
-          if (!(id in tabsById)) throw new Error('Tab not found');
-          return tabsById[id];
+          if (!(id in dynamicTabs)) throw new Error('Tab not found');
+          return dynamicTabs[id];
         },
         async query() {
-          return Array.isArray(tabsList) ? tabsList : Object.values(tabsById);
+          return Array.isArray(tabsList) ? tabsList : Object.values(dynamicTabs);
         },
         async create(props) {
           createdTabs.push(props);
-          return { id: 900 + createdTabs.length, ...props };
+          const tab = { id: 900 + createdTabs.length, status: 'complete', ...props };
+          dynamicTabs[tab.id] = tab;
+          return tab;
+        },
+        async remove(id) {
+          delete dynamicTabs[id];
         }
       },
       scripting: {
@@ -493,4 +524,169 @@ test('IMPORT_SYNC_PAYLOAD accepts valid sync URL from extension sender, rejects 
     { url: 'https://untrusted.example/page.html', tab: { id: 55 } }
   );
   assert.equal(untrustedRes.ok, false);
+});
+
+test('fetchPdfInTabAndStream omits Accept on force-cache and retries HTTP 403 with credentials: omit', async () => {
+  const fetchCalls = [];
+  let env;
+  env = loadServiceWorker({
+    tabsById: {
+      50: { id: 50, index: 0, windowId: 1, url: 'https://cdn.example/paper.pdf', status: 'complete' }
+    },
+    executeScriptImpl: async (opts) => {
+      if (opts.target.allFrames) {
+        return [{
+          frameId: 0,
+          result: { isPdf: true, url: 'https://cdn.example/paper.pdf', origin: 'https://cdn.example', detectedHref: '' }
+        }];
+      }
+      if (Array.isArray(opts.target.frameIds)) {
+        const res = await env.context.fetchPdfInTabAndStream(...opts.args);
+        return [{ result: res }];
+      }
+      return [];
+    },
+    fetchImpl: async (url, opts = {}) => {
+      fetchCalls.push({
+        url: String(url),
+        cache: opts.cache,
+        credentials: opts.credentials,
+        hasAccept: Boolean(opts.headers && ('Accept' in opts.headers || 'accept' in opts.headers))
+      });
+      if (fetchCalls.length <= 2) {
+        return new Response('Forbidden', { status: 403 });
+      }
+      return new Response(Buffer.from('%PDF-1.7\n1 0 obj\n'), { status: 200 });
+    }
+  });
+
+  const viewerMessages = [];
+  let triggerViewerMsg;
+  const donePromise = new Promise((resolve) => {
+    const viewerPort = {
+      name: 'kct-pdf-fetch',
+      sender: {
+        id: 'native-read-test-ext',
+        url: 'chrome-extension://native-read-test-ext/viewer/pdf-viewer.html'
+      },
+      onDisconnect: { addListener() {} },
+      onMessage: { addListener(fn) { triggerViewerMsg = fn; } },
+      postMessage(msg) {
+        viewerMessages.push(msg);
+        if (msg.type === 'PDF_END' || msg.type === 'PDF_FALLBACK' || msg.type === 'PDF_AUTH_REQUIRED') {
+          resolve();
+        }
+      },
+      disconnect() {}
+    };
+    env.getOnConnect()(viewerPort);
+  });
+
+  triggerViewerMsg({
+    type: 'FETCH_PDF_FROM_TAB',
+    requestId: 'tx_403_omit',
+    tabId: 50,
+    url: 'https://cdn.example/paper.pdf'
+  });
+  await donePromise;
+
+  assert.equal(fetchCalls.length, 3);
+  assert.deepEqual(fetchCalls[0], {
+    url: 'https://cdn.example/paper.pdf',
+    cache: 'force-cache',
+    credentials: 'include',
+    hasAccept: false
+  });
+  assert.deepEqual(fetchCalls[1], {
+    url: 'https://cdn.example/paper.pdf',
+    cache: 'default',
+    credentials: 'include',
+    hasAccept: true
+  });
+  assert.deepEqual(fetchCalls[2], {
+    url: 'https://cdn.example/paper.pdf',
+    cache: 'default',
+    credentials: 'omit',
+    hasAccept: false
+  });
+
+  assert.equal(viewerMessages[0]?.type, 'PDF_META');
+  const chunks = viewerMessages.filter((m) => m.type === 'PDF_CHUNK');
+  assert.equal(chunks.length, 1);
+  assert.equal(Buffer.from(chunks[0].data, 'base64').toString('utf8'), '%PDF-1.7\n1 0 obj\n');
+  assert.equal(viewerMessages[viewerMessages.length - 1]?.type, 'PDF_END');
+});
+
+test('FETCH_PDF_VIA_BG_TAB falls back to wrapper detectedHref transfer when top page is HTML', async () => {
+  const transferCalls = [];
+  let env;
+  env = loadServiceWorker({
+    executeScriptImpl: async (opts) => {
+      if (opts.target.allFrames) {
+        return [{
+          frameId: 0,
+          result: {
+            isPdf: false,
+            url: 'https://paper.example/stamp?arnumber=123',
+            origin: 'https://paper.example',
+            detectedHref: 'https://paper.example/ielx7/123.pdf'
+          }
+        }];
+      }
+      if (Array.isArray(opts.target.frameIds)) {
+        transferCalls.push({
+          tabId: opts.target.tabId,
+          frameIds: [...opts.target.frameIds],
+          fetchUrl: opts.args[1]
+        });
+        const res = await env.context.fetchPdfInTabAndStream(...opts.args);
+        return [{ result: res }];
+      }
+      return [];
+    },
+    fetchImpl: async (url) => {
+      if (String(url) === 'https://paper.example/ielx7/123.pdf') {
+        return new Response(Buffer.from('%PDF-1.7\nwrapper-ok\n'), { status: 200 });
+      }
+      return new Response('Not Found', { status: 404 });
+    }
+  });
+
+  const viewerMessages = [];
+  let triggerViewerMsg;
+  const donePromise = new Promise((resolve) => {
+    const viewerPort = {
+      name: 'kct-pdf-fetch',
+      sender: {
+        id: 'native-read-test-ext',
+        url: 'chrome-extension://native-read-test-ext/viewer/pdf-viewer.html'
+      },
+      onDisconnect: { addListener() {} },
+      onMessage: { addListener(fn) { triggerViewerMsg = fn; } },
+      postMessage(msg) {
+        viewerMessages.push(msg);
+        if (msg.type === 'PDF_END' || msg.type === 'PDF_FALLBACK' || msg.type === 'PDF_AUTH_REQUIRED') {
+          resolve();
+        }
+      },
+      disconnect() {}
+    };
+    env.getOnConnect()(viewerPort);
+  });
+
+  triggerViewerMsg({
+    type: 'FETCH_PDF_VIA_BG_TAB',
+    requestId: 'bg_wrapper_1',
+    url: 'https://paper.example/stamp?arnumber=123'
+  });
+  await donePromise;
+
+  assert.equal(transferCalls.length, 1);
+  assert.deepEqual(transferCalls[0].frameIds, [0]);
+  assert.equal(transferCalls[0].fetchUrl, 'https://paper.example/ielx7/123.pdf');
+  assert.equal(viewerMessages.some((m) => m.type === 'PDF_AUTH_REQUIRED'), false);
+  const chunks = viewerMessages.filter((m) => m.type === 'PDF_CHUNK');
+  assert.equal(chunks.length, 1);
+  assert.equal(Buffer.from(chunks[0].data, 'base64').toString('utf8'), '%PDF-1.7\nwrapper-ok\n');
+  assert.equal(viewerMessages[viewerMessages.length - 1]?.type, 'PDF_END');
 });

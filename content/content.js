@@ -52,6 +52,8 @@
   };
 
   let pageActive = false;
+  let lastAppliedSettings = null;
+  let pendingVisibilitySync = false;
   let pageInfo = classifyPage();
   let lastPageKey = location.origin + location.pathname;
   let scanTimer = null;
@@ -691,6 +693,7 @@
     if (state.haltedByError && !force) return;
     CodeOverlay.injectOutputTranslateButtons(state.settings, getPageContext());
     if (!state.settings.enabled && !force) return;
+    lastAppliedSettings = snapshotRenderSettings(state.settings);
 
     const newBlocks = collectCandidateBlocks(force);
     const newComments = CodeOverlay.collectCodeComments(force, state.settings, state);
@@ -2166,6 +2169,72 @@
     return false;
   });
 
+  function snapshotRenderSettings(s) {
+    if (!s || typeof s !== 'object') return null;
+    return {
+      enabled: Boolean(s.enabled),
+      scope: s.scope,
+      targetLang: s.targetLang,
+      customTargetLang: s.customTargetLang,
+      translateCodeComments: s.translateCodeComments,
+      customGlossary: s.customGlossary,
+      lazyViewport: s.lazyViewport,
+      providerId: s.providerId,
+      protocol: s.protocol,
+      baseUrl: s.baseUrl,
+      apiKey: s.apiKey,
+      model: s.model
+    };
+  }
+
+  function applySettingsTransition(prev, next) {
+    if (!prev || !next?.enabled || !pageActive) return;
+    const nonProviderChanged = (
+      prev.scope !== next.scope ||
+      prev.targetLang !== next.targetLang ||
+      prev.customTargetLang !== next.customTargetLang ||
+      prev.translateCodeComments !== next.translateCodeComments ||
+      prev.customGlossary !== next.customGlossary ||
+      prev.lazyViewport !== next.lazyViewport ||
+      !prev.enabled
+    );
+    const providerChanged = (
+      prev.providerId !== next.providerId ||
+      prev.baseUrl !== next.baseUrl ||
+      prev.apiKey !== next.apiKey ||
+      prev.model !== next.model ||
+      prev.protocol !== next.protocol
+    );
+
+    if (nonProviderChanged) {
+      state.haltedByError = false;
+      resetAndClearPage(false);
+      scanAndTranslate(true);
+    } else if (providerChanged) {
+      state.haltedByError = false;
+      if (state.lastErrorMsg) {
+        state.lastErrorMsg = '';
+        state.fallbackNotice = '';
+        cancelAllActiveStreams();
+        updateWidgetUI();
+        lastAppliedSettings = snapshotRenderSettings(next);
+        scanAndTranslate(false);
+      } else if (prev.model !== next.model || prev.protocol !== next.protocol) {
+        resetAndClearPage(false);
+        scanAndTranslate(true);
+      } else {
+        lastAppliedSettings = snapshotRenderSettings(next);
+      }
+    }
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && pendingVisibilitySync && pageActive && state.settings?.enabled) {
+      pendingVisibilitySync = false;
+      applySettingsTransition(lastAppliedSettings, state.settings);
+    }
+  });
+
   chrome.storage.onChanged.addListener((changes, areaName) => {
     if (areaName !== 'local' || !changes[SETTINGS_KEY]) return;
     const nextSettings = changes[SETTINGS_KEY].newValue;
@@ -2184,41 +2253,14 @@
 
     if (pageActive) {
       if (prev && prev.enabled && !state.settings.enabled) {
+        pendingVisibilitySync = false;
         resetAndClearPage(false);
       } else if (prev && state.settings.enabled) {
-        const nonProviderChanged = (
-          prev.scope !== state.settings.scope ||
-          prev.targetLang !== state.settings.targetLang ||
-          prev.customTargetLang !== state.settings.customTargetLang ||
-          prev.translateCodeComments !== state.settings.translateCodeComments ||
-          prev.customGlossary !== state.settings.customGlossary ||
-          prev.lazyViewport !== state.settings.lazyViewport ||
-          !prev.enabled
-        );
-        const providerChanged = (
-          prev.providerId !== state.settings.providerId ||
-          prev.baseUrl !== state.settings.baseUrl ||
-          prev.apiKey !== state.settings.apiKey ||
-          prev.model !== state.settings.model ||
-          prev.protocol !== state.settings.protocol
-        );
-
-        if (nonProviderChanged) {
-          state.haltedByError = false;
-          resetAndClearPage(false);
-          scanAndTranslate(true);
-        } else if (providerChanged) {
-          state.haltedByError = false;
-          if (state.lastErrorMsg) {
-            state.lastErrorMsg = '';
-            state.fallbackNotice = '';
-            cancelAllActiveStreams();
-            updateWidgetUI();
-            scanAndTranslate(false);
-          } else if (prev.model !== state.settings.model || prev.protocol !== state.settings.protocol) {
-            resetAndClearPage(false);
-            scanAndTranslate(true);
-          }
+        if (document.hidden) {
+          pendingVisibilitySync = true;
+        } else {
+          pendingVisibilitySync = false;
+          applySettingsTransition(prev, state.settings);
         }
       }
     }

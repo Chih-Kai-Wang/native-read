@@ -14,12 +14,15 @@ import {
 pdfjsLib.GlobalWorkerOptions.workerSrc = chrome.runtime.getURL('vendor/pdfjs/pdf.worker.min.mjs');
 
 const {
+  PROVIDER_PRESETS,
   TARGET_LANGUAGES,
   SETTINGS_KEY,
   getSettings,
   saveSettings,
   hashText,
   resolveTargetLanguage,
+  listSavedProviders,
+  switchActiveProviderSettings,
   formatApiError,
   resolvePdfSourceUrl,
   resolveAssociatedPdfUrl
@@ -35,6 +38,8 @@ const dom = {
   docTitle: document.getElementById('docTitle'),
   pageIndicator: document.getElementById('pageIndicator'),
   modeSegmented: document.getElementById('modeSegmented'),
+  providerSelectWrap: document.getElementById('providerSelectWrap'),
+  providerSelect: document.getElementById('providerSelect'),
   langSelect: document.getElementById('langSelect'),
   zoomOutBtn: document.getElementById('zoomOutBtn'),
   zoomResetBtn: document.getElementById('zoomResetBtn'),
@@ -78,6 +83,8 @@ const dom = {
 // ============================================================
 const state = {
   settings: null,
+  appliedSettings: null,
+  pendingVisibilitySync: false,
   mode: 'overlay', // 'overlay' | 'split' | 'original'
   zoom: 1.0,
   baseFitScale: 1.35,
@@ -376,6 +383,49 @@ function populateLanguageSelect(currentLang) {
   } else {
     dom.langSelect.value = 'zh-TW';
   }
+}
+
+function renderProviderSelect(settings) {
+  if (!dom.providerSelect || !dom.providerSelectWrap) return;
+  const s = settings || state.settings || {};
+  const saved = typeof listSavedProviders === 'function' ? listSavedProviders(s) : [];
+  dom.providerSelect.replaceChildren();
+  dom.providerSelectWrap.hidden = saved.length === 0;
+  if (saved.length === 0) return;
+
+  for (const p of saved) {
+    const opt = document.createElement('option');
+    opt.value = p.providerId;
+    const modelPart = p.model ? ` (${p.model})` : '';
+    const badgePart = p.isFallback ? ' [備援]' : '';
+    opt.textContent = `${p.label}${modelPart}${badgePart}`;
+    dom.providerSelect.appendChild(opt);
+  }
+  const manageOpt = document.createElement('option');
+  manageOpt.value = '__manage__';
+  manageOpt.textContent = '管理供應商…';
+  dom.providerSelect.appendChild(manageOpt);
+
+  const activeId = s.providerId || '';
+  if (saved.some((p) => p.providerId === activeId)) {
+    dom.providerSelect.value = activeId;
+  } else {
+    dom.providerSelect.value = saved[0].providerId;
+  }
+}
+
+function snapshotPdfRenderSettings(s) {
+  if (!s || typeof s !== 'object') return null;
+  return {
+    targetLang: s.targetLang,
+    customTargetLang: s.customTargetLang,
+    customGlossary: s.customGlossary,
+    providerId: s.providerId,
+    baseUrl: s.baseUrl,
+    apiKey: s.apiKey,
+    model: s.model,
+    protocol: s.protocol
+  };
 }
 
 function getPageContext() {
@@ -1410,6 +1460,8 @@ async function openPdfFromArrayBuffer(arrayBuffer, { title, host, sourceUrl = ''
 
     state.pdfDoc = pdfDoc;
     state.numPages = pdfDoc.numPages;
+    state.appliedSettings = snapshotPdfRenderSettings(state.settings);
+    state.pendingVisibilitySync = false;
 
     // Extract PDF metadata title if available
     try {
@@ -1620,11 +1672,14 @@ async function fetchDirectRemotePdf(url, signal) {
       return { ...lastResult, aborted: true };
     }
     try {
-      const resp = await fetch(url, {
+      const fetchOpts = {
         credentials: creds,
-        headers: { Accept: 'application/pdf,application/octet-stream,*/*' },
         signal
-      });
+      };
+      if (creds === 'include') {
+        fetchOpts.headers = { Accept: 'application/pdf,application/octet-stream,*/*' };
+      }
+      const resp = await fetch(url, fetchOpts);
       if (!resp.ok) {
         lastResult = {
           ok: false,
@@ -1828,9 +1883,16 @@ async function loadPdfFromUrl(rawUrl, { sourceTabId = null } = {}) {
       if (tier3?.finalUrl && /^https?:\/\//i.test(tier3.finalUrl)) {
         state.sourceUrl = tier3.finalUrl;
       }
+      const errStatus =
+        tier2.status === 401 || tier2.status === 403
+          ? tier2.status
+          : tier1?.status === 401 || tier1?.status === 403
+            ? tier1.status
+            : 0;
+      const statusHint = errStatus ? `（HTTP ${errStatus}）` : '';
       showError(
         '需要於原網頁開啟或驗證此 PDF',
-        '此網站需要登入或瀏覽器驗證。請點擊下方「前往原網頁開啟／登入」，待畫面顯示 PDF 後按 Alt+T 或回來點「重試載入」即可直接翻譯，無需下載；或改用「開啟本機 PDF 檔案」。',
+        `此網站需要登入或瀏覽器驗證${statusHint}。請點擊下方「前往原網頁開啟／登入」，待畫面顯示 PDF 後按 Alt+T 或回來點「重試載入」即可直接翻譯，無需下載；或改用「開啟本機 PDF 檔案」。`,
         true,
         { canOpenSource: true }
       );
@@ -1900,6 +1962,8 @@ async function handleTargetLanguageChange(newLang, { persist = true } = {}) {
     state.settings = await saveSettings({ targetLang: newLang });
   }
   if (!state.pdfDoc) return;
+  state.appliedSettings = snapshotPdfRenderSettings(state.settings);
+  state.pendingVisibilitySync = false;
 
   state.translationEpoch += 1;
   cancelAllActiveStreams();
@@ -2019,6 +2083,27 @@ function bindEvents() {
     setMode(btn.dataset.mode);
   });
 
+  // Provider quick-switcher
+  dom.providerSelect?.addEventListener('change', async () => {
+    const val = dom.providerSelect.value;
+    if (val === '__manage__') {
+      renderProviderSelect(state.settings);
+      openOptions();
+      return;
+    }
+    if (!val || typeof switchActiveProviderSettings !== 'function') return;
+    const prev = state.settings;
+    const hadError = Boolean(state.lastError);
+    const switched = switchActiveProviderSettings(prev || {}, val);
+    const saved = await saveSettings(switched);
+    state.settings = saved;
+    state.pendingVisibilitySync = false;
+    renderProviderSelect(saved);
+    if (state.pdfDoc) {
+      applyPdfSettingsTransition(prev, saved, hadError);
+    }
+  });
+
   // Target language selector
   dom.langSelect.addEventListener('change', () => {
     handleTargetLanguageChange(dom.langSelect.value);
@@ -2078,6 +2163,7 @@ function bindEvents() {
       state.lastErrorCode = '';
       state.lastErrorRetryable = false;
       state.fallbackNotice = '';
+      state.appliedSettings = snapshotPdfRenderSettings(state.settings);
       updateStatusBadge();
       for (const pageRec of state.pages.values()) {
         if (pageRec.isVisible && pageRec.translatedEpoch !== state.translationEpoch) {
@@ -2197,6 +2283,55 @@ function bindEvents() {
     }
   });
 
+  function applyPdfSettingsTransition(prev, next, hadError) {
+    if (!state.pdfDoc || !next) return;
+    const nonProviderChanged = Boolean(
+      prev && (
+        next.targetLang !== prev.targetLang ||
+        next.customTargetLang !== prev.customTargetLang ||
+        next.customGlossary !== prev.customGlossary
+      )
+    );
+    const providerChanged = Boolean(
+      prev && (
+        next.providerId !== prev.providerId ||
+        next.baseUrl !== prev.baseUrl ||
+        next.apiKey !== prev.apiKey ||
+        next.model !== prev.model ||
+        next.protocol !== prev.protocol
+      )
+    );
+
+    if (nonProviderChanged) {
+      handleTargetLanguageChange(next.targetLang || 'zh-TW', { persist: false });
+    } else if (hadError || providerChanged) {
+      if (hadError) {
+        state.lastError = '';
+        state.lastErrorCode = '';
+        state.lastErrorRetryable = false;
+        state.fallbackNotice = '';
+        state.appliedSettings = snapshotPdfRenderSettings(next);
+        updateStatusBadge();
+        for (const pageRec of state.pages.values()) {
+          if (pageRec.isVisible && pageRec.translatedEpoch !== state.translationEpoch) {
+            renderAndTranslatePage(pageRec.pageNum, { forceCanvas: false });
+          }
+        }
+      } else if (next.model !== prev.model || next.protocol !== prev.protocol) {
+        handleTargetLanguageChange(next.targetLang || 'zh-TW', { persist: false });
+      } else {
+        state.appliedSettings = snapshotPdfRenderSettings(next);
+      }
+    }
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && state.pendingVisibilitySync && state.pdfDoc && state.settings) {
+      state.pendingVisibilitySync = false;
+      applyPdfSettingsTransition(state.appliedSettings, state.settings, Boolean(state.lastError));
+    }
+  });
+
   // Sync settings updates from Options page (e.g., user enters API Key, switches model/lang/glossary)
   chrome.storage.onChanged.addListener((changes, areaName) => {
     if (areaName !== 'local' || !changes[SETTINGS_KEY]) return;
@@ -2206,40 +2341,14 @@ function bindEvents() {
     const hadError = Boolean(state.lastError);
     state.settings = nextSettings;
     populateLanguageSelect(nextSettings.targetLang || 'zh-TW');
+    renderProviderSelect(nextSettings);
 
-    const nonProviderChanged = Boolean(
-      prev && (
-        nextSettings.targetLang !== prev.targetLang ||
-        nextSettings.customTargetLang !== prev.customTargetLang ||
-        nextSettings.customGlossary !== prev.customGlossary
-      )
-    );
-    const providerChanged = Boolean(
-      prev && (
-        nextSettings.providerId !== prev.providerId ||
-        nextSettings.baseUrl !== prev.baseUrl ||
-        nextSettings.apiKey !== prev.apiKey ||
-        nextSettings.model !== prev.model ||
-        nextSettings.protocol !== prev.protocol
-      )
-    );
-
-    if (state.pdfDoc && nonProviderChanged) {
-      handleTargetLanguageChange(nextSettings.targetLang || 'zh-TW', { persist: false });
-    } else if (state.pdfDoc && (hadError || providerChanged)) {
-      if (hadError) {
-        state.lastError = '';
-        state.lastErrorCode = '';
-        state.lastErrorRetryable = false;
-        state.fallbackNotice = '';
-        updateStatusBadge();
-        for (const pageRec of state.pages.values()) {
-          if (pageRec.isVisible && pageRec.translatedEpoch !== state.translationEpoch) {
-            renderAndTranslatePage(pageRec.pageNum, { forceCanvas: false });
-          }
-        }
-      } else if (nextSettings.model !== prev.model || nextSettings.protocol !== prev.protocol) {
-        handleTargetLanguageChange(nextSettings.targetLang || 'zh-TW', { persist: false });
+    if (state.pdfDoc) {
+      if (document.hidden) {
+        state.pendingVisibilitySync = true;
+      } else {
+        state.pendingVisibilitySync = false;
+        applyPdfSettingsTransition(prev, nextSettings, hadError);
       }
     }
   });
@@ -2248,6 +2357,7 @@ function bindEvents() {
 async function init() {
   state.settings = await getSettings();
   populateLanguageSelect(state.settings.targetLang || 'zh-TW');
+  renderProviderSelect(state.settings);
   setMode('overlay');
   updateZoomUI();
   updateStatusBadge();

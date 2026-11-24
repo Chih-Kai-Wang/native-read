@@ -2262,13 +2262,16 @@ async function fetchPdfInTabAndStream(transferId, targetUrl, maxBytes, chunkByte
     return btoa(binary);
   };
 
-  const attemptFetch = async (cacheMode) => {
+  const attemptFetch = async (cacheMode, withAcceptHeader = false, creds = 'include') => {
     try {
-      const resp = await fetch(targetUrl, {
-        credentials: 'include',
-        cache: cacheMode,
-        headers: { Accept: 'application/pdf,application/octet-stream,*/*' }
-      });
+      const fetchOpts = {
+        credentials: creds,
+        cache: cacheMode
+      };
+      if (withAcceptHeader) {
+        fetchOpts.headers = { Accept: 'application/pdf,application/octet-stream,*/*' };
+      }
+      const resp = await fetch(targetUrl, fetchOpts);
       if (!resp.ok) {
         return { ok: false, status: resp.status, isHtml: false, error: `HTTP ${resp.status}` };
       }
@@ -2300,10 +2303,12 @@ async function fetchPdfInTabAndStream(transferId, targetUrl, maxBytes, chunkByte
     }
   };
 
-  let fetched = await attemptFetch('force-cache');
-  if (!fetched.ok) {
-    if (fetched.tooLarge) return fetched;
-    fetched = await attemptFetch('default');
+  let fetched = await attemptFetch('force-cache', false, 'include');
+  if (!fetched.ok && !fetched.tooLarge) {
+    fetched = await attemptFetch('default', true, 'include');
+  }
+  if (!fetched.ok && !fetched.tooLarge && (fetched.status === 401 || fetched.status === 403)) {
+    fetched = await attemptFetch('default', false, 'omit');
   }
   if (!fetched.ok) {
     return fetched;
@@ -3700,8 +3705,58 @@ chrome.runtime.onConnect.addListener((port) => {
             return;
           }
 
-          const frames = await probeTabFramesForPdf(bgTabId);
-          const pdfFrame = frames.find((f) => f.isPdf);
+          const pickDetectedHref = (frameList) => {
+            const topFrame = frameList.find((f) => f.frameId === 0);
+            const rawDetected = topFrame?.detectedHref || '';
+            return /^https?:\/\//i.test(rawDetected) ? rawDetected : '';
+          };
+
+          let frames = await probeTabFramesForPdf(bgTabId);
+          let pdfFrame = frames.find((f) => f.isPdf);
+          let detectedHref = '';
+          if (!pdfFrame) {
+            detectedHref = pickDetectedHref(frames);
+            if (detectedHref) {
+              await sleep(300);
+              if (portDisconnected) return;
+              frames = await probeTabFramesForPdf(bgTabId);
+              pdfFrame = frames.find((f) => f.isPdf);
+              if (!pdfFrame) {
+                detectedHref = pickDetectedHref(frames) || detectedHref;
+              }
+            } else {
+              for (let poll = 0; poll < 2; poll++) {
+                await sleep(600);
+                if (portDisconnected) return;
+                try {
+                  const tabState = await chrome.tabs.get(bgTabId);
+                  if (tabState?.url && /^https?:\/\//i.test(tabState.url)) {
+                    currentUrl = tabState.url;
+                  }
+                } catch (_) {}
+                frames = await probeTabFramesForPdf(bgTabId);
+                pdfFrame = frames.find((f) => f.isPdf);
+                detectedHref = pickDetectedHref(frames);
+                if (pdfFrame || detectedHref) break;
+              }
+            }
+          }
+
+          if (!pdfFrame && detectedHref) {
+            // HTML PDF wrapper (e.g. IEEE stamp.jsp) or iframe embed with explicit PDF URL
+            const res = await runTabPdfTransfer(port, requestId, bgTabId, 0, detectedHref);
+            if (!res.ok && !portDisconnected) {
+              safePost({
+                type: 'PDF_AUTH_REQUIRED',
+                requestId,
+                finalUrl: res.finalUrl || currentUrl,
+                status: res.status || 0,
+                reason: res.error || 'BG_TAB_WRAPPER_FAILED'
+              });
+            }
+            return;
+          }
+
           if (!pdfFrame) {
             // Site returned an HTML login page, paywall, or verification gate instead of rendering PDF
             safePost({ type: 'PDF_AUTH_REQUIRED', requestId, finalUrl: currentUrl });
