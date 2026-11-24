@@ -1,4 +1,5 @@
-const CACHE_NAME = 'nativeread-pwa-v2.6.1';
+const CACHE_NAME = 'nativeread-pwa-v2.8.0';
+const NETWORK_FIRST_TIMEOUT_MS = 4000;
 
 const APP_SHELL_ASSETS = [
   './',
@@ -18,26 +19,49 @@ const APP_SHELL_ASSETS = [
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL_ASSETS)).catch(() => {})
+    caches.open(CACHE_NAME)
+      .then((cache) => Promise.allSettled(
+        APP_SHELL_ASSETS.map((asset) =>
+          fetch(new Request(asset, { cache: 'no-cache' }))
+            .then((res) => (res && res.ok ? cache.put(asset, res) : undefined))
+            .catch(() => undefined)
+        )
+      ))
+      .then(() => self.skipWaiting())
   );
-  self.skipWaiting();
 });
 
 self.addEventListener('activate', (event) => {
   event.waitUntil(
-    caches.keys().then((keys) =>
-      Promise.all(
-        keys.map((key) => {
-          if (key !== CACHE_NAME) {
-            return caches.delete(key);
-          }
-          return Promise.resolve();
-        })
-      )
-    )
+    caches.keys()
+      .then((keys) => Promise.all(
+        keys.map((key) => (key !== CACHE_NAME ? caches.delete(key) : Promise.resolve()))
+      ))
+      .then(() => self.clients.claim())
   );
-  self.clients.claim();
 });
+
+async function fetchWithTimeout(req, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(req, { signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function matchOfflineFallback(req) {
+  const exact = await caches.match(req);
+  if (exact) return exact;
+  const ignoreQuery = await caches.match(req, { ignoreSearch: true });
+  if (ignoreQuery) return ignoreQuery;
+  if (req.mode === 'navigate') {
+    const shell = await caches.match('./index.html');
+    if (shell) return shell;
+  }
+  return null;
+}
 
 self.addEventListener('fetch', (event) => {
   const req = event.request;
@@ -50,15 +74,14 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Only cache same-origin app shell assets; let LLM API calls and external PDFs go directly to network
-  if (url.origin !== self.location.origin) {
+  // Only cache same-origin HTTP(S) app shell assets; let LLM API calls and external PDFs pass through
+  if (url.origin !== self.location.origin || (url.protocol !== 'http:' && url.protocol !== 'https:')) {
     return;
   }
 
   const isImmutableVendor = url.pathname.includes('/vendor/') || url.pathname.includes('/icons/');
 
   if (isImmutableVendor) {
-    // Cache-First for immutable PDF.js and icons
     event.respondWith(
       caches.match(req).then((cached) => {
         if (cached) return cached;
@@ -74,9 +97,9 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Network-First for HTML, app.js, app.css, and nativeread.user.js so updates apply immediately, with offline cache fallback
+  // Network-First with Lie-Fi timeout and offline/query fallback for HTML, JS, CSS, and userscript
   event.respondWith(
-    fetch(req)
+    fetchWithTimeout(req, NETWORK_FIRST_TIMEOUT_MS)
       .then((res) => {
         if (res && res.ok && res.type === 'basic') {
           const copy = res.clone();
@@ -84,6 +107,10 @@ self.addEventListener('fetch', (event) => {
         }
         return res;
       })
-      .catch(() => caches.match(req))
+      .catch(async () => {
+        const cached = await matchOfflineFallback(req);
+        if (cached) return cached;
+        return new Response('Offline', { status: 503, statusText: 'Service Unavailable' });
+      })
   );
 });

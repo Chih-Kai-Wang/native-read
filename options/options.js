@@ -1,4 +1,5 @@
 const {
+  SETTINGS_KEY,
   PROVIDER_PRESETS,
   TARGET_LANGUAGES,
   DEFAULT_GLOSSARY,
@@ -7,11 +8,28 @@ const {
   resolveEndpoint,
   resolveStreamEndpoint,
   isLocalEndpoint,
-  sanitizeApiKey
+  sanitizeApiKey,
+  validateApiKey,
+  normalizeProviderProfiles,
+  isProfileSaved,
+  listSavedProviders,
+  switchActiveProviderSettings,
+  removeProviderProfile
 } = globalThis.KCTConfig;
 
 let whitelistHosts = [];
 let lastSyncUrl = '';
+let draftProfiles = {};
+let persistedActiveProviderId = 'gemini';
+let currentProviderId = 'gemini';
+let selectedFallbackProviderId = '';
+let saveStatusTimer = null;
+let listModelsSeq = 0;
+let testConnSeq = 0;
+let chipSwitchSeq = 0;
+let whitelistQueue = Promise.resolve();
+let isProviderFormDirty = false;
+let applyingExternalStorage = false;
 
 function normalizeHostInput(raw) {
   const trimmed = String(raw || '').trim();
@@ -61,12 +79,23 @@ function renderWhitelist() {
     removeBtn.textContent = '×';
     removeBtn.setAttribute('aria-label', `移除 ${host}`);
     removeBtn.title = `移除 ${host}`;
-    removeBtn.addEventListener('click', async () => {
-      whitelistHosts = whitelistHosts.filter((h) => h !== host);
-      renderWhitelist();
-      await saveSettings({ autoTranslateHosts: [...whitelistHosts] });
-      const fb = document.getElementById('whitelist-feedback');
-      if (fb) fb.textContent = `已移除 ${host}`;
+    removeBtn.addEventListener('click', () => {
+      whitelistQueue = whitelistQueue.then(async () => {
+        try {
+          const latest = await getSettings();
+          const current = Array.isArray(latest.autoTranslateHosts) ? latest.autoTranslateHosts : whitelistHosts;
+          whitelistHosts = current
+            .map((h) => normalizeHostInput(h))
+            .filter((h) => h && h !== host);
+          renderWhitelist();
+          await saveSettings({ autoTranslateHosts: [...whitelistHosts] });
+          const fb = document.getElementById('whitelist-feedback');
+          if (fb) fb.textContent = `已移除 ${host}`;
+        } catch (err) {
+          const fb = document.getElementById('whitelist-feedback');
+          if (fb) fb.textContent = `移除失敗：${err?.message || '儲存失敗'}`;
+        }
+      });
     });
 
     chip.appendChild(removeBtn);
@@ -85,17 +114,28 @@ async function handleAddHost() {
     return;
   }
 
-  if (whitelistHosts.includes(normalized)) {
-    fb.textContent = `${normalized} 已在白名單中`;
-    input.value = '';
-    return;
-  }
-
-  whitelistHosts = [...whitelistHosts, normalized];
   input.value = '';
-  renderWhitelist();
-  await saveSettings({ autoTranslateHosts: [...whitelistHosts] });
-  fb.textContent = `已加入白名單：${normalized}`;
+  whitelistQueue = whitelistQueue.then(async () => {
+    try {
+      const latest = await getSettings();
+      const existing = Array.isArray(latest.autoTranslateHosts)
+        ? [...new Set(latest.autoTranslateHosts.map((h) => normalizeHostInput(h)).filter(Boolean))]
+        : [...whitelistHosts];
+      if (existing.includes(normalized)) {
+        whitelistHosts = existing;
+        renderWhitelist();
+        fb.textContent = `${normalized} 已在白名單中`;
+        return;
+      }
+      whitelistHosts = [...existing, normalized];
+      renderWhitelist();
+      await saveSettings({ autoTranslateHosts: [...whitelistHosts] });
+      fb.textContent = `已加入白名單：${normalized}`;
+    } catch (err) {
+      fb.textContent = `加入失敗：${err?.message || '儲存失敗'}`;
+    }
+  });
+  await whitelistQueue;
 }
 
 function normalizeApiKeyValue(raw) {
@@ -112,8 +152,88 @@ function checkLocalEndpoint(baseUrl) {
   return /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?(\/|$)/i.test(String(baseUrl || '').trim());
 }
 
-function readFormValues() {
+function showSaveStatus(message, isError = false, durationMs = 2800) {
+  const statusEl = document.getElementById('save-status');
+  if (!statusEl) return;
+  if (saveStatusTimer) {
+    clearTimeout(saveStatusTimer);
+    saveStatusTimer = null;
+  }
+  statusEl.className = isError ? 'inline-status err' : 'inline-status ok';
+  statusEl.textContent = message;
+  if (durationMs > 0) {
+    saveStatusTimer = setTimeout(() => {
+      if (statusEl.textContent === message) {
+        statusEl.textContent = '';
+        statusEl.className = 'inline-status';
+      }
+    }, durationMs);
+  }
+}
+
+function buildDraftProviderProfiles(activeProviderId, activeProfile) {
+  const merged = normalizeProviderProfiles(draftProfiles);
+  if (isProfileSaved(activeProviderId, activeProfile)) {
+    merged[activeProviderId] = {
+      protocol: activeProfile.protocol,
+      baseUrl: activeProfile.baseUrl,
+      apiKey: activeProfile.apiKey,
+      model: activeProfile.model,
+      thinkingEffort: activeProfile.thinkingEffort || 'fastest'
+    };
+  } else {
+    delete merged[activeProviderId];
+  }
+  return merged;
+}
+
+function stashCurrentProviderToDraft() {
+  const pid = currentProviderId || document.getElementById('provider-select')?.value || 'gemini';
+  const activeProfile = {
+    protocol: document.getElementById('protocol-select')?.value || 'openai',
+    baseUrl: document.getElementById('baseurl-input')?.value.trim() || '',
+    apiKey: normalizeApiKeyValue(document.getElementById('apikey-input')?.value || ''),
+    model: document.getElementById('model-input')?.value.trim() || '',
+    thinkingEffort: document.getElementById('thinking-effort')?.value || 'fastest'
+  };
+  draftProfiles = buildDraftProviderProfiles(pid, activeProfile);
+}
+
+function readFormValues({ clampUi = false } = {}) {
+  const batchEl = document.getElementById('batch-size');
+  const rawBatchStr = String(batchEl?.value ?? '').trim();
+  const parsedBatch = rawBatchStr === '' ? 20 : Number(rawBatchStr);
+  const batchSize = Number.isFinite(parsedBatch) ? Math.min(40, Math.max(1, Math.round(parsedBatch))) : 20;
+  if (clampUi && batchEl) batchEl.value = String(batchSize);
+
   const maxCharsEl = document.getElementById('max-batch-chars');
+  const rawCharsStr = String(maxCharsEl?.value ?? '').trim();
+  const parsedChars = rawCharsStr === '' ? 5500 : Number(rawCharsStr);
+  const maxBatchChars = Number.isFinite(parsedChars) ? Math.min(20000, Math.max(800, Math.round(parsedChars))) : 5500;
+  if (clampUi && maxCharsEl) maxCharsEl.value = String(maxBatchChars);
+
+  const tempEl = document.getElementById('temperature-input');
+  const rawTemp = String(tempEl?.value ?? '').trim();
+  const parsedTemp = rawTemp === '' ? NaN : Number(rawTemp);
+  const temperature = Number.isFinite(parsedTemp) ? Math.min(1, Math.max(0, parsedTemp)) : 0.2;
+  if (clampUi && tempEl) tempEl.value = String(temperature);
+
+  const providerId = document.getElementById('provider-select').value;
+  const protocol = document.getElementById('protocol-select').value;
+  const baseUrl = document.getElementById('baseurl-input').value.trim();
+  const apiKey = normalizeApiKeyValue(document.getElementById('apikey-input').value);
+  const model = document.getElementById('model-input').value.trim();
+  const thinkingEffort = document.getElementById('thinking-effort').value;
+  const rawFallbackId = selectedFallbackProviderId || document.getElementById('fallback-provider-select')?.value || '';
+  const fallbackProviderId = rawFallbackId && rawFallbackId !== providerId ? rawFallbackId : '';
+  const providerProfiles = buildDraftProviderProfiles(providerId, {
+    protocol,
+    baseUrl,
+    apiKey,
+    model,
+    thinkingEffort
+  });
+
   return {
     targetLang: document.getElementById('lang-select').value,
     customTargetLang: document.getElementById('custom-lang-input').value.trim(),
@@ -122,27 +242,226 @@ function readFormValues() {
     showOutputTranslateBtn: document.getElementById('show-output-btn').checked,
     checkForUpdates: document.getElementById('check-for-updates').checked,
     typographyMatch: document.getElementById('typography-match').value,
-    thinkingEffort: document.getElementById('thinking-effort').value,
+    thinkingEffort,
     lazyViewport: document.getElementById('lazy-viewport').checked,
     streamTranslation: document.getElementById('stream-translation').checked,
     autoTranslate: document.getElementById('global-auto-translate').checked,
     autoTranslateHosts: [...whitelistHosts],
-    providerId: document.getElementById('provider-select').value,
-    protocol: document.getElementById('protocol-select').value,
-    baseUrl: document.getElementById('baseurl-input').value.trim(),
-    apiKey: normalizeApiKeyValue(document.getElementById('apikey-input').value),
-    model: document.getElementById('model-input').value.trim(),
-    batchSize: Math.min(40, Math.max(1, Number(document.getElementById('batch-size').value) || 20)),
-    ...(maxCharsEl ? {
-      maxBatchChars: Math.min(20000, Math.max(800, Math.round(Number(maxCharsEl.value) || 5500)))
-    } : {}),
-    temperature: (() => {
-      const raw = document.getElementById('temperature-input').value.trim();
-      const t = raw === '' ? NaN : Number(raw);
-      return Number.isFinite(t) ? Math.min(1, Math.max(0, t)) : 0.2;
-    })(),
+    providerId,
+    protocol,
+    baseUrl,
+    apiKey,
+    model,
+    providerProfiles,
+    fallbackProviderId,
+    batchSize,
+    ...(maxCharsEl ? { maxBatchChars } : {}),
+    temperature,
     customGlossary: document.getElementById('glossary-input').value
   };
+}
+
+function getPersistedViewState(form) {
+  const activeId = persistedActiveProviderId || form.providerId;
+  if (activeId === form.providerId) {
+    return {
+      providerId: activeId,
+      protocol: form.protocol,
+      baseUrl: form.baseUrl,
+      apiKey: form.apiKey,
+      model: form.model,
+      providerProfiles: form.providerProfiles,
+      fallbackProviderId: selectedFallbackProviderId !== activeId ? selectedFallbackProviderId : ''
+    };
+  }
+  const activeProf = form.providerProfiles?.[activeId] || {};
+  return {
+    providerId: activeId,
+    protocol: activeProf.protocol || PROVIDER_PRESETS?.[activeId]?.protocol || 'openai',
+    baseUrl: activeProf.baseUrl || PROVIDER_PRESETS?.[activeId]?.baseUrl || '',
+    apiKey: activeProf.apiKey || '',
+    model: activeProf.model || PROVIDER_PRESETS?.[activeId]?.defaultModel || '',
+    providerProfiles: form.providerProfiles,
+    fallbackProviderId: selectedFallbackProviderId !== activeId ? selectedFallbackProviderId : ''
+  };
+}
+
+function renderSavedProviders() {
+  const container = document.getElementById('saved-providers-list');
+  if (!container) return;
+  container.textContent = '';
+
+  const form = readFormValues();
+  const list = listSavedProviders(getPersistedViewState(form));
+
+  if (!list.length) {
+    const empty = document.createElement('span');
+    empty.className = 'host-empty';
+    empty.textContent = '尚未儲存任何供應商設定（請選擇上方預設並填寫 API Key 後儲存）';
+    container.appendChild(empty);
+    return;
+  }
+
+  for (const item of list) {
+    const isPersistedActive = item.providerId === persistedActiveProviderId;
+    const chip = document.createElement('span');
+    chip.className = 'provider-chip' + (isPersistedActive ? ' active' : '');
+    chip.dataset.providerId = item.providerId;
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'provider-chip-btn';
+    btn.title = isPersistedActive ? `${item.label}（目前使用中）` : `切換為 ${item.label}`;
+
+    const nameEl = document.createElement('span');
+    nameEl.textContent = item.label;
+    btn.appendChild(nameEl);
+
+    if (item.model) {
+      const meta = document.createElement('span');
+      meta.className = 'provider-chip-meta';
+      meta.textContent = item.model;
+      btn.appendChild(meta);
+    }
+
+    if (isPersistedActive) {
+      const badge = document.createElement('span');
+      badge.className = 'provider-chip-badge';
+      badge.textContent = '使用中';
+      btn.appendChild(badge);
+    } else if (item.isFallback) {
+      const badge = document.createElement('span');
+      badge.className = 'provider-chip-badge fallback';
+      badge.textContent = '備援';
+      btn.appendChild(badge);
+    }
+
+    btn.addEventListener('click', async () => {
+      if (item.providerId === persistedActiveProviderId) {
+        if (currentProviderId !== item.providerId) {
+          const providerSelect = document.getElementById('provider-select');
+          if (providerSelect) providerSelect.value = item.providerId;
+          applyPreset(item.providerId);
+        }
+        return;
+      }
+      const seq = ++chipSwitchSeq;
+      stashCurrentProviderToDraft();
+      try {
+        const fresh = await getSettings();
+        if (seq !== chipSwitchSeq) return;
+        const mergedProfiles = normalizeProviderProfiles({
+          ...(fresh.providerProfiles || {}),
+          ...draftProfiles
+        }, fresh);
+        const switched = typeof switchActiveProviderSettings === 'function'
+          ? switchActiveProviderSettings({ ...fresh, providerProfiles: mergedProfiles }, item.providerId)
+          : fresh;
+        await ensureHostPermissions([switched.baseUrl]);
+        const saved = await saveSettings({
+          providerId: switched.providerId,
+          protocol: switched.protocol,
+          baseUrl: switched.baseUrl,
+          apiKey: switched.apiKey,
+          model: switched.model,
+          thinkingEffort: switched.thinkingEffort,
+          providerProfiles: switched.providerProfiles,
+          fallbackProviderId: switched.fallbackProviderId
+        });
+        if (seq !== chipSwitchSeq) return;
+        persistedActiveProviderId = saved.providerId || item.providerId;
+        selectedFallbackProviderId = saved.fallbackProviderId || '';
+        draftProfiles = normalizeProviderProfiles(saved.providerProfiles, saved);
+        currentProviderId = persistedActiveProviderId;
+        isProviderFormDirty = false;
+        const providerSelect = document.getElementById('provider-select');
+        if (providerSelect) providerSelect.value = currentProviderId;
+        applyPreset(currentProviderId);
+        renderFallbackSelect(selectedFallbackProviderId);
+        renderSavedProviders();
+        showSaveStatus(`✓ 已切換為 ${item.label}`);
+      } catch (err) {
+        showSaveStatus(`切換失敗：${err?.message || '儲存失敗'}`, true, 4000);
+      }
+    });
+
+    chip.appendChild(btn);
+
+    if (!isPersistedActive) {
+      const removeBtn = document.createElement('button');
+      removeBtn.type = 'button';
+      removeBtn.className = 'provider-chip-remove';
+      removeBtn.textContent = '×';
+      removeBtn.setAttribute('aria-label', `移除 ${item.label}`);
+      removeBtn.title = `移除 ${item.label} 設定`;
+      removeBtn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        try {
+          const fresh = await getSettings();
+          const updated = typeof removeProviderProfile === 'function'
+            ? removeProviderProfile(fresh, item.providerId)
+            : fresh;
+          const saved = await saveSettings({
+            providerProfiles: updated.providerProfiles,
+            fallbackProviderId: updated.fallbackProviderId
+          });
+          delete draftProfiles[item.providerId];
+          draftProfiles = normalizeProviderProfiles({ ...saved.providerProfiles, ...draftProfiles });
+          if (selectedFallbackProviderId === item.providerId) {
+            selectedFallbackProviderId = '';
+          }
+          if (currentProviderId === item.providerId) {
+            const preset = PROVIDER_PRESETS[currentProviderId];
+            if (preset) {
+              document.getElementById('protocol-select').value = preset.protocol;
+              document.getElementById('baseurl-input').value = preset.baseUrl;
+              document.getElementById('model-input').value = preset.defaultModel || '';
+              document.getElementById('apikey-input').value = '';
+            }
+          }
+          renderFallbackSelect(selectedFallbackProviderId);
+          renderSavedProviders();
+        } catch (err) {
+          showSaveStatus(`移除失敗：${err?.message || '儲存失敗'}`, true, 4000);
+        }
+      });
+      chip.appendChild(removeBtn);
+    }
+
+    container.appendChild(chip);
+  }
+}
+
+function renderFallbackSelect(preferredValue) {
+  const select = document.getElementById('fallback-provider-select');
+  if (!select) return;
+  if (preferredValue !== undefined) {
+    selectedFallbackProviderId = String(preferredValue || '');
+  }
+  const form = readFormValues();
+  const activeId = persistedActiveProviderId || form.providerId;
+  const targetVal = selectedFallbackProviderId;
+  select.textContent = '';
+
+  const disabledOpt = document.createElement('option');
+  disabledOpt.value = '';
+  disabledOpt.textContent = '停用（僅手動切換）';
+  select.appendChild(disabledOpt);
+
+  const candidates = listSavedProviders({
+    ...getPersistedViewState(form),
+    fallbackProviderId: targetVal
+  }).filter((p) => p.providerId !== activeId && p.isReady);
+
+  for (const cand of candidates) {
+    const opt = document.createElement('option');
+    opt.value = cand.providerId;
+    opt.textContent = `${cand.label}${cand.model ? ` (${cand.model})` : ''}`;
+    select.appendChild(opt);
+  }
+
+  const hasMatch = candidates.some((c) => c.providerId === targetVal);
+  select.value = hasMatch ? targetVal : '';
 }
 
 function updateEndpointPreview() {
@@ -180,39 +499,76 @@ function updateModelSuggestions(preset) {
 function applyPreset(presetId) {
   const preset = PROVIDER_PRESETS[presetId];
   if (!preset) return;
-  document.getElementById('protocol-select').value = preset.protocol;
-  document.getElementById('baseurl-input').value = preset.baseUrl;
+  if (currentProviderId && currentProviderId !== presetId) {
+    stashCurrentProviderToDraft();
+  }
+  currentProviderId = presetId;
+  const savedProfile = draftProfiles[presetId];
+  document.getElementById('protocol-select').value = savedProfile?.protocol || preset.protocol;
+  document.getElementById('baseurl-input').value = savedProfile?.baseUrl || preset.baseUrl;
   const modelInput = document.getElementById('model-input');
-  modelInput.value = preset.defaultModel || '';
+  modelInput.value = savedProfile?.model || preset.defaultModel || '';
   modelInput.placeholder = preset.defaultModel
     ? `例如 ${preset.defaultModel}`
     : '請按「取得模型清單」選擇，或直接輸入模型名稱';
+  document.getElementById('apikey-input').value = savedProfile?.apiKey || '';
   document.getElementById('apikey-input').placeholder = preset.placeholderKey;
+  if (savedProfile?.thinkingEffort) {
+    const teEl = document.getElementById('thinking-effort');
+    if (teEl) teEl.value = savedProfile.thinkingEffort;
+  }
+  const testBox = document.getElementById('test-result');
+  if (testBox) {
+    testBox.hidden = true;
+    testBox.textContent = '';
+    testBox.className = 'test-box';
+  }
+  const modelListStatus = document.getElementById('model-list-status');
+  if (modelListStatus) {
+    modelListStatus.hidden = true;
+    modelListStatus.textContent = '';
+  }
   document.getElementById('provider-hint').textContent = preset.hint;
   updateModelSuggestions(preset);
   updateEndpointPreview();
+  renderFallbackSelect(selectedFallbackProviderId);
+  renderSavedProviders();
+}
+
+function toHostPermissionPattern(rawUrl) {
+  try {
+    const u = new URL(String(rawUrl || '').trim());
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return '';
+    const host = u.hostname.includes(':') && !u.hostname.startsWith('[')
+      ? `[${u.hostname}]`
+      : u.hostname;
+    return host ? `${u.protocol}//${host}/*` : '';
+  } catch (_) {
+    return '';
+  }
+}
+
+async function ensureHostPermissions(urls) {
+  const patterns = Array.from(
+    new Set((Array.isArray(urls) ? urls : [urls]).map(toHostPermissionPattern).filter(Boolean))
+  );
+  if (!patterns.length) return true;
+  try {
+    const missing = [];
+    for (const pat of patterns) {
+      const already = await chrome.permissions.contains({ origins: [pat] });
+      if (!already) missing.push(pat);
+    }
+    if (!missing.length) return true;
+    return await chrome.permissions.request({ origins: missing });
+  } catch (err) {
+    console.warn('Permission request skipped/denied:', err?.message || err);
+    return false;
+  }
 }
 
 async function ensureHostPermissionIfNeeded(baseUrl) {
-  let originPattern = null;
-  try {
-    const u = new URL(baseUrl);
-    if (u.protocol === 'https:' || u.protocol === 'http:') {
-      originPattern = `${u.origin}/*`;
-    }
-  } catch (_) {
-    return;
-  }
-  if (!originPattern) return;
-
-  try {
-    const already = await chrome.permissions.contains({ origins: [originPattern] });
-    if (!already) {
-      await chrome.permissions.request({ origins: [originPattern] });
-    }
-  } catch (err) {
-    console.warn('Permission request skipped/denied:', err.message);
-  }
+  return ensureHostPermissions([baseUrl]);
 }
 
 function formatCacheSize(bytes) {
@@ -235,7 +591,7 @@ function encodeBase64UrlUtf8(str) {
 function buildMobileSyncUrl(form) {
   const preset = PROVIDER_PRESETS[form.providerId] || null;
   const payload = {
-    p: form.providerId || 'deepseek',
+    p: form.providerId || 'gemini',
     r: form.protocol || 'openai',
     k: form.apiKey || '',
     m: form.model || '',
@@ -629,7 +985,16 @@ async function refreshCacheStats() {
   const statsEl = document.getElementById('cache-stats');
   if (!statsEl) return;
   try {
-    const res = await chrome.runtime.sendMessage({ type: 'GET_CACHE_STATS' });
+    let res = null;
+    if (globalThis.KCTCacheDB && typeof globalThis.KCTCacheDB.stats === 'function') {
+      const localStats = await globalThis.KCTCacheDB.stats();
+      if (localStats && Number.isFinite(localStats.entries)) {
+        res = { ok: true, entries: localStats.entries, bytes: localStats.bytes || 0 };
+      }
+    }
+    if (!res) {
+      res = await chrome.runtime.sendMessage({ type: 'GET_CACHE_STATS' });
+    }
     if (res?.ok) {
       const sizeStr = formatCacheSize(res.bytes);
       statsEl.textContent = `已快取 ${res.entries} 筆譯文（約 ${sizeStr}）`;
@@ -684,7 +1049,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   renderWhitelist();
   updateCustomLangVisibility();
 
-  providerSelect.value = settings.providerId || 'deepseek';
+  persistedActiveProviderId = settings.providerId || 'gemini';
+  currentProviderId = persistedActiveProviderId;
+  selectedFallbackProviderId = settings.fallbackProviderId || '';
+  draftProfiles = normalizeProviderProfiles(settings.providerProfiles, settings);
+  providerSelect.value = currentProviderId;
   document.getElementById('protocol-select').value = settings.protocol || 'openai';
   document.getElementById('baseurl-input').value = settings.baseUrl || '';
   document.getElementById('apikey-input').value = settings.apiKey || '';
@@ -703,8 +1072,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.getElementById('apikey-input').placeholder = activePreset.placeholderKey;
     updateModelSuggestions(activePreset);
   }
+  renderFallbackSelect(selectedFallbackProviderId);
+  renderSavedProviders();
   updateEndpointPreview();
-  await refreshCacheStats();
 
   const btnGenSync = document.getElementById('btn-generate-mobile-sync');
   const btnCopySync = document.getElementById('btn-copy-mobile-sync');
@@ -735,24 +1105,84 @@ document.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('typography-match')?.addEventListener('change', invalidateMobileSync);
   document.getElementById('thinking-effort')?.addEventListener('change', invalidateMobileSync);
 
+  const syncProviderDraftUI = () => {
+    isProviderFormDirty = true;
+    stashCurrentProviderToDraft();
+    updateEndpointPreview();
+    renderFallbackSelect(selectedFallbackProviderId);
+    renderSavedProviders();
+    invalidateMobileSync();
+  };
+
   providerSelect.addEventListener('change', (e) => {
+    isProviderFormDirty = true;
     applyPreset(e.target.value);
     invalidateMobileSync();
   });
 
-  document.getElementById('protocol-select')?.addEventListener('change', () => {
-    updateEndpointPreview();
+  document.getElementById('protocol-select')?.addEventListener('change', syncProviderDraftUI);
+  document.getElementById('baseurl-input')?.addEventListener('input', syncProviderDraftUI);
+  document.getElementById('model-input')?.addEventListener('input', syncProviderDraftUI);
+  document.getElementById('apikey-input')?.addEventListener('input', () => {
+    isProviderFormDirty = true;
+    stashCurrentProviderToDraft();
+    renderFallbackSelect(selectedFallbackProviderId);
+    renderSavedProviders();
     invalidateMobileSync();
   });
-  document.getElementById('baseurl-input')?.addEventListener('input', () => {
-    updateEndpointPreview();
-    invalidateMobileSync();
+  document.getElementById('fallback-provider-select')?.addEventListener('change', (e) => {
+    selectedFallbackProviderId = String(e.target.value || '');
+    renderSavedProviders();
   });
-  document.getElementById('model-input')?.addEventListener('input', () => {
-    updateEndpointPreview();
-    invalidateMobileSync();
+  document.getElementById('thinking-effort')?.addEventListener('change', () => {
+    stashCurrentProviderToDraft();
   });
-  document.getElementById('apikey-input')?.addEventListener('input', invalidateMobileSync);
+
+  const settingsKey = SETTINGS_KEY || 'kct_settings_v1';
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName !== 'local' || applyingExternalStorage) return;
+    const next = changes[settingsKey]?.newValue;
+    if (!next || typeof next !== 'object') return;
+    applyingExternalStorage = true;
+    try {
+      whitelistHosts = Array.isArray(next.autoTranslateHosts)
+        ? [...new Set(next.autoTranslateHosts.map((h) => normalizeHostInput(h)).filter(Boolean))]
+        : [];
+      renderWhitelist();
+      persistedActiveProviderId = next.providerId || 'gemini';
+      if (!isProviderFormDirty) {
+        selectedFallbackProviderId = next.fallbackProviderId || '';
+        draftProfiles = normalizeProviderProfiles(next.providerProfiles, next);
+        currentProviderId = persistedActiveProviderId;
+        providerSelect.value = currentProviderId;
+        const nextPreset = PROVIDER_PRESETS[currentProviderId];
+        if (nextPreset) {
+          document.getElementById('provider-hint').textContent = nextPreset.hint;
+          document.getElementById('apikey-input').placeholder = nextPreset.placeholderKey;
+          updateModelSuggestions(nextPreset);
+        }
+        document.getElementById('protocol-select').value = next.protocol || nextPreset?.protocol || 'openai';
+        document.getElementById('baseurl-input').value = next.baseUrl || nextPreset?.baseUrl || '';
+        document.getElementById('apikey-input').value = next.apiKey || '';
+        document.getElementById('model-input').value = next.model || nextPreset?.defaultModel || '';
+        document.getElementById('thinking-effort').value = next.thinkingEffort || 'fastest';
+        updateEndpointPreview();
+        renderFallbackSelect(selectedFallbackProviderId);
+        renderSavedProviders();
+      } else {
+        const currentEdited = draftProfiles[currentProviderId];
+        draftProfiles = normalizeProviderProfiles({
+          ...(next.providerProfiles || {}),
+          ...draftProfiles
+        }, next);
+        if (currentEdited) draftProfiles[currentProviderId] = currentEdited;
+        renderFallbackSelect(selectedFallbackProviderId);
+        renderSavedProviders();
+      }
+    } finally {
+      applyingExternalStorage = false;
+    }
+  });
   document.getElementById('stream-translation')?.addEventListener('change', updateEndpointPreview);
 
   document.getElementById('btn-toggle-key')?.addEventListener('click', (e) => {
@@ -776,19 +1206,74 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (el) el.value = DEFAULT_GLOSSARY;
   });
 
+  function validateProviderForm(form, { requireCredentials = false, requireModel = false } = {}) {
+    if (!form.baseUrl) {
+      return '請輸入有效的 http:// 或 https:// API Base URL';
+    }
+    try {
+      const parsed = new URL(form.baseUrl);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        return 'API Base URL 必須以 http:// 或 https:// 開頭';
+      }
+    } catch (_) {
+      return '請輸入有效的 http:// 或 https:// API Base URL';
+    }
+    if (/YOUR-RESOURCE/i.test(form.baseUrl)) {
+      return '請先將 Azure Base URL 中的 YOUR-RESOURCE 替換為實際資源名稱';
+    }
+    if (typeof validateApiKey === 'function') {
+      const keyCheck = validateApiKey(form.apiKey);
+      if (!keyCheck.ok) {
+        return keyCheck.error;
+      }
+    }
+    if (requireCredentials && !form.apiKey && !checkLocalEndpoint(form.baseUrl)) {
+      return '請先填寫 API Key';
+    }
+    if (requireModel && !form.model) {
+      return '請先選擇或輸入模型名稱';
+    }
+    return '';
+  }
+
   async function handleSave(statusElId) {
-    const form = readFormValues();
+    const form = readFormValues({ clampUi: true });
     const statusEl = document.getElementById(statusElId);
     if (!statusEl) return;
+
+    const validationErr = validateProviderForm(form);
+    if (validationErr) {
+      showSaveStatus(validationErr, true, 4500);
+      return;
+    }
+
+    if (saveStatusTimer) {
+      clearTimeout(saveStatusTimer);
+      saveStatusTimer = null;
+    }
     statusEl.className = 'inline-status';
     statusEl.textContent = '儲存中...';
 
-    await ensureHostPermissionIfNeeded(form.baseUrl);
-    await saveSettings(form);
+    try {
+      const fbProfile = form.fallbackProviderId ? form.providerProfiles?.[form.fallbackProviderId] : null;
+      await ensureHostPermissions([form.baseUrl, fbProfile?.baseUrl]);
+      const saved = await saveSettings(form);
+      persistedActiveProviderId = saved.providerId || form.providerId;
+      currentProviderId = persistedActiveProviderId;
+      selectedFallbackProviderId = saved.fallbackProviderId || '';
+      draftProfiles = normalizeProviderProfiles(saved.providerProfiles, saved);
+      isProviderFormDirty = false;
+      renderFallbackSelect(selectedFallbackProviderId);
+      renderSavedProviders();
 
-    statusEl.className = 'inline-status ok';
-    statusEl.textContent = '✓ 設定已儲存';
-    setTimeout(() => { statusEl.textContent = ''; }, 2500);
+      if (!saved.model) {
+        showSaveStatus('✓ 設定已儲存（提醒：尚未填寫模型名稱）', false, 3500);
+      } else {
+        showSaveStatus('✓ 設定已儲存', false, 2500);
+      }
+    } catch (err) {
+      showSaveStatus(`儲存失敗：${err?.message || '寫入設定時發生錯誤'}`, true, 4500);
+    }
   }
 
   document.getElementById('btn-save')?.addEventListener('click', async () => {
@@ -803,16 +1288,25 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!btn || !statusEl || !datalist) return;
 
     const form = readFormValues();
+    const validationErr = validateProviderForm(form);
+    if (validationErr) {
+      statusEl.hidden = false;
+      statusEl.textContent = validationErr;
+      return;
+    }
+
+    const seq = ++listModelsSeq;
     btn.disabled = true;
     statusEl.hidden = false;
     statusEl.textContent = '正在取得模型清單...';
 
     try {
-      await ensureHostPermissionIfNeeded(form.baseUrl);
+      await ensureHostPermissions([form.baseUrl]);
       const res = await chrome.runtime.sendMessage({
         type: 'LIST_MODELS',
         settings: form
       });
+      if (seq !== listModelsSeq) return;
 
       if (res?.ok && Array.isArray(res.models)) {
         datalist.replaceChildren();
@@ -832,26 +1326,43 @@ document.addEventListener('DOMContentLoaded', async () => {
         statusEl.textContent = res?.error || '取得模型清單失敗';
       }
     } catch (err) {
-      statusEl.textContent = `取得模型清單失敗：${err?.message || '無法連線至背景服務'}`;
+      if (seq === listModelsSeq) {
+        statusEl.textContent = `取得模型清單失敗：${err?.message || '無法連線至背景服務'}`;
+      }
     } finally {
-      btn.disabled = false;
+      if (seq === listModelsSeq) {
+        btn.disabled = false;
+      }
     }
   });
 
   document.getElementById('btn-test')?.addEventListener('click', async () => {
+    const btnTest = document.getElementById('btn-test');
     const form = readFormValues();
     const box = document.getElementById('test-result');
     if (!box) return;
+
+    const validationErr = validateProviderForm(form, { requireCredentials: true, requireModel: true });
+    if (validationErr) {
+      box.hidden = false;
+      box.className = 'test-box err';
+      box.textContent = `連線失敗：${validationErr}`;
+      return;
+    }
+
+    const seq = ++testConnSeq;
+    if (btnTest) btnTest.disabled = true;
     box.hidden = false;
     box.className = 'test-box';
     box.textContent = '正在測試連線...';
 
-    await ensureHostPermissionIfNeeded(form.baseUrl);
     try {
+      await ensureHostPermissions([form.baseUrl]);
       const res = await chrome.runtime.sendMessage({
         type: 'TEST_CONNECTION',
         settings: form
       });
+      if (seq !== testConnSeq) return;
 
       if (res?.ok) {
         box.className = 'test-box ok';
@@ -861,8 +1372,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         box.textContent = `連線失敗：${res?.error || '未知錯誤'}`;
       }
     } catch (err) {
-      box.className = 'test-box err';
-      box.textContent = `連線失敗：${err?.message || '無法連線至背景服務'}`;
+      if (seq === testConnSeq) {
+        box.className = 'test-box err';
+        box.textContent = `連線失敗：${err?.message || '無法連線至背景服務'}`;
+      }
+    } finally {
+      if (seq === testConnSeq && btnTest) {
+        btnTest.disabled = false;
+      }
     }
   });
 
@@ -875,22 +1392,41 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   if (btnGenSync) {
     btnGenSync.addEventListener('click', async () => {
-      const form = readFormValues();
-      if (!form.apiKey && !checkLocalEndpoint(form.baseUrl)) {
+      const form = readFormValues({ clampUi: true });
+      if (checkLocalEndpoint(form.baseUrl)) {
         invalidateMobileSync();
         if (syncStatus) {
           syncStatus.className = 'inline-status err';
-          syncStatus.textContent = '請先填寫 API Key 再產生同步 QR Code';
+          syncStatus.textContent = '本機端點 (localhost / 127.0.0.1) 無法從手機掃描存取，請改用雲端端點';
+        }
+        return;
+      }
+      const validationErr = validateProviderForm(form, { requireCredentials: true, requireModel: false });
+      if (validationErr) {
+        invalidateMobileSync();
+        if (syncStatus) {
+          syncStatus.className = 'inline-status err';
+          syncStatus.textContent = validationErr;
         }
         return;
       }
 
-      await saveSettings(form);
       try {
         const url = buildMobileSyncUrl(form);
         lastSyncUrl = url;
         if (syncUrlInput) syncUrlInput.value = url;
         renderQrToCanvas(syncQrCanvas, url);
+
+        await ensureHostPermissions([form.baseUrl]);
+        const saved = await saveSettings(form);
+        persistedActiveProviderId = saved.providerId || form.providerId;
+        currentProviderId = persistedActiveProviderId;
+        selectedFallbackProviderId = saved.fallbackProviderId || '';
+        draftProfiles = normalizeProviderProfiles(saved.providerProfiles, saved);
+        isProviderFormDirty = false;
+        renderFallbackSelect(selectedFallbackProviderId);
+        renderSavedProviders();
+
         if (syncBox) {
           syncBox.hidden = false;
           syncBox.classList.remove('hidden');
@@ -936,4 +1472,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
     });
   }
+
+  void refreshCacheStats();
 });

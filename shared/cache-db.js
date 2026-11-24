@@ -9,13 +9,23 @@
   const TOUCH_THRESHOLD_MS = 60 * 1000;
   const TOUCH_DEBOUNCE_MS = 250;
   const TOUCH_MAX_BATCH = 200;
+  const OPEN_TIMEOUT_MS = 3000;
+  const STATS_BATCH_SIZE = 500;
+  const STATS_TIMEOUT_MS = 5000;
 
   let dbPromise = null;
   let migrationPromise = null;
   const pendingTouches = new Map();
   let touchTimer = null;
   let activeFlushPromise = null;
+  let activeStatsPromise = null;
   let dbEpoch = 0;
+
+  function resetDbHandleIfCurrent(openedPromise) {
+    if (!openedPromise || dbPromise === openedPromise) {
+      dbPromise = null;
+    }
+  }
 
   function openDB() {
     if (typeof indexedDB === 'undefined') {
@@ -23,8 +33,35 @@
     }
     if (dbPromise) return dbPromise;
 
-    dbPromise = new Promise((resolve, reject) => {
+    const holder = { promise: null };
+    const createdPromise = new Promise((resolve, reject) => {
       let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        if (dbPromise === holder.promise) {
+          dbPromise = null;
+        }
+        reject(new Error('IndexedDB open timeout'));
+      }, OPEN_TIMEOUT_MS);
+
+      const finishResolve = (db) => {
+        clearTimeout(timer);
+        settled = true;
+        resolve(db);
+      };
+
+      const finishReject = (err) => {
+        clearTimeout(timer);
+        if (dbPromise === holder.promise) {
+          dbPromise = null;
+        }
+        if (!settled) {
+          settled = true;
+          reject(err);
+        }
+      };
+
       try {
         const req = indexedDB.open(DB_NAME, DB_VERSION);
         req.onupgradeneeded = () => {
@@ -41,39 +78,41 @@
         };
         req.onsuccess = () => {
           const db = req.result;
+          if (settled) {
+            try {
+              db.close();
+            } catch (_) {}
+            return;
+          }
           db.onversionchange = () => {
             try {
               db.close();
             } catch (_) {}
-            dbPromise = null;
+            if (dbPromise === holder.promise) {
+              dbPromise = null;
+            }
           };
           db.onclose = () => {
-            dbPromise = null;
+            if (dbPromise === holder.promise) {
+              dbPromise = null;
+            }
           };
-          settled = true;
-          resolve(db);
+          finishResolve(db);
         };
         req.onerror = () => {
-          dbPromise = null;
-          if (!settled) {
-            settled = true;
-            reject(req.error || new Error('Failed to open IndexedDB'));
-          }
+          finishReject(req.error || new Error('Failed to open IndexedDB'));
         };
         req.onblocked = () => {
-          dbPromise = null;
-          if (!settled) {
-            settled = true;
-            reject(new Error('IndexedDB open blocked'));
-          }
+          finishReject(new Error('IndexedDB open blocked'));
         };
       } catch (err) {
-        dbPromise = null;
-        reject(err);
+        finishReject(err);
       }
     });
 
-    return dbPromise;
+    holder.promise = createdPromise;
+    dbPromise = createdPromise;
+    return createdPromise;
   }
 
   function queueTouch(keys, ts) {
@@ -116,8 +155,10 @@
       if (batch.length === 0) break;
 
       activeFlushPromise = (async () => {
+        let openPromise = null;
         try {
-          const db = await openDB();
+          openPromise = openDB();
+          const db = await openPromise;
           if (flushEpoch !== dbEpoch) return;
           await new Promise((resolve) => {
             try {
@@ -126,19 +167,24 @@
               for (const [key, touchTs] of batch) {
                 const req = store.get(key);
                 req.onsuccess = () => {
-                  if (flushEpoch !== dbEpoch) return;
-                  const rec = req.result;
-                  if (
-                    rec &&
-                    typeof rec.zh === 'string' &&
-                    rec.zh.trim() &&
-                    (!Number.isFinite(rec.ts) || rec.ts < touchTs)
-                  ) {
-                    store.put({ key: rec.key, zh: rec.zh, ts: touchTs });
-                  }
+                  try {
+                    if (flushEpoch !== dbEpoch) return;
+                    const rec = req.result;
+                    if (
+                      rec &&
+                      typeof rec.zh === 'string' &&
+                      rec.zh.trim() &&
+                      (!Number.isFinite(rec.ts) || rec.ts < touchTs)
+                    ) {
+                      const putReq = store.put({ key: rec.key, zh: rec.zh, ts: touchTs });
+                      putReq.onerror = (e) => {
+                        try { e?.preventDefault?.(); e?.stopPropagation?.(); } catch (_) {}
+                      };
+                    }
+                  } catch (_) {}
                 };
                 req.onerror = (e) => {
-                  try { e?.stopPropagation?.(); } catch (_) {}
+                  try { e?.preventDefault?.(); e?.stopPropagation?.(); } catch (_) {}
                 };
               }
               tx.oncomplete = () => resolve();
@@ -147,7 +193,10 @@
                 resolve();
               };
               tx.onabort = () => resolve();
-            } catch (_) {
+            } catch (txErr) {
+              if (txErr?.name === 'InvalidStateError') {
+                resetDbHandleIfCurrent(openPromise);
+              }
               resolve();
             }
           });
@@ -171,8 +220,10 @@
     const now = Date.now();
     const staleHitKeys = [];
 
+    let openPromise = null;
     try {
-      const db = await openDB();
+      openPromise = openDB();
+      const db = await openPromise;
       return await new Promise((resolve) => {
         try {
           const tx = db.transaction(STORE_NAME, 'readonly');
@@ -181,13 +232,15 @@
           for (const key of uniqueKeys) {
             const req = store.get(key);
             req.onsuccess = () => {
-              const rec = req.result;
-              if (rec && typeof rec.zh === 'string' && rec.zh.trim()) {
-                result.set(key, rec.zh);
-                if (!Number.isFinite(rec.ts) || (now - rec.ts) >= TOUCH_THRESHOLD_MS) {
-                  staleHitKeys.push(key);
+              try {
+                const rec = req.result;
+                if (rec && typeof rec.zh === 'string' && rec.zh.trim()) {
+                  result.set(key, rec.zh);
+                  if (!Number.isFinite(rec.ts) || (now - rec.ts) >= TOUCH_THRESHOLD_MS) {
+                    staleHitKeys.push(key);
+                  }
                 }
-              }
+              } catch (_) {}
             };
           }
 
@@ -199,7 +252,10 @@
           };
           tx.onerror = () => resolve(result);
           tx.onabort = () => resolve(result);
-        } catch (_) {
+        } catch (txErr) {
+          if (txErr?.name === 'InvalidStateError') {
+            resetDbHandleIfCurrent(openPromise);
+          }
           resolve(result);
         }
       });
@@ -208,8 +264,133 @@
     }
   }
 
+  function deleteOldestFromSource(store, source, count) {
+    if (!store || !source || !Number.isFinite(count) || count <= 0) return;
+    if (typeof source.getAllKeys === 'function') {
+      const keysReq = source.getAllKeys(null, count);
+      keysReq.onsuccess = () => {
+        try {
+          const keys = Array.isArray(keysReq.result) ? keysReq.result : [];
+          for (const pk of keys) {
+            const delReq = store.delete(pk);
+            if (delReq && typeof delReq === 'object') {
+              delReq.onerror = (e) => {
+                try { e?.preventDefault?.(); e?.stopPropagation?.(); } catch (_) {}
+              };
+            }
+          }
+        } catch (_) {}
+      };
+      keysReq.onerror = (e) => {
+        try { e?.preventDefault?.(); e?.stopPropagation?.(); } catch (_) {}
+      };
+      return;
+    }
+
+    let remaining = count;
+    const cursorReq = source.openCursor(null, 'next');
+    cursorReq.onsuccess = () => {
+      try {
+        const cursor = cursorReq.result;
+        if (cursor && remaining > 0) {
+          const delReq = cursor.delete();
+          if (delReq && typeof delReq === 'object') {
+            delReq.onerror = (e) => {
+              try { e?.preventDefault?.(); e?.stopPropagation?.(); } catch (_) {}
+            };
+          }
+          remaining -= 1;
+          if (remaining > 0) {
+            cursor.continue();
+          }
+        }
+      } catch (_) {}
+    };
+    cursorReq.onerror = (e) => {
+      try { e?.preventDefault?.(); e?.stopPropagation?.(); } catch (_) {}
+    };
+  }
+
+  function evictOldestFraction(db, openPromise, fraction = 0.2) {
+    return new Promise((resolve) => {
+      try {
+        const tx = db.transaction(STORE_NAME, 'readwrite');
+        const store = tx.objectStore(STORE_NAME);
+        const countReq = store.count();
+        countReq.onsuccess = () => {
+          try {
+            const total = countReq.result || 0;
+            const toDelete = Math.max(10, Math.ceil(total * fraction));
+            if (total === 0) return;
+            deleteOldestFromSource(store, store.index('ts'), toDelete);
+          } catch (_) {}
+        };
+        tx.oncomplete = () => resolve(true);
+        tx.onerror = () => resolve(false);
+        tx.onabort = () => resolve(false);
+      } catch (txErr) {
+        if (txErr?.name === 'InvalidStateError') {
+          resetDbHandleIfCurrent(openPromise);
+        }
+        resolve(false);
+      }
+    });
+  }
+
+  function writeEntriesWithCap(db, openPromise, valid, writeEpoch) {
+    return new Promise((resolve) => {
+      if (writeEpoch !== dbEpoch) {
+        resolve({ ok: false, quotaExceeded: false });
+        return;
+      }
+      try {
+        const tx = db.transaction(STORE_NAME, 'readwrite');
+        const store = tx.objectStore(STORE_NAME);
+        let sawQuota = false;
+
+        for (const rec of valid) {
+          const putReq = store.put(rec);
+          putReq.onerror = () => {
+            if (putReq.error?.name === 'QuotaExceededError') {
+              sawQuota = true;
+            }
+          };
+        }
+
+        const countReq = store.count();
+        countReq.onsuccess = () => {
+          try {
+            const overflow = (countReq.result || 0) - MAX_ENTRIES;
+            if (overflow > 0) {
+              deleteOldestFromSource(store, store.index('ts'), overflow);
+            }
+          } catch (_) {}
+        };
+        countReq.onerror = (e) => {
+          try { e?.preventDefault?.(); e?.stopPropagation?.(); } catch (_) {}
+        };
+
+        tx.oncomplete = () => resolve({ ok: true, quotaExceeded: false });
+        tx.onerror = () => {
+          const isQuota = sawQuota || tx.error?.name === 'QuotaExceededError';
+          resolve({ ok: false, quotaExceeded: isQuota });
+        };
+        tx.onabort = () => {
+          const isQuota = sawQuota || tx.error?.name === 'QuotaExceededError';
+          resolve({ ok: false, quotaExceeded: isQuota });
+        };
+      } catch (txErr) {
+        if (txErr?.name === 'InvalidStateError') {
+          resetDbHandleIfCurrent(openPromise);
+        }
+        resolve({ ok: false, quotaExceeded: txErr?.name === 'QuotaExceededError' });
+      }
+    });
+  }
+
   async function putMany(entries) {
     if (!Array.isArray(entries) || entries.length === 0) return false;
+    const writeEpoch = dbEpoch;
     const preFiltered = [];
     const incomingKeys = new Set();
     for (let i = 0; i < entries.length; i++) {
@@ -238,9 +419,11 @@
       clearTimeout(touchTimer);
       touchTimer = null;
     }
-    if (pendingTouches.size > 0 || activeFlushPromise) {
-      await flushTouches();
+    // Wait only for an in-flight flush to finish (never drain unrelated touches in a loop)
+    if (activeFlushPromise) {
+      await activeFlushPromise.catch(() => {});
     }
+    if (writeEpoch !== dbEpoch) return false;
     for (const key of incomingKeys) {
       pendingTouches.delete(key);
     }
@@ -257,42 +440,19 @@
     }));
 
     try {
-      const db = await openDB();
-      return await new Promise((resolve) => {
-        try {
-          const tx = db.transaction(STORE_NAME, 'readwrite');
-          const store = tx.objectStore(STORE_NAME);
-
-          for (const rec of valid) {
-            store.put(rec);
-          }
-
-          const countReq = store.count();
-          countReq.onsuccess = () => {
-            let overflow = (countReq.result || 0) - MAX_ENTRIES;
-            if (overflow > 0) {
-              const tsIndex = store.index('ts');
-              const cursorReq = tsIndex.openCursor(null, 'next');
-              cursorReq.onsuccess = () => {
-                const cursor = cursorReq.result;
-                if (cursor && overflow > 0) {
-                  cursor.delete();
-                  overflow -= 1;
-                  if (overflow > 0) {
-                    cursor.continue();
-                  }
-                }
-              };
-            }
-          };
-
-          tx.oncomplete = () => resolve(true);
-          tx.onerror = () => resolve(false);
-          tx.onabort = () => resolve(false);
-        } catch (_) {
-          resolve(false);
+      const openPromise = openDB();
+      const db = await openPromise;
+      if (writeEpoch !== dbEpoch) return false;
+      const firstTry = await writeEntriesWithCap(db, openPromise, valid, writeEpoch);
+      if (firstTry.ok) return true;
+      if (firstTry.quotaExceeded && writeEpoch === dbEpoch) {
+        const evicted = await evictOldestFraction(db, openPromise, 0.2);
+        if (evicted && writeEpoch === dbEpoch) {
+          const retry = await writeEntriesWithCap(db, openPromise, valid, writeEpoch);
+          return retry.ok;
         }
-      });
+      }
+      return false;
     } catch (_) {
       return false;
     }
@@ -308,8 +468,10 @@
     if (activeFlushPromise) {
       await activeFlushPromise.catch(() => {});
     }
+    let openPromise = null;
     try {
-      const db = await openDB();
+      openPromise = openDB();
+      const db = await openPromise;
       await new Promise((resolve) => {
         try {
           const tx = db.transaction(STORE_NAME, 'readwrite');
@@ -317,7 +479,10 @@
           tx.oncomplete = () => resolve();
           tx.onerror = () => resolve();
           tx.onabort = () => resolve();
-        } catch (_) {
+        } catch (txErr) {
+          if (txErr?.name === 'InvalidStateError') {
+            resetDbHandleIfCurrent(openPromise);
+          }
           resolve();
         }
       });
@@ -333,43 +498,124 @@
   }
 
   async function stats() {
-    try {
-      const db = await openDB();
-      return await new Promise((resolve) => {
-        let entries = 0;
-        let bytes = 0;
-        try {
-          const tx = db.transaction(STORE_NAME, 'readonly');
-          const store = tx.objectStore(STORE_NAME);
-          const cursorReq = store.openCursor();
-          cursorReq.onsuccess = () => {
-            const cursor = cursorReq.result;
-            if (cursor) {
-              const rec = cursor.value;
-              entries += 1;
-              if (rec) {
-                const kLen = typeof rec.key === 'string' ? rec.key.length : 0;
-                const zLen = typeof rec.zh === 'string' ? rec.zh.length : 0;
-                bytes += kLen + zLen * 2 + 24;
-              }
-              cursor.continue();
+    if (activeStatsPromise) return activeStatsPromise;
+    const holder = { promise: null };
+    const run = (async () => {
+      let openPromise = null;
+      try {
+        openPromise = openDB();
+        const db = await openPromise;
+        return await new Promise((resolve) => {
+          let entries = 0;
+          let bytes = 0;
+          let settled = false;
+          let tx = null;
+          let timeoutId = null;
+
+          const finish = (result = { entries, bytes }) => {
+            if (settled) return;
+            settled = true;
+            if (timeoutId) {
+              clearTimeout(timeoutId);
+              timeoutId = null;
+            }
+            resolve(result);
+          };
+
+          const accumulateRecord = (rec) => {
+            entries += 1;
+            if (rec) {
+              const kLen = typeof rec.key === 'string' ? rec.key.length : 0;
+              const zLen = typeof rec.zh === 'string' ? rec.zh.length : 0;
+              bytes += kLen + zLen * 2 + 24;
             }
           };
-          tx.oncomplete = () => resolve({ entries, bytes });
-          tx.onerror = () => resolve({ entries, bytes });
-          tx.onabort = () => resolve({ entries, bytes });
-        } catch (_) {
-          resolve({ entries: 0, bytes: 0 });
+
+          timeoutId = setTimeout(() => {
+            try { tx?.abort?.(); } catch (_) {}
+            finish({ entries, bytes });
+          }, STATS_TIMEOUT_MS);
+
+          try {
+            tx = db.transaction(STORE_NAME, 'readonly');
+            const store = tx.objectStore(STORE_NAME);
+
+            if (typeof store.getAll === 'function' && typeof IDBKeyRange !== 'undefined') {
+              let hasLastKey = false;
+              let lastKey = null;
+              const nextBatch = () => {
+                if (settled) return;
+                try {
+                  const range = hasLastKey ? IDBKeyRange.lowerBound(lastKey, true) : null;
+                  const batchReq = store.getAll(range, STATS_BATCH_SIZE);
+                  batchReq.onsuccess = () => {
+                    if (settled) return;
+                    try {
+                      const list = Array.isArray(batchReq.result) ? batchReq.result : [];
+                      const prevKey = lastKey;
+                      const hadPrevKey = hasLastKey;
+                      for (const rec of list) {
+                        accumulateRecord(rec);
+                        if (rec && rec.key !== undefined) {
+                          lastKey = rec.key;
+                          hasLastKey = true;
+                        }
+                      }
+                      if (
+                        list.length >= STATS_BATCH_SIZE &&
+                        hasLastKey &&
+                        (!hadPrevKey || lastKey !== prevKey)
+                      ) {
+                        nextBatch();
+                      }
+                    } catch (_) {}
+                  };
+                  batchReq.onerror = (e) => {
+                    try { e?.preventDefault?.(); e?.stopPropagation?.(); } catch (_) {}
+                  };
+                } catch (_) {}
+              };
+              nextBatch();
+            } else {
+              const cursorReq = store.openCursor();
+              cursorReq.onsuccess = () => {
+                try {
+                  const cursor = cursorReq.result;
+                  if (cursor) {
+                    accumulateRecord(cursor.value);
+                    cursor.continue();
+                  }
+                } catch (_) {}
+              };
+            }
+
+            tx.oncomplete = () => finish({ entries, bytes });
+            tx.onerror = () => finish({ entries, bytes });
+            tx.onabort = () => finish({ entries, bytes });
+          } catch (txErr) {
+            if (txErr?.name === 'InvalidStateError') {
+              resetDbHandleIfCurrent(openPromise);
+            }
+            finish({ entries: 0, bytes: 0 });
+          }
+        });
+      } catch (_) {
+        return { entries: 0, bytes: 0 };
+      } finally {
+        if (activeStatsPromise === holder.promise) {
+          activeStatsPromise = null;
         }
-      });
-    } catch (_) {
-      return { entries: 0, bytes: 0 };
-    }
+      }
+    })();
+    holder.promise = run;
+    activeStatsPromise = run;
+    return run;
   }
 
   async function migrateFromLegacyStorage() {
     if (migrationPromise) return migrationPromise;
-    migrationPromise = (async () => {
+    const holder = { promise: null };
+    const run = (async () => {
       try {
         if (!chrome?.storage?.local) return 0;
         const data = await chrome.storage.local.get(LEGACY_CACHE_KEY);
@@ -395,13 +641,22 @@
         const ok = await putMany(entries);
         if (ok) {
           await chrome.storage.local.remove(LEGACY_CACHE_KEY);
+          return entries.length;
         }
-        return ok ? entries.length : 0;
+        if (migrationPromise === holder.promise) {
+          migrationPromise = null;
+        }
+        return 0;
       } catch (_) {
+        if (migrationPromise === holder.promise) {
+          migrationPromise = null;
+        }
         return 0;
       }
     })();
-    return migrationPromise;
+    holder.promise = run;
+    migrationPromise = run;
+    return run;
   }
 
   globalThis.KCTCacheDB = {

@@ -403,6 +403,101 @@ a:focus-visible {
   padding: 4px 0;
 }
 
+/* Saved Multi-Provider Profile Chips & Fallback */
+.provider-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.provider-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px 4px 10px;
+  border-radius: 999px;
+  background: var(--chip-bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  max-width: 100%;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.provider-chip.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.provider-chip-btn {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 2px 0;
+  cursor: pointer;
+  max-width: 100%;
+  min-width: 0;
+  text-align: left;
+}
+
+.provider-chip-meta {
+  font-weight: 400;
+  font-size: 11.5px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
+.provider-chip-badge {
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #ffffff;
+  white-space: nowrap;
+}
+
+.provider-chip-badge.fallback {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+
+.provider-chip-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+  flex-shrink: 0;
+}
+
+.provider-chip-remove:hover {
+  background: rgba(220, 38, 38, 0.14);
+  color: var(--err);
+}
+
+.fallback-field {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
 .cache-bar {
   display: flex;
   align-items: center;

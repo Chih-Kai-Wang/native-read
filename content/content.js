@@ -11,7 +11,8 @@
     hashText,
     SETTINGS_KEY,
     isHostWhitelisted,
-    toggleHostWhitelist
+    toggleHostWhitelist,
+    formatApiError
   } = globalThis.KCTConfig;
 
   const SiteAnalyzer = globalThis.KCTSiteAnalyzer;
@@ -45,7 +46,9 @@
     totalDetected: 0,
     totalTranslated: 0,
     translationEpoch: 0,
-    lastErrorMsg: ''
+    lastErrorMsg: '',
+    fallbackNotice: '',
+    haltedByError: false
   };
 
   let pageActive = false;
@@ -151,7 +154,7 @@
     if (lazyObserver) return lazyObserver;
     lazyObserver = new IntersectionObserver(
       (entries) => {
-        if (!pageActive) return;
+        if (!pageActive || state.haltedByError) return;
         const newlyVisible = [];
         for (const entry of entries) {
           if (!entry.isIntersecting) continue;
@@ -312,6 +315,10 @@
       }, 60000);
     }
 
+    if (msg.type === 'HEARTBEAT') {
+      return;
+    }
+
     if (msg.type === 'ITEM') {
       if (req.epoch !== state.translationEpoch) return;
       const matchedItems = req.itemsByKey.get(msg.key);
@@ -338,7 +345,11 @@
     if (msg.type === 'DONE') {
       if (req.timer) clearTimeout(req.timer);
       activeStreamRequests.delete(msg.requestId);
-      req.resolve({ ok: true, translatedCount: msg.translatedCount || 0 });
+      req.resolve({
+        ok: true,
+        translatedCount: msg.translatedCount || 0,
+        fallbackUsed: msg.fallbackUsed || null
+      });
       return;
     }
 
@@ -428,6 +439,36 @@
     }
   }
 
+  function releasePendingItems() {
+    if (!Array.isArray(state.pendingItems) || state.pendingItems.length === 0) return;
+    const leftover = state.pendingItems.splice(0, state.pendingItems.length);
+    releaseUnreceivedItems(leftover, null);
+  }
+
+  function isCircuitBreakingError(errorCode, msg) {
+    const code = String(errorCode || '').trim();
+    if ([
+      'NO_API_KEY',
+      'NO_MODEL',
+      'INVALID_API_KEY_CHARS',
+      'QUOTA_EXCEEDED',
+      'RATE_LIMITED',
+      'RATE_LIMIT',
+      'OVERLOADED',
+      'AUTH_ERROR',
+      'HTTP_401',
+      'HTTP_403',
+      'HTTP_404',
+      'HTTP_429',
+      'HTTP_503',
+      'HTTP_529'
+    ].includes(code)) {
+      return true;
+    }
+    const txt = String(msg || '');
+    return /\bHTTP\s+(?:401|403|404|429|503|529)\b|high demand|quota|API Key/i.test(txt);
+  }
+
   async function translateBatchViaFallback(batch, uniqueItems, pageContext, batchEpoch) {
     const response = await chrome.runtime.sendMessage({
       type: 'TRANSLATE_BATCH',
@@ -435,15 +476,21 @@
       pageContext
     });
 
-    if (batchEpoch !== state.translationEpoch) return;
+    if (batchEpoch !== state.translationEpoch) return { ok: false, cancelled: true };
 
     if (!response?.ok) {
       state.lastErrorMsg = response?.error || '翻譯失敗';
       releaseUnreceivedItems(batch, null);
-      if (response?.errorCode === 'NO_API_KEY') {
-        state.pendingItems.length = 0;
+      if (isCircuitBreakingError(response?.errorCode, response?.error)) {
+        state.haltedByError = true;
+        releasePendingItems();
+        resetLazyObserver();
       }
-      return;
+      return { ok: false, errorCode: response?.errorCode || '', error: state.lastErrorMsg };
+    }
+
+    if (response.fallbackUsed?.label) {
+      state.fallbackNotice = `已改用備援 ${response.fallbackUsed.label}`;
     }
 
     const results = response.results || {};
@@ -477,6 +524,7 @@
         .catch(() => {});
       await renderChain;
     }
+    return { ok: true };
   }
 
   function takeNextBatch() {
@@ -503,15 +551,16 @@
   }
 
   async function processQueue() {
-    if (isProcessingQueue) return;
+    if (isProcessingQueue || state.haltedByError) return;
     isProcessingQueue = true;
     state.lastErrorMsg = '';
+    state.fallbackNotice = '';
     updateWidgetUI();
 
     try {
       const workers = [];
       const spawnWorker = async () => {
-        while (state.pendingItems.length > 0 && pageActive) {
+        while (state.pendingItems.length > 0 && pageActive && !state.haltedByError) {
           const batch = takeNextBatch();
           if (batch.length === 0) break;
 
@@ -554,6 +603,9 @@
                 if (res?.cancelled || batchEpoch !== state.translationEpoch) {
                   continue;
                 }
+                if (res?.fallbackUsed?.label) {
+                  state.fallbackNotice = `已改用備援 ${res.fallbackUsed.label}`;
+                }
                 // Wait for any buffered rAF renders to complete before counting missing keys
                 await waitForAllRenders();
                 releaseUnreceivedItems(batch, receivedKeys);
@@ -566,14 +618,16 @@
                 } else {
                   state.lastErrorMsg = errObj?.error || '翻譯失敗';
                   releaseUnreceivedItems(batch, receivedKeys);
-                  if (errObj?.errorCode === 'NO_API_KEY') {
-                    state.pendingItems.length = 0;
+                  if (isCircuitBreakingError(errObj?.errorCode, errObj?.error)) {
+                    state.haltedByError = true;
+                    releasePendingItems();
+                    resetLazyObserver();
                     break;
                   }
                 }
               }
 
-              if (needFallback && batchEpoch === state.translationEpoch) {
+              if (needFallback && batchEpoch === state.translationEpoch && !state.haltedByError) {
                 const remainingBatch = batch.filter((it) => !receivedKeys.has(it.key));
                 const remainingUnique = uniqueItems.filter((it) => !receivedKeys.has(it.key));
                 if (remainingUnique.length > 0) {
@@ -583,6 +637,12 @@
                     if (batchEpoch !== state.translationEpoch) continue;
                     state.lastErrorMsg = fbErr?.message || streamErrObj?.error || '通訊失敗';
                     releaseUnreceivedItems(remainingBatch, null);
+                    if (isCircuitBreakingError(fbErr?.errorCode, state.lastErrorMsg)) {
+                      state.haltedByError = true;
+                      releasePendingItems();
+                      resetLazyObserver();
+                      break;
+                    }
                   }
                 }
               }
@@ -593,6 +653,12 @@
             if (batchEpoch !== state.translationEpoch) continue;
             state.lastErrorMsg = err?.message || '通訊失敗';
             releaseUnreceivedItems(batch, null);
+            if (isCircuitBreakingError(err?.errorCode, state.lastErrorMsg)) {
+              state.haltedByError = true;
+              releasePendingItems();
+              resetLazyObserver();
+              break;
+            }
           } finally {
             activeRequests -= 1;
             updateWidgetUI();
@@ -614,7 +680,7 @@
       isProcessingQueue = false;
       updateWidgetUI();
       // If IntersectionObserver enqueued new items while winding down, continue seamlessly
-      if (pageActive && state.pendingItems.length > 0 && !state.lastErrorMsg) {
+      if (pageActive && !state.haltedByError && state.pendingItems.length > 0 && !state.lastErrorMsg) {
         processQueue();
       }
     }
@@ -622,6 +688,7 @@
 
   function scanAndTranslate(force = false) {
     if (!state.settings || !pageActive) return;
+    if (state.haltedByError && !force) return;
     CodeOverlay.injectOutputTranslateButtons(state.settings, getPageContext());
     if (!state.settings.enabled && !force) return;
 
@@ -629,9 +696,11 @@
     const newComments = CodeOverlay.collectCodeComments(force, state.settings, state);
     const newItems = [...newBlocks, ...newComments];
 
-    if (newItems.length > 0) {
-      state.totalDetected += newItems.length;
-      state.pendingItems.push(...newItems);
+    if (newItems.length > 0 || state.pendingItems.length > 0) {
+      if (newItems.length > 0) {
+        state.totalDetected += newItems.length;
+        state.pendingItems.push(...newItems);
+      }
       sortViewportFirst(state.pendingItems);
       updateWidgetUI();
       processQueue();
@@ -654,14 +723,17 @@
         state.totalTranslated = 0;
         state.pendingItems.length = 0;
         state.lastErrorMsg = '';
+        state.fallbackNotice = '';
+        state.haltedByError = false;
         if (isTopFrame()) subframeStats.clear();
       }
-      if (!pageActive) return;
+      if (!pageActive || state.haltedByError) return;
       scanAndTranslate(false);
     }, delay);
   }
 
   function resetAndClearPage(deactivate = false) {
+    state.haltedByError = false;
     clearHydrationTimers();
     cancelAllActiveStreams();
     resetLazyObserver();
@@ -685,19 +757,22 @@
     let translated = state.totalTranslated;
     let isBusy = isProcessingQueue || activeRequests > 0;
     let err = state.lastErrorMsg;
+    let fallbackNotice = state.fallbackNotice;
 
     for (const s of subframeStats.values()) {
       detected += Number(s.totalDetected || 0);
       translated += Number(s.totalTranslated || 0);
       if (s.isBusy) isBusy = true;
       if (!err && s.lastErrorMsg) err = s.lastErrorMsg;
+      if (!fallbackNotice && s.fallbackNotice) fallbackNotice = s.fallbackNotice;
     }
 
     return {
       totalDetected: detected,
       totalTranslated: translated,
       isBusy,
-      lastErrorMsg: err
+      lastErrorMsg: err,
+      fallbackNotice
     };
   }
 
@@ -710,7 +785,8 @@
           totalDetected: state.totalDetected,
           totalTranslated: state.totalTranslated,
           isBusy: isProcessingQueue || activeRequests > 0,
-          lastErrorMsg: state.lastErrorMsg
+          lastErrorMsg: state.lastErrorMsg,
+          fallbackNotice: state.fallbackNotice
         }
       });
     } catch (_) {}
@@ -1194,8 +1270,9 @@
 
     if (agg.lastErrorMsg) {
       dot.classList.add('kct-err');
-      status.textContent = agg.lastErrorMsg;
-      status.title = agg.lastErrorMsg;
+      const fmt = typeof formatApiError === 'function' ? formatApiError(agg.lastErrorMsg) : null;
+      status.textContent = fmt ? fmt.shortMsg : agg.lastErrorMsg;
+      status.title = fmt ? fmt.detailMsg : agg.lastErrorMsg;
     } else if (agg.isBusy) {
       dot.classList.add('kct-busy');
       const label = state.settings?.streamTranslation !== false ? '串流中' : '翻譯中';
@@ -1209,7 +1286,8 @@
       status.textContent = agg.totalTranslated > 0 ? `已譯 ${agg.totalTranslated} 項（已暫停）` : '已暫停';
       status.title = '全域翻譯開關已關閉，點擊「↻」可啟用並翻譯';
     } else if (agg.totalTranslated > 0) {
-      status.textContent = `已譯 ${agg.totalTranslated} 項`;
+      const suffix = agg.fallbackNotice ? `（${agg.fallbackNotice}）` : '';
+      status.textContent = `已譯 ${agg.totalTranslated} 項${suffix}`;
       status.title = status.textContent;
     } else {
       status.textContent = '就緒';
@@ -1845,7 +1923,7 @@
   // =========================================================
   function setupObservers() {
     const observer = new MutationObserver((mutations) => {
-      if (!pageActive) return;
+      if (!pageActive || state.haltedByError) return;
       let hasExternalNodes = false;
       for (const m of mutations) {
         if (m.target && m.target.closest && m.target.closest('[data-kct-ui]')) continue;
@@ -1905,14 +1983,14 @@
           Renderer.refitAllPdfOverlayBlocks();
         }
         // Trigger DOM rescan on scroll for virtualized code editors, virtualized PDF viewers, or when lazyViewport is off
-        if (pageInfo.hasCodeWidgets || hasPdfOverlayLayer || state.settings?.lazyViewport === false) {
+        if (!state.haltedByError && (pageInfo.hasCodeWidgets || hasPdfOverlayLayer || state.settings?.lazyViewport === false)) {
           scheduleScan(240);
         }
       }, 240);
     };
     document.addEventListener('scroll', onScrollOrBlur, { passive: true, capture: true });
     document.addEventListener('focusout', () => {
-      if (!pageActive) return;
+      if (!pageActive || state.haltedByError) return;
       scheduleCmSync();
       if (pageInfo.hasCodeWidgets) {
         scheduleScan(220);
@@ -1934,6 +2012,8 @@
         state.settings = await saveSettings(patch);
       }
     }
+    state.haltedByError = false;
+    state.lastErrorMsg = '';
     pageActive = true;
     pageInfo = classifyPage();
     Renderer.applyDisplayModeClass(state.settings);
@@ -1946,7 +2026,7 @@
     clearHydrationTimers();
     for (const delay of [900, 2400]) {
       const id = setTimeout(() => {
-        if (pageActive) scanAndTranslate(false);
+        if (pageActive && !state.haltedByError) scanAndTranslate(false);
       }, delay);
       hydrationTimers.push(id);
     }
@@ -2105,23 +2185,41 @@
     if (pageActive) {
       if (prev && prev.enabled && !state.settings.enabled) {
         resetAndClearPage(false);
-      } else if (
-        prev &&
-        state.settings.enabled &&
-        (
+      } else if (prev && state.settings.enabled) {
+        const nonProviderChanged = (
           prev.scope !== state.settings.scope ||
           prev.targetLang !== state.settings.targetLang ||
           prev.customTargetLang !== state.settings.customTargetLang ||
           prev.translateCodeComments !== state.settings.translateCodeComments ||
           prev.customGlossary !== state.settings.customGlossary ||
-          prev.model !== state.settings.model ||
-          prev.protocol !== state.settings.protocol ||
           prev.lazyViewport !== state.settings.lazyViewport ||
           !prev.enabled
-        )
-      ) {
-        resetAndClearPage(false);
-        scanAndTranslate(true);
+        );
+        const providerChanged = (
+          prev.providerId !== state.settings.providerId ||
+          prev.baseUrl !== state.settings.baseUrl ||
+          prev.apiKey !== state.settings.apiKey ||
+          prev.model !== state.settings.model ||
+          prev.protocol !== state.settings.protocol
+        );
+
+        if (nonProviderChanged) {
+          state.haltedByError = false;
+          resetAndClearPage(false);
+          scanAndTranslate(true);
+        } else if (providerChanged) {
+          state.haltedByError = false;
+          if (state.lastErrorMsg) {
+            state.lastErrorMsg = '';
+            state.fallbackNotice = '';
+            cancelAllActiveStreams();
+            updateWidgetUI();
+            scanAndTranslate(false);
+          } else if (prev.model !== state.settings.model || prev.protocol !== state.settings.protocol) {
+            resetAndClearPage(false);
+            scanAndTranslate(true);
+          }
+        }
       }
     }
 
@@ -2130,6 +2228,14 @@
 
   async function tryImportMobileSyncHash() {
     if (!isTopFrame()) return false;
+    const isTrustedPwa =
+      location.origin === 'https://chih-kai-wang.github.io' &&
+      location.pathname.startsWith('/native-read');
+    const isTrustedExt =
+      location.protocol === 'chrome-extension:' &&
+      location.host === chrome.runtime?.id;
+    if (!isTrustedPwa && !isTrustedExt) return false;
+
     const rawHash = location.hash || '';
     const match = rawHash.match(/(?:^|[#&])nr_sync=([A-Za-z0-9_%-]+)/);
     if (!match) return false;
@@ -2144,44 +2250,88 @@
       }
       const jsonStr = new TextDecoder().decode(bytes);
       const data = JSON.parse(jsonStr);
-      if (!data || typeof data !== 'object') return false;
+      if (!data || typeof data !== 'object' || Array.isArray(data)) return false;
 
-      const providerId = String(data.providerId || data.p || '').trim();
-      const preset = (providerId && PROVIDER_PRESETS?.[providerId]) || null;
-      const patch = {};
-      if (providerId) patch.providerId = providerId;
+      const rawProviderId = String(data.providerId || data.p || '').trim();
+      if (rawProviderId && !PROVIDER_PRESETS?.[rawProviderId]) return false;
+      const preset = rawProviderId ? PROVIDER_PRESETS[rawProviderId] : null;
 
-      const protocol = String(data.protocol || data.r || preset?.protocol || '').trim();
-      if (protocol === 'openai' || protocol === 'gemini') patch.protocol = protocol;
-
-      const baseUrl = String(data.baseUrl || data.u || preset?.baseUrl || '').trim();
-      if (baseUrl) patch.baseUrl = baseUrl;
-
-      if (typeof (data.apiKey ?? data.k) === 'string') {
-        const cleanKey = typeof sanitizeApiKey === 'function'
-          ? sanitizeApiKey(data.apiKey ?? data.k)
-          : String(data.apiKey ?? data.k).trim();
-        patch.apiKey = cleanKey;
+      const rawProtocol = String(data.protocol || data.r || '').trim();
+      if (rawProtocol && rawProtocol !== 'openai' && rawProtocol !== 'gemini' && rawProtocol !== 'anthropic') {
+        return false;
       }
 
-      const model = String(data.model || data.m || preset?.defaultModel || '').trim();
+      const rawBaseUrl = String(data.baseUrl || data.u || '').trim();
+      if (rawBaseUrl) {
+        let parsedBase;
+        try {
+          parsedBase = new URL(rawBaseUrl);
+        } catch (_) {
+          return false;
+        }
+        if (parsedBase.protocol !== 'http:' && parsedBase.protocol !== 'https:') return false;
+      }
+
+      const rawKeyVal = Object.prototype.hasOwnProperty.call(data, 'apiKey')
+        ? data.apiKey
+        : Object.prototype.hasOwnProperty.call(data, 'k')
+          ? data.k
+          : undefined;
+      const hasExplicitKey = typeof rawKeyVal === 'string';
+      const hasEndpointMutationField = Boolean(rawProviderId || rawProtocol || rawBaseUrl);
+      if (!hasExplicitKey && hasEndpointMutationField) return false;
+
+      const patch = {};
+      if (hasExplicitKey) {
+        patch.apiKey = typeof sanitizeApiKey === 'function'
+          ? sanitizeApiKey(rawKeyVal)
+          : String(rawKeyVal).trim();
+        if (rawProviderId) patch.providerId = rawProviderId;
+        const protocol = rawProtocol || preset?.protocol || '';
+        if (protocol === 'openai' || protocol === 'gemini' || protocol === 'anthropic') {
+          patch.protocol = protocol;
+        }
+        const resolvedBaseUrl = rawBaseUrl || preset?.baseUrl || '';
+        if (resolvedBaseUrl) {
+          let parsedResolvedBase;
+          try {
+            parsedResolvedBase = new URL(resolvedBaseUrl);
+          } catch (_) {
+            return false;
+          }
+          if (parsedResolvedBase.protocol !== 'http:' && parsedResolvedBase.protocol !== 'https:') return false;
+          patch.baseUrl = resolvedBaseUrl;
+        }
+      }
+
+      const model = String(data.model || data.m || (hasExplicitKey ? preset?.defaultModel : '') || '').trim();
       if (model) patch.model = model;
 
       const targetLang = String(data.targetLang || data.l || '').trim();
-      if (targetLang) patch.targetLang = targetLang;
+      if (targetLang && (!TARGET_LANGUAGES || TARGET_LANGUAGES[targetLang])) {
+        patch.targetLang = targetLang;
+      }
 
       const customTargetLang = String(data.customTargetLang ?? data.c ?? '').trim();
-      if (customTargetLang || targetLang === 'custom') {
+      if (customTargetLang || patch.targetLang === 'custom') {
         patch.customTargetLang = customTargetLang;
       }
 
       const thinkingEffort = String(data.thinkingEffort || data.e || '').trim();
-      if (thinkingEffort) patch.thinkingEffort = thinkingEffort;
+      if (['fastest', 'balanced', 'deep'].includes(thinkingEffort)) {
+        patch.thinkingEffort = thinkingEffort;
+      }
 
       const typographyMatch = String(data.typographyMatch || data.t || '').trim();
-      if (typographyMatch) patch.typographyMatch = typographyMatch;
+      if (['native', 'system', 'preserve'].includes(typographyMatch)) {
+        patch.typographyMatch = typographyMatch;
+      }
 
-      history.replaceState(null, '', location.pathname + location.search);
+      if (Object.keys(patch).length === 0) return false;
+
+      try {
+        history.replaceState(null, '', location.pathname + location.search);
+      } catch (_) {}
       state.settings = await saveSettings(patch);
 
       createFloatingWidget();

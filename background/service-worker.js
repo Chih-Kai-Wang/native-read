@@ -22,7 +22,10 @@ const {
   isAzureOpenAIEndpoint,
   buildAnthropicMessagesBody,
   extractAnthropicText,
-  extractAnthropicStreamDelta
+  extractAnthropicStreamDelta,
+  isLocalEndpoint,
+  resolveFallbackSettings,
+  formatApiError
 } = globalThis.KCTConfig;
 
 const CacheDB = globalThis.KCTCacheDB;
@@ -56,15 +59,25 @@ function finishBatchEvent(id, patch) {
   if (recentBatchDebug.length > 20) recentBatchDebug.shift();
 }
 
-function isLocalEndpoint(baseUrl) {
-  return /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?(\/|$)/i.test(String(baseUrl || '').trim());
-}
-
 function redactApiKey(text, apiKey) {
   const out = String(text || '');
   const cleanKey = sanitizeApiKey(apiKey);
   if (!out || cleanKey.length < 6) return out;
   return out.split(cleanKey).join('[REDACTED]');
+}
+
+function redactAllKeys(text, settings, extraSettings = null) {
+  let out = String(text || '');
+  if (!out) return out;
+  if (settings?.apiKey) out = redactApiKey(out, settings.apiKey);
+  if (extraSettings?.apiKey) out = redactApiKey(out, extraSettings.apiKey);
+  const profiles = settings?.providerProfiles;
+  if (profiles && typeof profiles === 'object') {
+    for (const prof of Object.values(profiles)) {
+      if (prof?.apiKey) out = redactApiKey(out, prof.apiKey);
+    }
+  }
+  return out;
 }
 
 // A model must be chosen explicitly (presets no longer ship guessed defaults).
@@ -420,17 +433,42 @@ function makeAbortError(message = '請求已取消') {
   return err;
 }
 
-// Cross-frame global scheduler + adaptive cooldown after HTTP 429 (protects Free Tier 5-15 RPM)
+// Per-provider scheduler + adaptive cooldown after HTTP 429/503 (isolates providers from each other)
 const NORMAL_MAX_CONCURRENT = 3;
-let inFlightRequests = 0;
-const slotWaiters = [];
-let globalCooldownUntil = 0;
-let adaptivePacingUntil = 0;
-let lastRequestStartAt = 0;
-let pacingTail = Promise.resolve();
+const providerPacingMap = new Map();
 
-function getEffectiveMaxConcurrent() {
-  return Date.now() < adaptivePacingUntil ? 1 : NORMAL_MAX_CONCURRENT;
+function getProviderPacingKey(settings) {
+  const pid = String(settings?.providerId || '').trim();
+  let host = '';
+  try {
+    const raw = String(settings?.baseUrl || '').trim();
+    if (raw) host = new URL(raw).host.toLowerCase();
+  } catch (_) {}
+  if (pid && host) return `${pid}::${host}`;
+  return pid || host || String(settings?.protocol || 'default');
+}
+
+function getPacingState(pacingKey = 'default') {
+  const key = String(pacingKey || 'default');
+  let st = providerPacingMap.get(key);
+  if (!st) {
+    st = {
+      inFlightRequests: 0,
+      slotWaiters: [],
+      globalCooldownUntil: 0,
+      adaptivePacingUntil: 0,
+      adaptiveGapMs: 4300,
+      lastRequestStartAt: 0,
+      pacingTail: Promise.resolve()
+    };
+    providerPacingMap.set(key, st);
+  }
+  return st;
+}
+
+function getEffectiveMaxConcurrent(pacingKey = 'default') {
+  const st = getPacingState(pacingKey);
+  return Date.now() < st.adaptivePacingUntil ? 1 : NORMAL_MAX_CONCURRENT;
 }
 
 function abortableSleep(ms, signal) {
@@ -451,19 +489,20 @@ function abortableSleep(ms, signal) {
   });
 }
 
-async function acquireRequestSlot(externalSignal) {
+async function acquireRequestSlot(externalSignal, pacingKey = 'default') {
   if (externalSignal?.aborted) {
     throw makeAbortError();
   }
-  while (inFlightRequests >= getEffectiveMaxConcurrent()) {
+  const st = getPacingState(pacingKey);
+  while (st.inFlightRequests >= getEffectiveMaxConcurrent(pacingKey)) {
     await new Promise((resolve, reject) => {
       const waiter = () => {
         if (externalSignal) externalSignal.removeEventListener('abort', onAbort);
         resolve();
       };
       const onAbort = () => {
-        const idx = slotWaiters.indexOf(waiter);
-        if (idx !== -1) slotWaiters.splice(idx, 1);
+        const idx = st.slotWaiters.indexOf(waiter);
+        if (idx !== -1) st.slotWaiters.splice(idx, 1);
         reject(makeAbortError());
       };
       if (externalSignal) {
@@ -473,46 +512,47 @@ async function acquireRequestSlot(externalSignal) {
         }
         externalSignal.addEventListener('abort', onAbort, { once: true });
       }
-      slotWaiters.push(waiter);
+      st.slotWaiters.push(waiter);
     });
   }
-  inFlightRequests += 1;
+  st.inFlightRequests += 1;
 
-  const gate = pacingTail.then(async () => {
+  const gate = st.pacingTail.then(async () => {
     if (externalSignal?.aborted) return;
-    const cooldownWait = globalCooldownUntil - Date.now();
+    const cooldownWait = st.globalCooldownUntil - Date.now();
     if (cooldownWait > 0) {
       await abortableSleep(cooldownWait, externalSignal);
     }
     if (externalSignal?.aborted) return;
-    if (Date.now() < adaptivePacingUntil) {
-      const gapWait = lastRequestStartAt + 4300 - Date.now();
+    if (Date.now() < st.adaptivePacingUntil) {
+      const gapWait = st.lastRequestStartAt + st.adaptiveGapMs - Date.now();
       if (gapWait > 0) {
         await abortableSleep(gapWait, externalSignal);
       }
     }
     if (!externalSignal?.aborted) {
-      lastRequestStartAt = Date.now();
+      st.lastRequestStartAt = Date.now();
     }
   });
-  pacingTail = gate.catch(() => {});
+  st.pacingTail = gate.catch(() => {});
   try {
     await gate;
   } catch (err) {
-    releaseRequestSlot();
+    releaseRequestSlot(pacingKey);
     throw err;
   }
 
   if (externalSignal?.aborted) {
-    releaseRequestSlot();
+    releaseRequestSlot(pacingKey);
     throw makeAbortError();
   }
 }
 
-function releaseRequestSlot() {
-  inFlightRequests = Math.max(0, inFlightRequests - 1);
-  if (slotWaiters.length > 0 && inFlightRequests < getEffectiveMaxConcurrent()) {
-    const wake = slotWaiters.shift();
+function releaseRequestSlot(pacingKey = 'default') {
+  const st = getPacingState(pacingKey);
+  st.inFlightRequests = Math.max(0, st.inFlightRequests - 1);
+  if (st.slotWaiters.length > 0 && st.inFlightRequests < getEffectiveMaxConcurrent(pacingKey)) {
+    const wake = st.slotWaiters.shift();
     wake();
   }
 }
@@ -539,20 +579,22 @@ function parseRetryDelayMs(errBody, response) {
   return 0;
 }
 
-function handleRateLimitResponse(errBody, response, attempt, maxAttempts, apiKey = '') {
+function handleRateLimitResponse(errBody, response, attempt, maxAttempts, apiKey = '', pacingKey = 'default') {
   const safeBody = redactApiKey(errBody, apiKey);
   const isDailyOrZeroQuota = /PerDay|RequestsPerDay|GenerateRequestsPerDay|"quotaValue"\s*:\s*"0"|limit:\s*0/i.test(safeBody);
   const retryDelayMs = parseRetryDelayMs(safeBody, response);
   if (!isDailyOrZeroQuota && attempt < maxAttempts && retryDelayMs <= 28000) {
     const waitMs = Math.min(26000, retryDelayMs > 0 ? retryDelayMs + 400 : 4500 * attempt);
     const now = Date.now();
-    adaptivePacingUntil = Math.max(adaptivePacingUntil, now + 90000);
-    globalCooldownUntil = Math.max(globalCooldownUntil, now + waitMs);
-    return { shouldRetry: true };
+    const st = getPacingState(pacingKey);
+    st.adaptiveGapMs = 4300;
+    st.adaptivePacingUntil = Math.max(st.adaptivePacingUntil, now + 90000);
+    st.globalCooldownUntil = Math.max(st.globalCooldownUntil, now + waitMs);
+    return { shouldRetry: true, waitMs };
   }
   const waitSec = retryDelayMs > 0 ? Math.ceil(retryDelayMs / 1000) : null;
   const rateHint = isDailyOrZeroQuota
-    ? 'HTTP 429：已達每日免費額度上限（或模型配額為 0），建議切換 Tier 1 Key、更換模型或改用 DeepSeek'
+    ? 'HTTP 429：已達每日免費額度上限（或模型配額為 0），建議切換 Tier 1 Key、更換模型或切換備援供應商'
     : waitSec
       ? `HTTP 429：請求頻率達上限，需等待約 ${waitSec}s（免費版限 5–15 RPM）`
       : `HTTP 429：請求頻率達上限 (${safeBody.slice(0, 160) || response.statusText})`;
@@ -562,6 +604,89 @@ function handleRateLimitResponse(errBody, response, attempt, maxAttempts, apiKey
   httpErr.noSplit = true;
   httpErr.noRetry = true;
   return { shouldRetry: false, error: httpErr };
+}
+
+function computeOverloadBackoffMs(status, attempt, safeBody, response, pacingKey = 'default') {
+  const retryDelayMs = parseRetryDelayMs(safeBody, response);
+  const jitter = Math.floor(Math.random() * 450);
+  const st = getPacingState(pacingKey);
+  if (retryDelayMs > 0 && retryDelayMs <= 12000) {
+    const now = Date.now();
+    st.adaptiveGapMs = 2200;
+    st.adaptivePacingUntil = Math.max(st.adaptivePacingUntil, now + 30000);
+    st.globalCooldownUntil = Math.max(st.globalCooldownUntil, now + retryDelayMs + jitter);
+    return retryDelayMs + jitter;
+  }
+  if (status === 503 || status === 529) {
+    const waitMs = ([1500, 3500, 7000][attempt - 1] || 7000) + jitter;
+    const now = Date.now();
+    st.adaptiveGapMs = 2200;
+    st.adaptivePacingUntil = Math.max(st.adaptivePacingUntil, now + 30000);
+    st.globalCooldownUntil = Math.max(st.globalCooldownUntil, now + waitMs);
+    return waitMs;
+  }
+  return 900 * attempt + Math.floor(Math.random() * 300);
+}
+
+function buildHttpFailureError(status, safeErrBody, apiKey = '') {
+  const cleanBody = redactApiKey(safeErrBody, apiKey);
+  const isOverload =
+    status === 503 ||
+    status === 529 ||
+    ((!status || status >= 500) && /high demand|overloaded|UNAVAILABLE|capacity|temporarily unavailable/i.test(cleanBody));
+  const errorCode = isOverload ? 'OVERLOADED' : `HTTP_${status}`;
+  const fmt = formatApiError(cleanBody, status, errorCode);
+  const msg = withModelHint(fmt.detailMsg || `HTTP ${status}: ${cleanBody.slice(0, 200)}`, status);
+  const httpErr = new Error(msg);
+  httpErr.httpStatus = status;
+  httpErr.errorCode = errorCode;
+  httpErr.rawError = cleanBody.slice(0, 240);
+  httpErr.noRetry = true;
+  httpErr.noSplit =
+    status >= 500 ||
+    status === 529 ||
+    status === 401 ||
+    status === 402 ||
+    status === 403 ||
+    status === 404 ||
+    status === 422 ||
+    status === 429 ||
+    (status === 400 && !isContextLengthError(cleanBody));
+  return httpErr;
+}
+
+function isFallbackEligibleError(err) {
+  if (!err || err.isExternalAbort) return false;
+  const status = Number(err?.httpStatus || 0);
+  if ([400, 401, 402, 403, 404, 422].includes(status)) return false;
+  const code = String(err?.errorCode || '').trim();
+  if ([
+    'NO_API_KEY',
+    'NO_MODEL',
+    'INVALID_API_KEY_CHARS',
+    'VISION_UNSUPPORTED',
+    'HTTP_400',
+    'HTTP_401',
+    'HTTP_402',
+    'HTTP_403',
+    'HTTP_404',
+    'HTTP_422'
+  ].includes(code)) {
+    return false;
+  }
+  if ([429, 500, 502, 503, 504, 529].includes(status)) return true;
+  return [
+    'OVERLOADED',
+    'QUOTA_EXCEEDED',
+    'RATE_LIMITED',
+    'HTTP_500',
+    'HTTP_502',
+    'HTTP_503',
+    'HTTP_504',
+    'HTTP_529',
+    'TIMEOUT',
+    'NETWORK_ERROR'
+  ].includes(code);
 }
 
 function normalizeGeminiModelId(model) {
@@ -640,8 +765,9 @@ async function callLLMChat(settings, messages, expectJson = true, externalSignal
     throw new Error('API 地址無效，請檢查設定中的 Base URL');
   }
 
+  const pacingKey = getProviderPacingKey(settings);
   const maxAttempts = 4;
-  const maxNetworkOr5xxAttempts = 3;
+  const maxNetworkOr5xxAttempts = 4;
   const maxTimeoutAttempts = 2;
   let lastError = null;
 
@@ -650,7 +776,7 @@ async function callLLMChat(settings, messages, expectJson = true, externalSignal
       throw makeAbortError();
     }
     let sleepAfterAttemptMs = 0;
-    await acquireRequestSlot(externalSignal);
+    await acquireRequestSlot(externalSignal, pacingKey);
     const controller = new AbortController();
     let timedOut = false;
     const onExternalAbort = () => controller.abort();
@@ -733,28 +859,15 @@ async function callLLMChat(settings, messages, expectJson = true, externalSignal
         const safeErrBody = redactApiKey(errBody, settings.apiKey);
         const status = response.status;
         if (status === 429) {
-          const rl = handleRateLimitResponse(safeErrBody, response, attempt, maxAttempts, settings.apiKey);
+          const rl = handleRateLimitResponse(safeErrBody, response, attempt, maxAttempts, settings.apiKey, pacingKey);
           if (rl.shouldRetry) continue;
           throw rl.error;
         }
-        if (status >= 500 && attempt < maxNetworkOr5xxAttempts) {
-          sleepAfterAttemptMs = 700 * attempt;
+        if ((status >= 500 || status === 529) && attempt < maxNetworkOr5xxAttempts) {
+          sleepAfterAttemptMs = computeOverloadBackoffMs(status, attempt, safeErrBody, response, pacingKey);
           continue;
         }
-        const httpErr = new Error(withModelHint(`HTTP ${status}: ${safeErrBody.slice(0, 280) || response.statusText}`, status));
-        httpErr.httpStatus = status;
-        httpErr.errorCode = `HTTP_${status}`;
-        httpErr.noRetry = true;
-        httpErr.noSplit =
-          status >= 500 ||
-          status === 401 ||
-          status === 402 ||
-          status === 403 ||
-          status === 404 ||
-          status === 422 ||
-          status === 429 ||
-          (status === 400 && !isContextLengthError(safeErrBody));
-        throw httpErr;
+        throw buildHttpFailureError(status, safeErrBody || response.statusText, settings.apiKey);
       }
 
       const data = await response.json();
@@ -794,6 +907,7 @@ async function callLLMChat(settings, messages, expectJson = true, externalSignal
       lastError = err;
       if (err.name === 'AbortError' || timedOut) {
         lastError = new Error('請求逾時 (25s)，請檢查網路或 API 服務狀態');
+        lastError.errorCode = 'TIMEOUT';
         lastError.noSplit = true;
         if (attempt < maxTimeoutAttempts) {
           sleepAfterAttemptMs = 700 * attempt;
@@ -808,6 +922,7 @@ async function callLLMChat(settings, messages, expectJson = true, externalSignal
         err?.name === 'TypeError' ||
         /network|failed to fetch|load failed|networkerror|fetch/i.test(String(lastError.message));
       if (isNetworkErr) {
+        lastError.errorCode = lastError.errorCode || 'NETWORK_ERROR';
         lastError.noSplit = true;
         if (attempt < maxNetworkOr5xxAttempts) {
           sleepAfterAttemptMs = 700 * attempt;
@@ -820,9 +935,9 @@ async function callLLMChat(settings, messages, expectJson = true, externalSignal
       if (externalSignal) {
         externalSignal.removeEventListener('abort', onExternalAbort);
       }
-      releaseRequestSlot();
+      releaseRequestSlot(pacingKey);
       if (sleepAfterAttemptMs > 0 && !externalSignal?.aborted) {
-        await sleep(sleepAfterAttemptMs);
+        await abortableSleep(sleepAfterAttemptMs, externalSignal);
       }
     }
   }
@@ -1061,7 +1176,7 @@ function extractStreamTextDelta(protocol, chunkObj) {
   return '';
 }
 
-async function streamTranslateItems(settings, items, pageContext, onItem, externalSignal = null) {
+async function streamTranslateItems(settings, items, pageContext, onItem, externalSignal = null, onProgress = null) {
   assertModelConfigured(settings);
   if (!items || items.length === 0) return 0;
 
@@ -1070,6 +1185,7 @@ async function streamTranslateItems(settings, items, pageContext, onItem, extern
     throw new Error('API 地址無效，請檢查設定中的 Base URL');
   }
 
+  const pacingKey = getProviderPacingKey(settings);
   const payload = items.map((item, idx) =>
     item.kind === 'comment'
       ? { i: idx, kind: 'comment', text: item.text }
@@ -1081,7 +1197,7 @@ async function streamTranslateItems(settings, items, pageContext, onItem, extern
   ];
 
   const maxAttempts = 4;
-  const maxNetworkOr5xxAttempts = 3;
+  const maxNetworkOr5xxAttempts = 4;
   const maxTimeoutAttempts = 2;
   let lastError = null;
   let emittedCount = 0;
@@ -1100,7 +1216,8 @@ async function streamTranslateItems(settings, items, pageContext, onItem, extern
       throw makeAbortError();
     }
     let sleepAfterAttemptMs = 0;
-    await acquireRequestSlot(externalSignal);
+    onProgress?.('attempt', { attempt, providerId: settings?.providerId || '' });
+    await acquireRequestSlot(externalSignal, pacingKey);
 
     const controller = new AbortController();
     let timedOut = false;
@@ -1187,28 +1304,19 @@ async function streamTranslateItems(settings, items, pageContext, onItem, extern
         const safeErrBody = redactApiKey(errBody, settings.apiKey);
         const status = response.status;
         if (status === 429) {
-          const rl = handleRateLimitResponse(safeErrBody, response, attempt, maxAttempts, settings.apiKey);
-          if (rl.shouldRetry) continue;
+          const rl = handleRateLimitResponse(safeErrBody, response, attempt, maxAttempts, settings.apiKey, pacingKey);
+          if (rl.shouldRetry) {
+            onProgress?.('backoff', { status: 429, attempt, waitMs: rl.waitMs || 0 });
+            continue;
+          }
           throw rl.error;
         }
-        if (status >= 500 && attempt < maxNetworkOr5xxAttempts) {
-          sleepAfterAttemptMs = 700 * attempt;
+        if ((status >= 500 || status === 529) && attempt < maxNetworkOr5xxAttempts) {
+          sleepAfterAttemptMs = computeOverloadBackoffMs(status, attempt, safeErrBody, response, pacingKey);
+          onProgress?.('backoff', { status, attempt, waitMs: sleepAfterAttemptMs });
           continue;
         }
-        const httpErr = new Error(withModelHint(`HTTP ${status}: ${safeErrBody.slice(0, 280) || response.statusText}`, status));
-        httpErr.httpStatus = status;
-        httpErr.errorCode = `HTTP_${status}`;
-        httpErr.noRetry = true;
-        httpErr.noSplit =
-          status >= 500 ||
-          status === 401 ||
-          status === 402 ||
-          status === 403 ||
-          status === 404 ||
-          status === 422 ||
-          status === 429 ||
-          (status === 400 && !isContextLengthError(safeErrBody));
-        throw httpErr;
+        throw buildHttpFailureError(status, safeErrBody || response.statusText, settings.apiKey);
       }
 
       const contentType = String(response.headers.get('content-type') || '').toLowerCase();
@@ -1336,9 +1444,11 @@ async function streamTranslateItems(settings, items, pageContext, onItem, extern
       lastError = err;
       if (err.name === 'AbortError' || timedOut) {
         lastError = new Error('串流請求逾時，請檢查網路或 API 服務狀態');
+        lastError.errorCode = 'TIMEOUT';
         lastError.noSplit = true;
         if (attempt < maxTimeoutAttempts && emittedCount === 0) {
           sleepAfterAttemptMs = 700 * attempt;
+          onProgress?.('backoff', { status: 0, attempt, waitMs: sleepAfterAttemptMs, reason: 'timeout' });
           continue;
         }
         break;
@@ -1350,9 +1460,11 @@ async function streamTranslateItems(settings, items, pageContext, onItem, extern
         err?.name === 'TypeError' ||
         /network|failed to fetch|load failed|networkerror|fetch/i.test(String(lastError.message));
       if (isNetworkErr) {
+        lastError.errorCode = lastError.errorCode || 'NETWORK_ERROR';
         lastError.noSplit = true;
         if (attempt < maxNetworkOr5xxAttempts) {
           sleepAfterAttemptMs = 700 * attempt;
+          onProgress?.('backoff', { status: 0, attempt, waitMs: sleepAfterAttemptMs, reason: 'network' });
           continue;
         }
       }
@@ -1362,9 +1474,9 @@ async function streamTranslateItems(settings, items, pageContext, onItem, extern
       if (externalSignal) {
         externalSignal.removeEventListener('abort', onExternalAbort);
       }
-      releaseRequestSlot();
+      releaseRequestSlot(pacingKey);
       if (sleepAfterAttemptMs > 0 && !externalSignal?.aborted) {
-        await sleep(sleepAfterAttemptMs);
+        await abortableSleep(sleepAfterAttemptMs, externalSignal);
       }
     }
   }
@@ -1603,10 +1715,48 @@ async function handleTranslateBatch(items, pageContext = null) {
 
   recordBatchEvent(bid, { stage: 'calling_llm', uncached: uncached.length, cached: items.length - uncached.length });
   if (uncached.length > 0) {
+    let fallbackUsed = null;
     try {
-      const translatedMap = await translateItemsWithFallback(settings, uncached, pageContext);
+      let translatedMap = null;
+      let activeSig = sig;
+      let activeSettings = settings;
+      let itemsToTranslate = uncached;
+
+      try {
+        translatedMap = await translateItemsWithFallback(activeSettings, itemsToTranslate, pageContext);
+      } catch (primaryErr) {
+        const fbSettings = isFallbackEligibleError(primaryErr) ? resolveFallbackSettings(settings) : null;
+        if (!fbSettings) {
+          throw primaryErr;
+        }
+        recordBatchEvent(bid, { stage: 'fallback_provider', provider: fbSettings.providerId, model: fbSettings.model });
+        activeSettings = fbSettings;
+        activeSig = buildCacheSignature(fbSettings, pageContext);
+        const fbKeys = itemsToTranslate.map((it) => `${activeSig}::${it.key}`);
+        const fbCachedMap = await CacheDB.getMany(fbKeys);
+        const fbUncached = [];
+        for (const it of itemsToTranslate) {
+          const fbCacheKey = `${activeSig}::${it.key}`;
+          const fbHit = fbCachedMap.get(fbCacheKey);
+          if (typeof fbHit === 'string' && fbHit.trim() && !isUntranslatedEcho(it.text, fbHit, lang.id)) {
+            results[it.key] = { zh: fbHit, cached: true };
+          } else {
+            fbUncached.push({ ...it, cacheKey: fbCacheKey });
+          }
+        }
+        translatedMap = fbUncached.length > 0
+          ? await translateItemsWithFallback(fbSettings, fbUncached, pageContext)
+          : {};
+        itemsToTranslate = fbUncached;
+        fallbackUsed = {
+          providerId: fbSettings.providerId,
+          label: PROVIDER_PRESETS[fbSettings.providerId]?.label || fbSettings.providerId,
+          model: fbSettings.model
+        };
+      }
+
       const toPersist = [];
-      for (const item of uncached) {
+      for (const item of itemsToTranslate) {
         const zh = translatedMap[item.key];
         if (zh) {
           results[item.key] = { zh, cached: false };
@@ -1618,11 +1768,12 @@ async function handleTranslateBatch(items, pageContext = null) {
       if (toPersist.length > 0) {
         await CacheDB.putMany(toPersist);
       }
-      finishBatchEvent(bid, { stage: 'done', translated: toPersist.length });
+      finishBatchEvent(bid, { stage: 'done', translated: toPersist.length, fallback: fallbackUsed?.providerId || '' });
     } catch (err) {
-      finishBatchEvent(bid, { stage: 'error', error: redactApiKey(err?.message || String(err), settings.apiKey) });
+      finishBatchEvent(bid, { stage: 'error', error: redactAllKeys(err?.message || String(err), settings, activeSettings) });
       throw err;
     }
+    return fallbackUsed ? { ok: true, results, fallbackUsed } : { ok: true, results };
   } else {
     finishBatchEvent(bid, { stage: 'done_cached', translated: 0 });
   }
@@ -1648,19 +1799,29 @@ async function handleTranslateSingle(text, mode = 'selection', pageContext = nul
     ? `You are a Notebook & Python teaching assistant. The user provided code cell output (Hints, check() feedback, or a Python traceback). Translate it accurately into ${lang.promptName}, keeping code/variable names intact; if it is an error, add one concise sentence explaining the likely cause.${topicHint} ${langGuide}`
     : `You are an expert web and technical translator. Translate the selected text accurately into ${lang.promptName}, preserving technical identifiers naturally. Output only the concise translation.${topicHint} ${langGuide}`;
 
-  const zh = await callLLMChat(
-    settings,
-    [
-      {
-        role: 'system',
-        content: systemContent
-      },
-      { role: 'user', content: String(text || '') }
-    ],
-    false
-  );
+  const messages = [
+    { role: 'system', content: systemContent },
+    { role: 'user', content: String(text || '') }
+  ];
 
-  return { ok: true, zh: String(zh || '').trim() };
+  let zh;
+  let fallbackUsed = null;
+  try {
+    zh = await callLLMChat(settings, messages, false);
+  } catch (err) {
+    const fbSettings = isFallbackEligibleError(err) ? resolveFallbackSettings(settings) : null;
+    if (!fbSettings) throw err;
+    zh = await callLLMChat(fbSettings, messages, false);
+    fallbackUsed = {
+      providerId: fbSettings.providerId,
+      label: PROVIDER_PRESETS[fbSettings.providerId]?.label || fbSettings.providerId,
+      model: fbSettings.model
+    };
+  }
+
+  return fallbackUsed
+    ? { ok: true, zh: String(zh || '').trim(), fallbackUsed }
+    : { ok: true, zh: String(zh || '').trim() };
 }
 
 const MODEL_LIST_CACHE_KEY = 'nr_model_list_v1';
@@ -1710,7 +1871,8 @@ async function handleListModels(settingsOverride) {
     };
   }
 
-  if (!cleanKey && !isLocalEndpoint(merged.baseUrl)) {
+  const allowEmptyPublicKey = Boolean(PROVIDER_PRESETS?.[merged.providerId]?.publicModelList);
+  if (!cleanKey && !allowEmptyPublicKey && !isLocalEndpoint(merged.baseUrl)) {
     return {
       ok: false,
       errorCode: 'MISSING_API_KEY',
@@ -2305,7 +2467,7 @@ async function tryImportNrSyncFromUrl(urlStr) {
     const preset = providerId ? PROVIDER_PRESETS[providerId] : null;
 
     const rawProtocol = String(data.protocol || data.r || '').trim();
-    if (rawProtocol && rawProtocol !== 'openai' && rawProtocol !== 'gemini') return false;
+    if (rawProtocol && rawProtocol !== 'openai' && rawProtocol !== 'gemini' && rawProtocol !== 'anthropic') return false;
 
     const rawBaseUrl = String(data.baseUrl || data.u || '').trim();
     if (rawBaseUrl) {
@@ -2331,7 +2493,11 @@ async function tryImportNrSyncFromUrl(urlStr) {
 
     const patch = {};
     if (hasExplicitKey) {
-      patch.apiKey = sanitizeApiKey(rawKey);
+      const keyCheck = typeof KCTConfig?.validateApiKey === 'function'
+        ? KCTConfig.validateApiKey(rawKey)
+        : { ok: true, cleanKey: sanitizeApiKey(rawKey) };
+      if (!keyCheck.ok) return false;
+      patch.apiKey = keyCheck.cleanKey;
       if (providerId) patch.providerId = providerId;
       const protocol = rawProtocol || preset?.protocol || '';
       if (protocol === 'openai' || protocol === 'gemini' || protocol === 'anthropic') {
@@ -2508,6 +2674,7 @@ chrome.runtime.onConnect.addListener((port) => {
       const toPersist = [];
       let translatedCount = 0;
       let settings = null;
+      let activeFbSettings = null;
 
       try {
         settings = await getSettings();
@@ -2588,64 +2755,129 @@ chrome.runtime.onConnect.addListener((port) => {
           });
         };
 
-        if (settings.streamTranslation !== false) {
-          try {
-            await streamTranslateItems(
-              settings,
-              uncached,
+        const sendHeartbeat = (stage, detail = null) => {
+          safePost({
+            type: 'HEARTBEAT',
+            requestId,
+            stage,
+            ...(detail && typeof detail === 'object' ? detail : {})
+          });
+        };
+
+        const runWithProvider = async (activeSettings, activeUncached) => {
+          if (activeSettings.streamTranslation !== false) {
+            try {
+              await streamTranslateItems(
+                activeSettings,
+                activeUncached,
+                pageContext,
+                (idx, text) => {
+                  const target = activeUncached[idx];
+                  if (target) {
+                    emitItem(target, text);
+                  }
+                },
+                controller.signal,
+                sendHeartbeat
+              );
+            } catch (streamErr) {
+              if (portDisconnected || controller.signal.aborted || streamErr?.isExternalAbort) {
+                throw streamErr;
+              }
+              const isFatal =
+                streamErr?.httpStatus >= 500 ||
+                streamErr?.httpStatus === 529 ||
+                streamErr?.httpStatus === 401 ||
+                streamErr?.httpStatus === 402 ||
+                streamErr?.httpStatus === 403 ||
+                streamErr?.httpStatus === 404 ||
+                streamErr?.httpStatus === 422 ||
+                streamErr?.httpStatus === 429 ||
+                streamErr?.noSplit === true;
+              if (isFatal) {
+                throw streamErr;
+              }
+              console.warn('[KCT] SSE stream failed, falling back to batch JSON:', streamErr?.message);
+            }
+          }
+
+          const remaining = activeUncached.filter((it) => !emittedKeys.has(it.key));
+          if (remaining.length > 0 && !portDisconnected && !controller.signal.aborted) {
+            sendHeartbeat('fallback_batch', { remaining: remaining.length });
+            recordBatchEvent(bid, { stage: 'fallback_batch', remaining: remaining.length });
+            const fallbackMap = await translateItemsWithFallback(
+              activeSettings,
+              remaining,
               pageContext,
-              (idx, text) => {
-                const target = uncached[idx];
-                if (target) {
-                  emitItem(target, text);
-                }
-              },
               controller.signal
             );
-          } catch (streamErr) {
-            if (portDisconnected || controller.signal.aborted || streamErr?.isExternalAbort) {
-              finishBatchEvent(bid, { stage: 'aborted' });
-              return;
+            for (const item of remaining) {
+              const zh = fallbackMap[item.key];
+              if (zh) {
+                emitItem(item, zh, { allowEcho: true });
+              }
             }
-            const isFatal =
-              streamErr?.httpStatus >= 500 ||
-              streamErr?.httpStatus === 401 ||
-              streamErr?.httpStatus === 402 ||
-              streamErr?.httpStatus === 403 ||
-              streamErr?.httpStatus === 404 ||
-              streamErr?.httpStatus === 422 ||
-              streamErr?.httpStatus === 429 ||
-              streamErr?.noSplit === true;
-            if (isFatal) {
-              throw streamErr;
-            }
-            console.warn('[KCT] SSE stream failed, falling back to batch JSON:', streamErr?.message);
           }
-        }
+        };
 
-        // Fallback for any missed items (or when streamTranslation is disabled)
-        const remaining = uncached.filter((it) => !emittedKeys.has(it.key));
-        if (remaining.length > 0 && !portDisconnected && !controller.signal.aborted) {
-          recordBatchEvent(bid, { stage: 'fallback_batch', remaining: remaining.length });
-          const fallbackMap = await translateItemsWithFallback(
-            settings,
-            remaining,
-            pageContext,
-            controller.signal
-          );
-          for (const item of remaining) {
-            const zh = fallbackMap[item.key];
-            if (zh) {
-              emitItem(item, zh, { allowEcho: true });
+        let fallbackUsed = null;
+        try {
+          await runWithProvider(settings, uncached);
+        } catch (primaryErr) {
+          if (portDisconnected || controller.signal.aborted || primaryErr?.isExternalAbort) {
+            finishBatchEvent(bid, { stage: 'aborted' });
+            return;
+          }
+          const fbSettings = isFallbackEligibleError(primaryErr) ? resolveFallbackSettings(settings) : null;
+          if (!fbSettings) {
+            throw primaryErr;
+          }
+          activeFbSettings = fbSettings;
+          sendHeartbeat('fallback_provider', { provider: fbSettings.providerId, model: fbSettings.model });
+          recordBatchEvent(bid, { stage: 'fallback_provider', provider: fbSettings.providerId, model: fbSettings.model });
+
+          const fbSig = buildCacheSignature(fbSettings, pageContext);
+          const remaining = uncached.filter((it) => !emittedKeys.has(it.key));
+          const fbKeys = remaining.map((it) => `${fbSig}::${it.key}`);
+          const fbCachedMap = fbKeys.length > 0 ? await CacheDB.getMany(fbKeys) : new Map();
+          const fbUncached = [];
+          for (const it of remaining) {
+            const fbCacheKey = `${fbSig}::${it.key}`;
+            const fbHit = fbCachedMap.get(fbCacheKey);
+            if (typeof fbHit === 'string' && fbHit.trim() && !isUntranslatedEcho(it.text, fbHit, lang.id)) {
+              emittedKeys.add(it.key);
+              translatedCount += 1;
+              safePost({
+                type: 'ITEM',
+                requestId,
+                key: it.key,
+                zh: fbHit,
+                cached: true
+              });
+            } else {
+              fbUncached.push({ ...it, cacheKey: fbCacheKey });
             }
           }
+          if (fbUncached.length > 0 && !portDisconnected && !controller.signal.aborted) {
+            await runWithProvider(fbSettings, fbUncached);
+          }
+          fallbackUsed = {
+            providerId: fbSettings.providerId,
+            label: PROVIDER_PRESETS[fbSettings.providerId]?.label || fbSettings.providerId,
+            model: fbSettings.model
+          };
         }
 
         if (toPersist.length > 0) {
           await CacheDB.putMany(toPersist);
         }
-        finishBatchEvent(bid, { stage: 'done', translated: toPersist.length });
-        safePost({ type: 'DONE', requestId, translatedCount });
+        finishBatchEvent(bid, { stage: 'done', translated: toPersist.length, fallback: fallbackUsed?.providerId || '' });
+        safePost({
+          type: 'DONE',
+          requestId,
+          translatedCount,
+          ...(fallbackUsed ? { fallbackUsed } : {})
+        });
       } catch (err) {
         if (toPersist.length > 0) {
           CacheDB.putMany(toPersist).catch(() => {});
@@ -2654,7 +2886,7 @@ chrome.runtime.onConnect.addListener((port) => {
           finishBatchEvent(bid, { stage: 'aborted' });
           return;
         }
-        const safeErrMsg = redactApiKey(err?.message || String(err), settings?.apiKey);
+        const safeErrMsg = redactAllKeys(err?.message || String(err), settings, activeFbSettings);
         finishBatchEvent(bid, { stage: 'error', error: safeErrMsg });
         safePost({
           type: 'ERROR',
@@ -3563,214 +3795,257 @@ async function callVisionImageLLM(settings, systemPrompt, userPrompt, mimeType, 
     throw makeVisionError('API 地址無效，請檢查設定中的 Base URL', 'INVALID_ENDPOINT');
   }
 
+  const pacingKey = getProviderPacingKey(settings);
   const cleanKey = sanitizeApiKey(settings.apiKey);
   // Locating text boxes and translating in one multimodal call is too hard at MINIMAL thinking (boxes get
   // dropped or swapped between cards), so on-demand image translation uses at least the 'balanced' level.
   const visionEffort = settings.thinkingEffort === 'deep' ? 'deep' : 'balanced';
   const thinkingConfig = resolveThinkingConfig(settings.model, visionEffort);
+  const maxAttempts = 3;
+  let lastVisionErr = null;
 
-  await acquireRequestSlot();
-  const controller = new AbortController();
-  let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, 60000);
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    let sleepAfterAttemptMs = 0;
+    await acquireRequestSlot(null, pacingKey);
+    const controller = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, 60000);
 
-  try {
-    let resp;
-    let preReadErrText = null;
+    try {
+      let resp;
+      let preReadErrText = null;
 
-    if (settings.protocol === 'gemini') {
-      const normModel = normalizeGeminiModelId(settings.model);
-      const isGemini3Or4 = /^gemini-(?:3|4)(?:[.\-]|$)/.test(normModel);
-      const generationConfig = {
-        responseMimeType: 'application/json'
-      };
-      if (!isGemini3Or4) {
-        generationConfig.temperature = 0.15;
-      }
-      if (thinkingConfig) {
-        generationConfig.thinkingConfig = thinkingConfig;
-      }
-      const headers = { 'Content-Type': 'application/json' };
-      if (cleanKey) headers['x-goog-api-key'] = cleanKey;
-      resp = await fetch(endpoint, {
-        method: 'POST',
-        headers,
-        signal: controller.signal,
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: systemPrompt }] },
-          contents: [
+      if (settings.protocol === 'gemini') {
+        const normModel = normalizeGeminiModelId(settings.model);
+        const isGemini3Or4 = /^gemini-(?:3|4)(?:[.\-]|$)/.test(normModel);
+        const generationConfig = {
+          responseMimeType: 'application/json'
+        };
+        if (!isGemini3Or4) {
+          generationConfig.temperature = 0.15;
+        }
+        if (thinkingConfig) {
+          generationConfig.thinkingConfig = thinkingConfig;
+        }
+        const headers = buildProviderAuthHeaders(settings, cleanKey);
+        resp = await fetch(endpoint, {
+          method: 'POST',
+          headers,
+          signal: controller.signal,
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: systemPrompt }] },
+            contents: [
+              {
+                role: 'user',
+                parts: [
+                  { text: userPrompt },
+                  { inlineData: { mimeType, data: base64Data } }
+                ]
+              }
+            ],
+            generationConfig
+          })
+        });
+      } else if (settings.protocol === 'anthropic') {
+        const headers = buildProviderAuthHeaders(settings, cleanKey);
+        const bodyObj = buildAnthropicMessagesBody(
+          { ...settings, thinkingEffort: visionEffort },
+          [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt }
+          ],
+          { stream: false, maxTokens: 16000, image: { mimeType, base64: base64Data } }
+        );
+        resp = await fetch(endpoint, {
+          method: 'POST',
+          headers,
+          signal: controller.signal,
+          body: JSON.stringify(bodyObj)
+        });
+      } else {
+        const model = String(settings.model || '').trim();
+        const effort = settings.thinkingEffort || 'fastest';
+        const isOpenAIReasoning = /^o[134](?:-|$)/i.test(model);
+        const isDeepSeekReasoner = /deepseek-reasoner|^r1\b/i.test(model);
+
+        const headers = buildProviderAuthHeaders(settings, cleanKey);
+        const bodyObj = {
+          model,
+          messages: [
+            { role: 'system', content: systemPrompt },
             {
               role: 'user',
-              parts: [
-                { text: userPrompt },
-                { inlineData: { mimeType, data: base64Data } }
+              content: [
+                { type: 'text', text: userPrompt },
+                { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64Data}` } }
               ]
             }
           ],
-          generationConfig
-        })
-      });
-    } else if (settings.protocol === 'anthropic') {
-      const headers = buildProviderAuthHeaders(settings, cleanKey);
-      const bodyObj = buildAnthropicMessagesBody(
-        { ...settings, thinkingEffort: visionEffort },
-        [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt }
-        ],
-        { stream: false, maxTokens: 16000, image: { mimeType, base64: base64Data } }
-      );
-      resp = await fetch(endpoint, {
-        method: 'POST',
-        headers,
-        signal: controller.signal,
-        body: JSON.stringify(bodyObj)
-      });
-    } else {
-      const model = String(settings.model || '').trim();
-      const effort = settings.thinkingEffort || 'fastest';
-      const isOpenAIReasoning = /^o[134](?:-|$)/i.test(model);
-      const isDeepSeekReasoner = /deepseek-reasoner|^r1\b/i.test(model);
-
-      const headers = buildProviderAuthHeaders(settings, cleanKey);
-      const bodyObj = {
-        model,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: userPrompt },
-              { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64Data}` } }
-            ]
+          response_format: { type: 'json_object' }
+        };
+        if (!isOpenAIReasoning && !isDeepSeekReasoner) {
+          bodyObj.temperature = 0.15;
+        }
+        if (effort === 'fastest') {
+          if (isOpenAIReasoning && /api\.openai\.com/i.test(endpoint)) {
+            bodyObj.reasoning_effort = 'low';
+          } else if (/^qwen3/i.test(model) && /dashscope\.aliyuncs\.com/i.test(endpoint)) {
+            bodyObj.enable_thinking = false;
           }
-        ],
-        response_format: { type: 'json_object' }
-      };
-      if (!isOpenAIReasoning && !isDeepSeekReasoner) {
-        bodyObj.temperature = 0.15;
-      }
-      if (effort === 'fastest') {
-        if (isOpenAIReasoning && /api\.openai\.com/i.test(endpoint)) {
-          bodyObj.reasoning_effort = 'low';
-        } else if (/^qwen3/i.test(model) && /dashscope\.aliyuncs\.com/i.test(endpoint)) {
-          bodyObj.enable_thinking = false;
+        }
+
+        resp = await fetch(endpoint, {
+          method: 'POST',
+          headers,
+          signal: controller.signal,
+          body: JSON.stringify(bodyObj)
+        });
+
+        // Pre-inference HTTP 400 optional-param fallback (only when NOT a Vision-unsupported error)
+        if (!resp.ok && resp.status === 400) {
+          const errText = await resp.text();
+          if (
+            !isVisionUnsupportedError(errText, 400) &&
+            /response_format|json_object|reasoning_effort|enable_thinking|temperature/i.test(errText)
+          ) {
+            delete bodyObj.response_format;
+            delete bodyObj.reasoning_effort;
+            delete bodyObj.enable_thinking;
+            if (/temperature/i.test(errText)) delete bodyObj.temperature;
+            resp = await fetch(endpoint, {
+              method: 'POST',
+              headers,
+              signal: controller.signal,
+              body: JSON.stringify(bodyObj)
+            });
+          } else {
+            preReadErrText = errText;
+          }
         }
       }
 
-      resp = await fetch(endpoint, {
-        method: 'POST',
-        headers,
-        signal: controller.signal,
-        body: JSON.stringify(bodyObj)
-      });
+      if (!resp.ok) {
+        const rawErrText = preReadErrText !== null ? preReadErrText : await resp.text();
+        const safeRawText = redactAllKeys(rawErrText, settings);
 
-      // Pre-inference HTTP 400 optional-param fallback (only when NOT a Vision-unsupported error)
-      if (!resp.ok && resp.status === 400) {
-        const errText = await resp.text();
-        if (
-          !isVisionUnsupportedError(errText, 400) &&
-          /response_format|json_object|reasoning_effort|enable_thinking|temperature/i.test(errText)
-        ) {
-          delete bodyObj.response_format;
-          delete bodyObj.reasoning_effort;
-          delete bodyObj.enable_thinking;
-          if (/temperature/i.test(errText)) delete bodyObj.temperature;
-          resp = await fetch(endpoint, {
-            method: 'POST',
-            headers,
-            signal: controller.signal,
-            body: JSON.stringify(bodyObj)
-          });
-        } else {
-          preReadErrText = errText;
+        if (resp.status === 429) {
+          const isDailyOrZeroQuota = /PerDay|RequestsPerDay|GenerateRequestsPerDay|"quotaValue"\s*:\s*"0"|limit:\s*0/i.test(safeRawText);
+          const retryDelayMs = parseRetryDelayMs(safeRawText, resp);
+          if (!isDailyOrZeroQuota) {
+            const waitMs = Math.min(26000, retryDelayMs > 0 ? retryDelayMs + 400 : 4500);
+            const now = Date.now();
+            const st = getPacingState(pacingKey);
+            st.adaptivePacingUntil = Math.max(st.adaptivePacingUntil, now + 90000);
+            st.globalCooldownUntil = Math.max(st.globalCooldownUntil, now + waitMs);
+            if (attempt < maxAttempts && retryDelayMs <= 20000) {
+              continue;
+            }
+          }
+          const waitSec = retryDelayMs > 0 ? Math.ceil(retryDelayMs / 1000) : null;
+          const msg = isDailyOrZeroQuota
+            ? 'HTTP 429：已達每日免費額度上限（或模型配額為 0）'
+            : waitSec
+              ? `HTTP 429：請求頻率達上限，請等待約 ${waitSec}s 後再試`
+              : `HTTP 429：請求頻率達上限 (${safeRawText.slice(0, 160) || resp.statusText})`;
+          throw makeVisionError(msg, isDailyOrZeroQuota ? 'QUOTA_EXCEEDED' : 'RATE_LIMIT', 429);
         }
-      }
-    }
 
-    if (!resp.ok) {
-      const rawErrText = preReadErrText !== null ? preReadErrText : await resp.text();
-      const safeRawText = redactApiKey(rawErrText, settings.apiKey);
-
-      if (resp.status === 429) {
-        const isDailyOrZeroQuota = /PerDay|RequestsPerDay|GenerateRequestsPerDay|"quotaValue"\s*:\s*"0"|limit:\s*0/i.test(safeRawText);
-        const retryDelayMs = parseRetryDelayMs(safeRawText, resp);
-        if (!isDailyOrZeroQuota) {
-          const waitMs = Math.min(26000, retryDelayMs > 0 ? retryDelayMs + 400 : 4500);
-          const now = Date.now();
-          adaptivePacingUntil = Math.max(adaptivePacingUntil, now + 90000);
-          globalCooldownUntil = Math.max(globalCooldownUntil, now + waitMs);
+        if (isVisionUnsupportedError(safeRawText, resp.status)) {
+          throw makeVisionError(
+            '目前模型不支援圖片視覺翻譯，請於設定頁改用多模態模型（如 Gemini / GPT-4o）。',
+            'VISION_UNSUPPORTED',
+            resp.status
+          );
         }
-        const waitSec = retryDelayMs > 0 ? Math.ceil(retryDelayMs / 1000) : null;
-        const msg = isDailyOrZeroQuota
-          ? 'HTTP 429：已達每日免費額度上限（或模型配額為 0）'
-          : waitSec
-            ? `HTTP 429：請求頻率達上限，請等待約 ${waitSec}s 後再試`
-            : `HTTP 429：請求頻率達上限 (${safeRawText.slice(0, 160) || resp.statusText})`;
-        throw makeVisionError(msg, isDailyOrZeroQuota ? 'QUOTA_EXCEEDED' : 'RATE_LIMIT', 429);
-      }
 
-      if (isVisionUnsupportedError(safeRawText, resp.status)) {
+        if ((resp.status >= 500 || resp.status === 529) && attempt < maxAttempts) {
+          sleepAfterAttemptMs = computeOverloadBackoffMs(resp.status, attempt, safeRawText, resp, pacingKey);
+          lastVisionErr = makeVisionError(
+            `Vision API 錯誤 (${resp.status}): ${safeRawText.slice(0, 240)}`,
+            resp.status === 503 || resp.status === 529 ? 'OVERLOADED' : `HTTP_${resp.status}`,
+            resp.status
+          );
+          continue;
+        }
+
         throw makeVisionError(
-          '目前模型不支援圖片視覺翻譯，請於設定頁改用多模態模型（如 Gemini / GPT-4o）。',
-          'VISION_UNSUPPORTED',
+          `Vision API 錯誤 (${resp.status}): ${safeRawText.slice(0, 240)}`,
+          resp.status === 503 || resp.status === 529 ? 'OVERLOADED' : `HTTP_${resp.status}`,
           resp.status
         );
       }
 
-      throw makeVisionError(
-        `Vision API 錯誤 (${resp.status}): ${safeRawText.slice(0, 240)}`,
-        `HTTP_${resp.status}`,
-        resp.status
-      );
-    }
+      const rawText = await resp.text();
+      let data;
+      try {
+        data = JSON.parse(rawText);
+      } catch (_) {
+        throw makeVisionError('Vision API 回應非有效 JSON', 'PARSE_FAILED');
+      }
 
-    const rawText = await resp.text();
-    let data;
-    try {
-      data = JSON.parse(rawText);
-    } catch (_) {
-      throw makeVisionError('Vision API 回應非有效 JSON', 'PARSE_FAILED');
-    }
+      if (data?.error?.message) {
+        throw makeVisionError(redactAllKeys(data.error.message, settings), 'API_ERROR');
+      }
 
-    if (data?.error?.message) {
-      throw makeVisionError(redactApiKey(data.error.message, settings.apiKey), 'API_ERROR');
-    }
+      let outText = '';
+      if (settings.protocol === 'gemini') {
+        const candidate = data?.candidates?.[0];
+        const parts = candidate?.content?.parts || [];
+        const answerParts = parts.filter((p) => !p.thought && typeof p.text === 'string');
+        outText = (answerParts.length ? answerParts : parts)
+          .map((p) => (typeof p.text === 'string' ? p.text : ''))
+          .join('\n')
+          .trim();
+      } else if (settings.protocol === 'anthropic') {
+        outText = String(extractAnthropicText(data) || '').trim();
+      } else {
+        outText = String(data?.choices?.[0]?.message?.content || '').trim();
+      }
 
-    let outText = '';
-    if (settings.protocol === 'gemini') {
-      const candidate = data?.candidates?.[0];
-      const parts = candidate?.content?.parts || [];
-      const answerParts = parts.filter((p) => !p.thought && typeof p.text === 'string');
-      outText = (answerParts.length ? answerParts : parts)
-        .map((p) => (typeof p.text === 'string' ? p.text : ''))
-        .join('\n')
-        .trim();
-    } else if (settings.protocol === 'anthropic') {
-      outText = String(extractAnthropicText(data) || '').trim();
-    } else {
-      outText = String(data?.choices?.[0]?.message?.content || '').trim();
+      if (!outText) {
+        throw makeVisionError('模型未返回有效的圖片翻譯內容', 'PARSE_FAILED');
+      }
+      return outText;
+    } catch (err) {
+      if (err?.name === 'AbortError' || timedOut) {
+        lastVisionErr = makeVisionError('圖片視覺翻譯逾時 (60s)，請檢查網路或稍後重試', 'TIMEOUT');
+        if (attempt < maxAttempts) {
+          sleepAfterAttemptMs = 1000 * attempt;
+          continue;
+        }
+        throw lastVisionErr;
+      }
+      if (err?.errorCode === 'INVALID_API_KEY_CHARS' || err?.errorCode === 'VISION_UNSUPPORTED' || err?.errorCode === 'PARSE_FAILED' || err?.errorCode === 'API_ERROR' || err?.httpStatus === 401 || err?.httpStatus === 403 || err?.httpStatus === 404) {
+        if (err?.message) err.message = redactAllKeys(err.message, settings);
+        throw err;
+      }
+      const isNet = err?.name === 'TypeError' || /network|failed to fetch|load failed|networkerror|fetch/i.test(String(err?.message || ''));
+      if (isNet) {
+        const netErr = makeVisionError(redactAllKeys(err?.message || '網路連線失敗', settings), 'NETWORK_ERROR');
+        lastVisionErr = netErr;
+        if (attempt < maxAttempts) {
+          sleepAfterAttemptMs = 1000 * attempt;
+          continue;
+        }
+        throw netErr;
+      }
+      if (err?.message) {
+        err.message = redactAllKeys(err.message, settings);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+      releaseRequestSlot(pacingKey);
+      if (sleepAfterAttemptMs > 0) {
+        await sleep(sleepAfterAttemptMs);
+      }
     }
-
-    if (!outText) {
-      throw makeVisionError('模型未返回有效的圖片翻譯內容', 'PARSE_FAILED');
-    }
-    return outText;
-  } catch (err) {
-    if (err?.name === 'AbortError' || timedOut) {
-      throw makeVisionError('圖片視覺翻譯逾時 (60s)，請檢查網路或稍後重試', 'TIMEOUT');
-    }
-    if (err?.message) {
-      err.message = redactApiKey(err.message, settings.apiKey);
-    }
-    throw err;
-  } finally {
-    clearTimeout(timer);
-    releaseRequestSlot();
   }
+
+  throw lastVisionErr || makeVisionError('圖片視覺翻譯失敗', 'VISION_ERROR');
 }
 
 function extractCachedVisionBlocks(cachedRaw) {
@@ -3874,19 +4149,48 @@ async function handleTranslateImage(message) {
   });
 
   let rawContent;
+  let fbVisionSettings = null;
+  let fallbackUsed = null;
   try {
-    rawContent = await callVisionImageLLM(
-      effectiveSettings,
-      prompts.systemPrompt,
-      prompts.userPrompt,
-      prepared.mimeType,
-      prepared.base64
-    );
+    try {
+      rawContent = await callVisionImageLLM(
+        effectiveSettings,
+        prompts.systemPrompt,
+        prompts.userPrompt,
+        prepared.mimeType,
+        prepared.base64
+      );
+    } catch (primaryErr) {
+      const fbBase = isFallbackEligibleError(primaryErr) ? resolveFallbackSettings(effectiveSettings) : null;
+      if (!fbBase) throw primaryErr;
+      fbVisionSettings = {
+        ...fbBase,
+        targetLang: effectiveSettings.targetLang,
+        customTargetLang: effectiveSettings.customTargetLang,
+        thinkingEffort: effectiveSettings.thinkingEffort
+      };
+      const fbPrompts = buildVisionImagePrompts(fbVisionSettings, pageContext, {
+        width: reqWidth,
+        height: reqHeight
+      });
+      rawContent = await callVisionImageLLM(
+        fbVisionSettings,
+        fbPrompts.systemPrompt,
+        fbPrompts.userPrompt,
+        prepared.mimeType,
+        prepared.base64
+      );
+      fallbackUsed = {
+        providerId: fbVisionSettings.providerId,
+        label: PROVIDER_PRESETS[fbVisionSettings.providerId]?.label || fbVisionSettings.providerId,
+        model: fbVisionSettings.model
+      };
+    }
   } catch (err) {
     return {
       ok: false,
       errorCode: err?.errorCode || (err?.httpStatus ? `HTTP_${err.httpStatus}` : 'VISION_ERROR'),
-      error: redactApiKey(err?.message || '圖片視覺翻譯失敗', effectiveSettings.apiKey)
+      error: redactAllKeys(err?.message || '圖片視覺翻譯失敗', effectiveSettings, fbVisionSettings)
     };
   }
 
@@ -3897,7 +4201,7 @@ async function handleTranslateImage(message) {
     return {
       ok: false,
       errorCode: 'PARSE_FAILED',
-      error: redactApiKey(err?.message || '無法解析圖片翻譯結果，請重試', effectiveSettings.apiKey)
+      error: redactAllKeys(err?.message || '無法解析圖片翻譯結果，請重試', effectiveSettings, fbVisionSettings)
     };
   }
 
@@ -3927,7 +4231,9 @@ async function handleTranslateImage(message) {
     } catch (_) {}
   }
 
-  return { ok: true, cached: false, blocks: enriched };
+  return fallbackUsed
+    ? { ok: true, cached: false, blocks: enriched, fallbackUsed }
+    : { ok: true, cached: false, blocks: enriched };
 }
 
 // ============================================================
@@ -4078,9 +4384,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       let safeErr = err?.message || '未知錯誤';
       try {
         const currentSettings = await getSettings();
-        if (currentSettings?.apiKey) {
-          safeErr = redactApiKey(safeErr, currentSettings.apiKey);
-        }
+        safeErr = redactAllKeys(safeErr, currentSettings);
       } catch (_) {}
       sendResponse({
         ok: false,

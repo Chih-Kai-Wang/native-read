@@ -65,6 +65,7 @@ export const PROVIDER_PRESETS = {
       "google/gemini-2.5-flash"
     ],
     "placeholderKey": "sk-or-...",
+    "publicModelList": true,
     "hint": "聚合數百個模型，模型清單不需金鑰即可查詢。"
   },
   "groq": {
@@ -142,6 +143,7 @@ export const PROVIDER_PRESETS = {
     "defaultModel": "",
     "suggestedModels": [],
     "placeholderKey": "...",
+    "publicModelList": true,
     "hint": "開源模型託管；模型清單不需金鑰即可查詢。"
   },
   "huggingface": {
@@ -153,6 +155,7 @@ export const PROVIDER_PRESETS = {
     "defaultModel": "",
     "suggestedModels": [],
     "placeholderKey": "hf_...",
+    "publicModelList": true,
     "hint": "使用 Hugging Face Token；模型清單不需金鑰即可查詢。"
   },
   "novita": {
@@ -164,6 +167,7 @@ export const PROVIDER_PRESETS = {
     "defaultModel": "",
     "suggestedModels": [],
     "placeholderKey": "...",
+    "publicModelList": true,
     "hint": "開源模型託管；模型清單不需金鑰即可查詢。"
   },
   "deepseek": {

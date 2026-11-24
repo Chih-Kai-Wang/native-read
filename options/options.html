@@ -83,6 +83,11 @@
         <p id="provider-hint" class="hint"></p>
       </div>
 
+      <div id="saved-providers-wrap" class="field">
+        <label>已設定供應商（點擊快速切換，各供應商 API Key 與模型獨立保存）</label>
+        <div id="saved-providers-list" class="provider-chips"></div>
+      </div>
+
       <div class="grid-2">
         <div class="field">
           <label for="protocol-select">介面協定</label>
@@ -120,6 +125,12 @@
         <button id="btn-test" type="button" class="btn secondary">測試連線</button>
       </div>
       <div id="test-result" class="test-box hidden" hidden></div>
+
+      <div class="field fallback-field">
+        <label for="fallback-provider-select">高負載自動備援供應商（503 / 過載時選用）</label>
+        <select id="fallback-provider-select"></select>
+        <p class="hint">僅當主供應商經退避重試仍發生 503／過載／連線逾時時自動切換（不涵蓋 401/403 金鑰錯誤），預設停用。</p>
+      </div>
     </section>
 
     <details class="panel details-panel">
@@ -243,6 +254,7 @@
   </main>
 
   <script src="../shared/config.js"></script>
+  <script src="../shared/cache-db.js"></script>
   <script src="options.js"></script>
 </body>
 </html>

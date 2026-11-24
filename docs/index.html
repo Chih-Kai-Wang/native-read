@@ -28,7 +28,7 @@
       <img src="./icons/icon-48.png" alt="NativeRead" width="28" height="28" class="nr-brand-logo">
       <div class="nr-brand-titles">
         <span class="nr-brand-title">NativeRead</span>
-        <span class="nr-brand-tag">v2.6.1 Mobile &amp; PWA</span>
+        <span class="nr-brand-tag">v2.8.0 Mobile &amp; PWA</span>
       </div>
     </div>
 
@@ -37,6 +37,7 @@
         <span class="nr-status-dot"></span>
         <span id="globalStatusText" class="nr-status-label">就緒</span>
       </div>
+      <select id="globalProviderSelect" class="nr-header-select nr-header-provider" aria-label="快速切換 AI 供應商" title="快速切換 AI 供應商"></select>
       <select id="globalLangSelect" class="nr-header-select" aria-label="目標翻譯語言"></select>
     </div>
   </header>
@@ -265,6 +266,11 @@
           </div>
 
           <div class="nr-field">
+            <label class="nr-label">已設定供應商（點擊切換，金鑰獨立保存）</label>
+            <div id="savedProvidersRow" class="nr-chip-row nr-provider-chip-row"></div>
+          </div>
+
+          <div class="nr-field">
             <label for="setApiKey" class="nr-label">API Key 金鑰</label>
             <div class="nr-input-row">
               <input id="setApiKey" type="password" class="nr-text-input" placeholder="填入 API Key..." autocomplete="off">
@@ -274,15 +280,29 @@
 
           <div class="nr-field-grid">
             <div class="nr-field">
-              <label for="setModel" class="nr-label">模型名稱 (Model ID)</label>
-              <input id="setModel" type="text" class="nr-text-input" placeholder="例如 gemini-3.5-flash-lite 或 deepseek-chat">
-              <div id="modelChipsRow" class="nr-chip-row"></div>
+              <label for="setProtocol" class="nr-label">API 協定 (Protocol)</label>
+              <select id="setProtocol" class="nr-select-full">
+                <option value="openai">OpenAI 相容 (/v1/chat/completions)</option>
+                <option value="gemini">Google Gemini 原生</option>
+                <option value="anthropic">Anthropic Messages API</option>
+              </select>
             </div>
 
             <div class="nr-field">
               <label for="setBaseUrl" class="nr-label">API Base URL</label>
               <input id="setBaseUrl" type="url" class="nr-text-input" placeholder="https://...">
             </div>
+          </div>
+
+          <div class="nr-field">
+            <label for="setModel" class="nr-label">模型名稱 (Model ID)</label>
+            <div class="nr-input-row">
+              <input id="setModel" type="text" list="modelSuggestions" class="nr-text-input" placeholder="例如 gemini-3.5-flash-lite 或 deepseek-chat">
+              <button id="fetchModelsBtn" type="button" class="nr-secondary-btn">取得清單</button>
+            </div>
+            <datalist id="modelSuggestions"></datalist>
+            <p id="modelListHint" class="nr-field-hint" hidden></p>
+            <div id="modelChipsRow" class="nr-chip-row"></div>
           </div>
 
           <div class="nr-field-grid">
@@ -313,6 +333,12 @@
                 <option value="preserve">保留網站原始 CSS 字型</option>
               </select>
             </div>
+          </div>
+
+          <div class="nr-field">
+            <label for="setFallbackProvider" class="nr-label">高負載自動備援供應商（503 / 過載時選用）</label>
+            <select id="setFallbackProvider" class="nr-select-full"></select>
+            <p class="nr-field-hint">僅當主供應商經退避重試仍發生 503／過載／連線逾時時自動切換（不涵蓋 401/403 金鑰錯誤），預設停用。</p>
           </div>
 
           <div class="nr-field">

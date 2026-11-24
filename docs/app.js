@@ -135,7 +135,7 @@ const DEFAULT_GLOSSARY = [
 ].join('\n');
 
 const DEFAULT_SETTINGS = {
-  settingsSchemaVersion: 5,
+  settingsSchemaVersion: 6,
   targetLang: 'zh-TW',
   customTargetLang: '',
   thinkingEffort: 'fastest',
@@ -145,6 +145,8 @@ const DEFAULT_SETTINGS = {
   baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
   apiKey: '',
   model: 'gemini-3.5-flash-lite',
+  providerProfiles: {},
+  fallbackProviderId: '',
   temperature: 0.2,
   batchSize: 18,
   maxBatchChars: 5000,
@@ -168,9 +170,282 @@ function hashText(str) {
 
 function sanitizeApiKey(rawKey) {
   return String(rawKey || '')
+    .replace(/[\u200B-\u200D\uFEFF\r\n\t]+/g, '')
     .trim()
     .replace(/^Bearer\s+/i, '')
     .trim();
+}
+
+function validateApiKey(rawKey) {
+  const cleanKey = sanitizeApiKey(rawKey);
+  if (!cleanKey) return { ok: true, cleanKey: '', error: '' };
+  if (!/^[\x21-\x7E]+$/.test(cleanKey)) {
+    return {
+      ok: false,
+      cleanKey,
+      error: 'API Key 格式錯誤：包含空白、不可見字元或非 ASCII 字元，請重新複製純金鑰。'
+    };
+  }
+  return { ok: true, cleanKey, error: '' };
+}
+
+function isLocalEndpoint(baseUrl) {
+  return /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d+)?(\/|$)/i.test(
+    String(baseUrl || '').trim()
+  );
+}
+
+function isProfileSaved(providerId, profile) {
+  if (!profile || typeof profile !== 'object') return false;
+  if (sanitizeApiKey(profile.apiKey)) return true;
+  if ((providerId === 'ollama' || isLocalEndpoint(profile.baseUrl)) && String(profile.model || '').trim()) {
+    return true;
+  }
+  if (providerId === 'custom' && String(profile.baseUrl || '').trim() && String(profile.model || '').trim()) {
+    return true;
+  }
+  return false;
+}
+
+function isProfileReady(providerId, profile) {
+  if (!profile || typeof profile !== 'object') return false;
+  const model = String(profile.model || '').trim();
+  const baseUrl = String(profile.baseUrl || '').trim();
+  if (!model || !baseUrl) return false;
+  return Boolean(sanitizeApiKey(profile.apiKey)) || isLocalEndpoint(baseUrl);
+}
+
+function normalizeProviderProfiles(rawProfiles, activeSettings = null) {
+  const out = {};
+  if (rawProfiles && typeof rawProfiles === 'object') {
+    for (const [rawId, prof] of Object.entries(rawProfiles)) {
+      const pid = PROVIDER_PRESETS[rawId] ? rawId : '';
+      if (!pid || !prof || typeof prof !== 'object') continue;
+      const preset = PROVIDER_PRESETS[pid];
+      const clean = {
+        protocol: prof.protocol || preset?.protocol || 'openai',
+        baseUrl: String(prof.baseUrl ?? preset?.baseUrl ?? '').trim(),
+        apiKey: sanitizeApiKey(prof.apiKey),
+        model: String(prof.model ?? preset?.defaultModel ?? '').trim()
+      };
+      if (isProfileSaved(pid, clean)) {
+        out[pid] = clean;
+      }
+    }
+  }
+  if (activeSettings && typeof activeSettings === 'object') {
+    const pid = PROVIDER_PRESETS[activeSettings.providerId] ? activeSettings.providerId : '';
+    if (pid) {
+      const preset = PROVIDER_PRESETS[pid];
+      const activeClean = {
+        protocol: activeSettings.protocol || preset?.protocol || 'openai',
+        baseUrl: String(activeSettings.baseUrl ?? preset?.baseUrl ?? '').trim(),
+        apiKey: sanitizeApiKey(activeSettings.apiKey),
+        model: String(activeSettings.model ?? preset?.defaultModel ?? '').trim()
+      };
+      if (isProfileSaved(pid, activeClean)) {
+        out[pid] = activeClean;
+      }
+    }
+  }
+  return out;
+}
+
+function listSavedProviders(settings) {
+  const activeId = settings?.providerId || 'gemini';
+  const fallbackId = settings?.fallbackProviderId || '';
+  const profiles = normalizeProviderProfiles(settings?.providerProfiles, settings);
+  const presetOrder = Object.keys(PROVIDER_PRESETS);
+  return presetOrder
+    .filter((pid) => Boolean(profiles[pid]))
+    .map((pid) => {
+      const p = profiles[pid];
+      const preset = PROVIDER_PRESETS[pid];
+      const isLocal = isLocalEndpoint(p.baseUrl);
+      return {
+        providerId: pid,
+        label: preset?.label || pid,
+        model: p.model || '',
+        protocol: p.protocol || preset?.protocol || 'openai',
+        baseUrl: p.baseUrl || '',
+        hasKey: Boolean(sanitizeApiKey(p.apiKey)),
+        isLocal,
+        isReady: isProfileReady(pid, p),
+        isActive: pid === activeId,
+        isFallback: pid === fallbackId && pid !== activeId
+      };
+    });
+}
+
+function switchActiveProviderSettings(settings, targetProviderId) {
+  const current = { ...DEFAULT_SETTINGS, ...(settings || {}) };
+  const targetId = PROVIDER_PRESETS[targetProviderId] ? targetProviderId : 'custom';
+  const preset = PROVIDER_PRESETS[targetId] || PROVIDER_PRESETS.custom;
+  const profiles = normalizeProviderProfiles(current.providerProfiles, current);
+
+  const saved = profiles[targetId];
+  const next = {
+    ...current,
+    providerId: targetId,
+    protocol: saved?.protocol || preset?.protocol || 'openai',
+    baseUrl: saved?.baseUrl || preset?.baseUrl || '',
+    apiKey: saved?.apiKey || '',
+    model: saved?.model || preset?.defaultModel || '',
+    providerProfiles: profiles,
+    fallbackProviderId: current.fallbackProviderId === targetId ? '' : (current.fallbackProviderId || '')
+  };
+  return next;
+}
+
+function removeProviderProfile(settings, targetProviderId) {
+  const current = { ...DEFAULT_SETTINGS, ...(settings || {}) };
+  const profiles = normalizeProviderProfiles(current.providerProfiles, current);
+  if (targetProviderId && targetProviderId !== current.providerId) {
+    delete profiles[targetProviderId];
+  }
+  return {
+    ...current,
+    providerProfiles: profiles,
+    fallbackProviderId: current.fallbackProviderId === targetProviderId ? '' : (current.fallbackProviderId || '')
+  };
+}
+
+function resolveFallbackSettings(settings) {
+  if (!settings || typeof settings !== 'object') return null;
+  const fbId = String(settings.fallbackProviderId || '').trim();
+  const activeId = String(settings.providerId || '').trim();
+  if (!fbId || fbId === activeId || !PROVIDER_PRESETS[fbId]) return null;
+  const profiles = normalizeProviderProfiles(settings.providerProfiles, settings);
+  const fb = profiles[fbId];
+  if (!fb || !isProfileReady(fbId, fb)) return null;
+  return {
+    ...settings,
+    providerId: fbId,
+    protocol: fb.protocol,
+    baseUrl: fb.baseUrl,
+    apiKey: fb.apiKey,
+    model: fb.model,
+    fallbackProviderId: ''
+  };
+}
+
+function formatApiError(errOrMsg, httpStatus = 0, errorCode = '') {
+  const raw = typeof errOrMsg === 'string'
+    ? errOrMsg
+    : String(errOrMsg?.message || errOrMsg?.error || '');
+  const trimmed = raw.trim();
+  const code = String(errorCode || errOrMsg?.errorCode || '').trim();
+  const statusMatch = trimmed.match(/\bHTTP(?:_|\s+)(\d{3})\b/i);
+  const status = Number(httpStatus || errOrMsg?.httpStatus || (statusMatch ? statusMatch[1] : 0) || 0);
+  const lower = trimmed.toLowerCase();
+
+  if (code === 'NO_API_KEY') {
+    return {
+      shortMsg: '未填 API Key',
+      detailMsg: trimmed || '請先在設定中填寫 API Key。',
+      rawMsg: trimmed,
+      retryable: false,
+      suggestSwitch: true
+    };
+  }
+  if (code === 'INVALID_API_KEY_CHARS') {
+    return {
+      shortMsg: 'API Key 格式無效',
+      detailMsg: trimmed || 'API Key 包含空白或非 ASCII 字元，請重新貼上純金鑰。',
+      rawMsg: trimmed,
+      retryable: false,
+      suggestSwitch: true
+    };
+  }
+  if (code === 'NO_MODEL') {
+    return {
+      shortMsg: '未指定模型',
+      detailMsg: trimmed || '請先選擇或填寫模型名稱。',
+      rawMsg: trimmed,
+      retryable: false,
+      suggestSwitch: false
+    };
+  }
+  if (status === 401 || status === 403 || code === 'AUTH_ERROR' || (!status && /invalid api key|unauthorized|forbidden|authentication/i.test(lower))) {
+    return {
+      shortMsg: `金鑰驗證失敗 (${status || 401})，請檢查設定`,
+      detailMsg: `API Key 無效或權限不足 (${status || 401})：${trimmed}`,
+      rawMsg: trimmed,
+      retryable: false,
+      suggestSwitch: true
+    };
+  }
+  if (status === 404) {
+    return {
+      shortMsg: '模型或端點不存在 (404)',
+      detailMsg: `找不到指定模型或 API 端點 (404)：${trimmed}`,
+      rawMsg: trimmed,
+      retryable: false,
+      suggestSwitch: true
+    };
+  }
+  if (
+    status === 429 ||
+    code === 'RATE_LIMIT' ||
+    /rate limit|too many requests|quota|resource_exhausted|配額上限|額度已用盡/i.test(lower)
+  ) {
+    return {
+      shortMsg: `請求頻率上限 (${status || 429})，請稍候或切換`,
+      detailMsg: `請求次數或配額達上限 (${status || 429})：${trimmed}`,
+      rawMsg: trimmed,
+      retryable: true,
+      suggestSwitch: true
+    };
+  }
+  if (
+    status === 503 ||
+    status === 529 ||
+    code === 'OVERLOADED' ||
+    /high demand|overloaded|service unavailable|currently unavailable|capacity|try again later/i.test(lower)
+  ) {
+    return {
+      shortMsg: `模型忙碌 (${status || 503})，請重試或切換供應商`,
+      detailMsg: `供應商暫時過載 (${status || 503})：${trimmed}`,
+      rawMsg: trimmed,
+      retryable: true,
+      suggestSwitch: true
+    };
+  }
+  if (status >= 500 || code === 'SERVER_ERROR' || status === 502 || status === 504) {
+    return {
+      shortMsg: `伺服器錯誤 (${status || 500})，可重試或切換`,
+      detailMsg: `供應商端暫時錯誤 (${status || 500})：${trimmed}`,
+      rawMsg: trimmed,
+      retryable: true,
+      suggestSwitch: true
+    };
+  }
+  if (code === 'TIMEOUT' || /timeout|timed out|abort/i.test(lower)) {
+    return {
+      shortMsg: '連線逾時，請重試或切換供應商',
+      detailMsg: trimmed || '模型回應逾時，請重試或改用備援供應商。',
+      rawMsg: trimmed,
+      retryable: true,
+      suggestSwitch: true
+    };
+  }
+  if (code === 'NETWORK_ERROR' || /failed to fetch|networkerror|load failed|cors/i.test(lower)) {
+    return {
+      shortMsg: '連線失敗或 CORS 受限，請檢查或切換',
+      detailMsg: trimmed || '網路連線中斷或跨域受限。',
+      rawMsg: trimmed,
+      retryable: true,
+      suggestSwitch: true
+    };
+  }
+  const cleanShort = trimmed.replace(/^HTTP\s+\d+\s*:\s*/i, '');
+  return {
+    shortMsg: cleanShort.length > 44 ? `${cleanShort.slice(0, 42)}…` : (cleanShort || '翻譯失敗'),
+    detailMsg: trimmed || '翻譯失敗',
+    rawMsg: trimmed,
+    retryable: false,
+    suggestSwitch: false
+  };
 }
 
 function resolveTargetLanguage(settings) {
@@ -190,27 +465,59 @@ function resolveTargetLanguage(settings) {
 }
 
 function normalizeOpenAIEndpoint(baseUrl) {
-  const clean = String(baseUrl || '').trim().replace(/\/+$/, '');
-  if (!clean) return '';
-  if (clean.endsWith('/chat/completions')) return clean;
-  if (/\/(v\d+|openai|compatible-mode\/v1|api\/paas\/v\d+)$/i.test(clean)) {
-    return `${clean}/chat/completions`;
+  const raw = String(baseUrl || '').trim();
+  if (!raw) return '';
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch (_) {
+    const clean = raw.replace(/\/+$/, '');
+    if (clean.endsWith('/chat/completions')) return clean;
+    if (/\/(v\d+|openai|compatible-mode\/v1|api\/paas\/v\d+)$/i.test(clean)) {
+      return `${clean}/chat/completions`;
+    }
+    return `${clean}/v1/chat/completions`;
   }
-  return `${clean}/v1/chat/completions`;
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
+  const cleanPath = parsed.pathname.replace(/\/+$/, '');
+  if (!cleanPath.endsWith('/chat/completions')) {
+    if (/\/(v\d+|openai|compatible-mode\/v1|api\/paas\/v\d+|openai\/deployments\/[^/]+)$/i.test(cleanPath) || (isAzureOpenAIEndpoint(raw) && cleanPath && cleanPath !== '/')) {
+      parsed.pathname = `${cleanPath}/chat/completions`;
+    } else {
+      parsed.pathname = `${cleanPath}/v1/chat/completions`;
+    }
+  } else {
+    parsed.pathname = cleanPath;
+  }
+  return parsed.toString();
 }
 
 function normalizeGeminiEndpoint(baseUrl, model) {
-  const clean = String(baseUrl || 'https://generativelanguage.googleapis.com/v1beta')
-    .trim()
-    .replace(/\/+$/, '');
+  const raw = String(baseUrl || 'https://generativelanguage.googleapis.com/v1beta').trim();
   const m = String(model || 'gemini-3.5-flash-lite').trim().replace(/^models\//, '');
-  if (clean.includes(':generateContent') || clean.includes(':streamGenerateContent')) {
-    return clean;
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch (_) {
+    const clean = raw.replace(/\/+$/, '');
+    if (clean.includes(':generateContent') || clean.includes(':streamGenerateContent')) return clean;
+    if (/\/v1(?:alpha|beta)?$/i.test(clean)) {
+      return `${clean}/models/${encodeURIComponent(m)}:generateContent`;
+    }
+    return `${clean}/v1beta/models/${encodeURIComponent(m)}:generateContent`;
   }
-  if (/\/v1(beta)?$/i.test(clean)) {
-    return `${clean}/models/${encodeURIComponent(m)}:generateContent`;
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
+  const cleanPath = parsed.pathname.replace(/\/+$/, '');
+  if (cleanPath.includes(':generateContent') || cleanPath.includes(':streamGenerateContent')) {
+    parsed.pathname = cleanPath;
+    return parsed.toString();
   }
-  return `${clean}/v1beta/models/${encodeURIComponent(m)}:generateContent`;
+  if (/\/v1(?:alpha|beta)?$/i.test(cleanPath)) {
+    parsed.pathname = `${cleanPath}/models/${encodeURIComponent(m)}:generateContent`;
+  } else {
+    parsed.pathname = `${cleanPath}/v1beta/models/${encodeURIComponent(m)}:generateContent`;
+  }
+  return parsed.toString();
 }
 
 // ---- Provider helpers kept in sync with shared/config.js (Anthropic Messages API + Azure OpenAI) ----
@@ -241,16 +548,91 @@ function normalizeAnthropicEndpoint(baseUrl) {
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
     return '';
   }
-  const clean = parsed.toString().replace(/\/+$/, '');
-  if (clean.endsWith('/v1/messages')) return clean;
-  if (clean.endsWith('/v1')) return `${clean}/messages`;
-  return `${clean}/v1/messages`;
+  const cleanPath = parsed.pathname.replace(/\/+$/, '');
+  if (cleanPath.endsWith('/v1/messages') || cleanPath.endsWith('/messages')) {
+    parsed.pathname = cleanPath;
+  } else if (cleanPath.endsWith('/v1')) {
+    parsed.pathname = `${cleanPath}/messages`;
+  } else {
+    parsed.pathname = `${cleanPath}/v1/messages`;
+  }
+  return parsed.toString();
+}
+
+function buildListModelsUrl(settings) {
+  const protocol = settings?.protocol || 'openai';
+  const raw = String(settings?.baseUrl || '').trim();
+  if (!raw) return '';
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch (_) {
+    return '';
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
+  let cleanPath = parsed.pathname.replace(/\/+$/, '');
+
+  if (protocol === 'gemini') {
+    const actionIdx = cleanPath.indexOf('/models/');
+    if (actionIdx !== -1) cleanPath = cleanPath.slice(0, actionIdx);
+    if (/\/v1(?:alpha|beta)?$/i.test(cleanPath)) {
+      parsed.pathname = `${cleanPath}/models`;
+    } else {
+      parsed.pathname = `${cleanPath}/v1beta/models`;
+    }
+    parsed.searchParams.set('pageSize', '200');
+    return parsed.toString();
+  }
+
+  if (protocol === 'anthropic') {
+    if (cleanPath.endsWith('/v1/messages')) cleanPath = cleanPath.slice(0, -'/messages'.length);
+    else if (cleanPath.endsWith('/messages')) cleanPath = cleanPath.slice(0, -'/messages'.length);
+    if (cleanPath.endsWith('/models')) parsed.pathname = cleanPath;
+    else if (cleanPath.endsWith('/v1')) parsed.pathname = `${cleanPath}/models`;
+    else parsed.pathname = `${cleanPath}/v1/models`;
+    return parsed.toString();
+  }
+
+  if (cleanPath.endsWith('/chat/completions')) {
+    cleanPath = cleanPath.slice(0, -'/chat/completions'.length);
+  }
+  if (cleanPath.endsWith('/models')) {
+    parsed.pathname = cleanPath;
+  } else if (/\/(v\d+|openai|compatible-mode\/v1|api\/paas\/v\d+|openai\/deployments\/[^/]+)$/i.test(cleanPath) || (isAzureOpenAIEndpoint(raw) && cleanPath && cleanPath !== '/')) {
+    parsed.pathname = `${cleanPath}/models`;
+  } else {
+    parsed.pathname = `${cleanPath}/v1/models`;
+  }
+  return parsed.toString();
+}
+
+function extractModelIdsFromResponse(protocol, data) {
+  if (!data || typeof data !== 'object') return [];
+  const rawList = protocol === 'gemini'
+    ? (Array.isArray(data.models) ? data.models : [])
+    : (Array.isArray(data.data) ? data.data : (Array.isArray(data.models) ? data.models : []));
+  const ids = [];
+  for (const item of rawList) {
+    if (typeof item === 'string') {
+      ids.push(item.trim());
+    } else if (item && typeof item === 'object') {
+      const id = String(item.id || item.name || '').replace(/^models\//, '').trim();
+      if (id) ids.push(id);
+    }
+  }
+  return Array.from(new Set(ids)).sort((a, b) => a.localeCompare(b));
 }
 
 function buildProviderAuthHeaders(settings, cleanKey) {
   const headers = { 'Content-Type': 'application/json' };
   const protocol = settings?.protocol || 'openai';
-  const key = String(cleanKey || '').trim();
+  const keyCheck = validateApiKey(cleanKey);
+  if (!keyCheck.ok) {
+    const err = new Error(keyCheck.error);
+    err.errorCode = 'INVALID_API_KEY_CHARS';
+    throw err;
+  }
+  const key = keyCheck.cleanKey;
 
   if (protocol === 'gemini') {
     if (key) headers['x-goog-api-key'] = key;
@@ -449,17 +831,58 @@ function resolveThinkingConfig(model, effort = 'fastest') {
 function loadSettings() {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
-    if (!raw) return { ...DEFAULT_SETTINGS };
+    if (!raw) {
+      return {
+        ...DEFAULT_SETTINGS,
+        providerProfiles: normalizeProviderProfiles({}, DEFAULT_SETTINGS)
+      };
+    }
     const parsed = JSON.parse(raw);
-    return { ...DEFAULT_SETTINGS, ...parsed };
+    const merged = {
+      ...DEFAULT_SETTINGS,
+      ...parsed,
+      apiKey: sanitizeApiKey(parsed?.apiKey),
+      settingsSchemaVersion: 6
+    };
+    const profiles = normalizeProviderProfiles(parsed.providerProfiles, merged);
+    merged.providerProfiles = profiles;
+    if (
+      !merged.fallbackProviderId ||
+      merged.fallbackProviderId === merged.providerId ||
+      !isProfileReady(merged.fallbackProviderId, profiles[merged.fallbackProviderId])
+    ) {
+      merged.fallbackProviderId = '';
+    }
+    return merged;
   } catch (_) {
-    return { ...DEFAULT_SETTINGS };
+    return {
+      ...DEFAULT_SETTINGS,
+      providerProfiles: {}
+    };
   }
 }
 
 function saveSettings(partial) {
   const current = loadSettings();
-  const next = { ...current, ...partial };
+  const next = {
+    ...current,
+    ...partial,
+    settingsSchemaVersion: 6
+  };
+  const explicitProfiles = Object.prototype.hasOwnProperty.call(partial || {}, 'providerProfiles');
+  const baseProfiles = explicitProfiles ? partial.providerProfiles : current.providerProfiles;
+  const profiles = normalizeProviderProfiles(baseProfiles, next);
+  if (explicitProfiles && next.providerId && !isProfileSaved(next.providerId, next)) {
+    delete profiles[next.providerId];
+  }
+  next.providerProfiles = profiles;
+  if (
+    !next.fallbackProviderId ||
+    next.fallbackProviderId === next.providerId ||
+    !isProfileReady(next.fallbackProviderId, profiles[next.fallbackProviderId])
+  ) {
+    next.fallbackProviderId = '';
+  }
   try {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(next));
   } catch (_) {}
@@ -481,52 +904,88 @@ function decodeBase64UrlJson(b64url) {
   return JSON.parse(jsonStr);
 }
 
+function scrubNrSyncHashFromUrl() {
+  try {
+    history.replaceState(null, '', window.location.pathname + window.location.search);
+  } catch (_) {}
+}
+
 function checkAndApplyNrSyncHash() {
   const hash = String(window.location.hash || '');
   if (!hash.includes('nr_sync=')) return false;
 
   const match = hash.match(/(?:^|[#&])nr_sync=([^&]+)/);
-  if (!match || !match[1]) return false;
+  if (!match || !match[1]) {
+    scrubNrSyncHashFromUrl();
+    return false;
+  }
 
   try {
     const payload = decodeBase64UrlJson(decodeURIComponent(match[1]));
-    if (!payload || typeof payload !== 'object') return false;
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
 
-    const providerId = payload.providerId || payload.p || 'gemini';
+    const rawProviderId = String(payload.providerId || payload.p || 'gemini').trim();
+    const providerId = PROVIDER_PRESETS[rawProviderId] ? rawProviderId : 'custom';
     const preset = PROVIDER_PRESETS[providerId] || PROVIDER_PRESETS.gemini;
-    const protocol = payload.protocol || payload.r || preset.protocol || 'gemini';
-    const baseUrl = payload.baseUrl || payload.u || preset.baseUrl;
-    const apiKey = sanitizeApiKey(payload.apiKey ?? payload.k ?? '');
-    const model = payload.model || payload.m || preset.defaultModel;
-    const targetLang = payload.targetLang || payload.l || 'zh-TW';
-    const customTargetLang = payload.customTargetLang ?? payload.c ?? '';
-    const thinkingEffort = payload.thinkingEffort || payload.e || 'fastest';
-    const typographyMatch = payload.typographyMatch || payload.t || 'native';
+    const rawProtocol = String(payload.protocol || payload.r || preset.protocol || 'gemini').trim().toLowerCase();
+    if (!['openai', 'gemini', 'anthropic'].includes(rawProtocol)) return false;
+
+    const baseUrl = String(payload.baseUrl || payload.u || preset.baseUrl || '').trim();
+    try {
+      const parsedUrl = new URL(baseUrl);
+      if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') return false;
+    } catch (_) {
+      return false;
+    }
+
+    const keyCheck = validateApiKey(payload.apiKey ?? payload.k ?? '');
+    if (!keyCheck.ok) return false;
+    const apiKey = keyCheck.cleanKey;
+
+    const model = String(payload.model || payload.m || preset.defaultModel || '').trim();
+    const rawLang = String(payload.targetLang || payload.l || 'zh-TW').trim();
+    const targetLang = TARGET_LANGUAGES[rawLang] ? rawLang : 'zh-TW';
+    const customTargetLang = String(payload.customTargetLang ?? payload.c ?? '').trim();
+    const rawEffort = String(payload.thinkingEffort || payload.e || 'fastest').trim();
+    const thinkingEffort = ['fastest', 'balanced', 'deep'].includes(rawEffort) ? rawEffort : 'fastest';
+    const rawTypo = String(payload.typographyMatch || payload.t || 'native').trim();
+    const typographyMatch = ['native', 'system', 'preserve'].includes(rawTypo) ? rawTypo : 'native';
+
+    const current = loadSettings();
+    const mergedProfiles = normalizeProviderProfiles(current.providerProfiles, {
+      providerId,
+      protocol: rawProtocol,
+      baseUrl,
+      apiKey,
+      model
+    });
 
     saveSettings({
       providerId,
-      protocol,
+      protocol: rawProtocol,
       baseUrl,
       apiKey,
       model,
+      providerProfiles: mergedProfiles,
       targetLang,
       customTargetLang,
       thinkingEffort,
       typographyMatch
     });
 
-    // Scrub sensitive hash from address bar and browser history
-    history.replaceState(null, '', window.location.pathname + window.location.search);
     return true;
   } catch (err) {
     console.warn('[NativeRead] Failed to decode #nr_sync payload:', err);
     return false;
+  } finally {
+    scrubNrSyncHashFromUrl();
   }
 }
 
 // ============================================================
 // 3. IndexedDB Persistent Cache (kct_cache_db_v2)
 // ============================================================
+const IDB_OPEN_TIMEOUT_MS = 3000;
 let dbPromise = null;
 
 function openCacheDB() {
@@ -534,29 +993,61 @@ function openCacheDB() {
     return Promise.reject(new Error('IndexedDB unavailable'));
   }
   if (dbPromise) return dbPromise;
-  dbPromise = new Promise((resolve, reject) => {
+  const currentPromise = new Promise((resolve, reject) => {
+    let settled = false;
+    let openReq = null;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      if (dbPromise === currentPromise) dbPromise = null;
+      reject(new Error('IndexedDB open timeout'));
+    }, IDB_OPEN_TIMEOUT_MS);
+
+    const finishOk = (db) => {
+      if (settled) {
+        try { db.close(); } catch (_) {}
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      db.onversionchange = () => {
+        try { db.close(); } catch (_) {}
+        if (dbPromise === currentPromise) dbPromise = null;
+      };
+      db.onclose = () => {
+        if (dbPromise === currentPromise) dbPromise = null;
+      };
+      resolve(db);
+    };
+
+    const finishErr = (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (dbPromise === currentPromise) dbPromise = null;
+      reject(err);
+    };
+
     try {
-      const req = indexedDB.open(DB_NAME, DB_VERSION);
-      req.onupgradeneeded = () => {
-        const db = req.result;
+      openReq = indexedDB.open(DB_NAME, DB_VERSION);
+      openReq.onupgradeneeded = () => {
+        const db = openReq.result;
         const store = db.objectStoreNames.contains(STORE_NAME)
-          ? req.transaction.objectStore(STORE_NAME)
+          ? openReq.transaction.objectStore(STORE_NAME)
           : db.createObjectStore(STORE_NAME, { keyPath: 'key' });
         if (!store.indexNames.contains('ts')) {
           store.createIndex('ts', 'ts', { unique: false });
         }
       };
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => {
-        dbPromise = null;
-        reject(req.error);
-      };
+      openReq.onsuccess = () => finishOk(openReq.result);
+      openReq.onerror = () => finishErr(openReq.error || new Error('IndexedDB open error'));
+      openReq.onblocked = () => finishErr(new Error('IndexedDB open blocked'));
     } catch (err) {
-      dbPromise = null;
-      reject(err);
+      finishErr(err);
     }
   });
-  return dbPromise;
+  dbPromise = currentPromise;
+  return currentPromise;
 }
 
 async function cacheGetMany(keys) {
@@ -565,7 +1056,14 @@ async function cacheGetMany(keys) {
   try {
     const db = await openCacheDB();
     return await new Promise((resolve) => {
-      const tx = db.transaction(STORE_NAME, 'readonly');
+      let tx;
+      try {
+        tx = db.transaction(STORE_NAME, 'readonly');
+      } catch (err) {
+        if (err?.name === 'InvalidStateError') dbPromise = null;
+        resolve(out);
+        return;
+      }
       const store = tx.objectStore(STORE_NAME);
       for (const k of keys) {
         const req = store.get(k);
@@ -577,43 +1075,113 @@ async function cacheGetMany(keys) {
       }
       tx.oncomplete = () => resolve(out);
       tx.onerror = () => resolve(out);
+      tx.onabort = () => resolve(out);
     });
   } catch (_) {
     return out;
   }
 }
 
+function deleteOldestCacheKeys(store, source, count) {
+  if (!store || !source || !Number.isFinite(count) || count <= 0) return;
+  if (typeof source.getAllKeys === 'function') {
+    const keysReq = source.getAllKeys(null, count);
+    keysReq.onsuccess = () => {
+      try {
+        const keys = Array.isArray(keysReq.result) ? keysReq.result : [];
+        for (const pk of keys) {
+          const delReq = store.delete(pk);
+          if (delReq && typeof delReq === 'object') {
+            delReq.onerror = (e) => {
+              try { e?.preventDefault?.(); e?.stopPropagation?.(); } catch (_) {}
+            };
+          }
+        }
+      } catch (_) {}
+    };
+    keysReq.onerror = (e) => {
+      try { e?.preventDefault?.(); e?.stopPropagation?.(); } catch (_) {}
+    };
+    return;
+  }
+
+  let remaining = count;
+  const curReq = source.openCursor(null, 'next');
+  curReq.onsuccess = () => {
+    const cursor = curReq.result;
+    if (cursor && remaining > 0) {
+      cursor.delete();
+      remaining -= 1;
+      if (remaining > 0) cursor.continue();
+    }
+  };
+}
+
+async function evictOldestCacheFraction(db, fraction = 0.2) {
+  await new Promise((resolve) => {
+    let tx;
+    try {
+      tx = db.transaction(STORE_NAME, 'readwrite');
+    } catch (_) {
+      resolve();
+      return;
+    }
+    const store = tx.objectStore(STORE_NAME);
+    const countReq = store.count();
+    countReq.onsuccess = () => {
+      const total = countReq.result || 0;
+      const toDelete = Math.max(1, Math.ceil(total * fraction));
+      const cursorSource = store.indexNames.contains('ts') ? store.index('ts') : store;
+      deleteOldestCacheKeys(store, cursorSource, toDelete);
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => resolve();
+    tx.onabort = () => resolve();
+  });
+}
+
+async function writeCacheEntriesOnce(db, entries) {
+  const now = Date.now();
+  return new Promise((resolve, reject) => {
+    let tx;
+    try {
+      tx = db.transaction(STORE_NAME, 'readwrite');
+    } catch (err) {
+      if (err?.name === 'InvalidStateError') dbPromise = null;
+      reject(err);
+      return;
+    }
+    const store = tx.objectStore(STORE_NAME);
+    entries.forEach((entry, idx) => {
+      if (entry?.key && entry?.zh) {
+        store.put({ key: entry.key, zh: entry.zh, ts: now + idx });
+      }
+    });
+    const countReq = store.count();
+    countReq.onsuccess = () => {
+      const overflow = (countReq.result || 0) - MAX_CACHE_ENTRIES;
+      if (overflow > 0 && store.indexNames.contains('ts')) {
+        deleteOldestCacheKeys(store, store.index('ts'), overflow);
+      }
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error('IDB write failed'));
+    tx.onabort = () => reject(tx.error || new Error('IDB write aborted'));
+  });
+}
+
 async function cachePutMany(entries) {
   if (!Array.isArray(entries) || entries.length === 0) return;
   try {
     const db = await openCacheDB();
-    const now = Date.now();
-    await new Promise((resolve) => {
-      const tx = db.transaction(STORE_NAME, 'readwrite');
-      const store = tx.objectStore(STORE_NAME);
-      entries.forEach((entry, idx) => {
-        if (entry?.key && entry?.zh) {
-          store.put({ key: entry.key, zh: entry.zh, ts: now + idx });
-        }
-      });
-      const countReq = store.count();
-      countReq.onsuccess = () => {
-        let overflow = (countReq.result || 0) - MAX_CACHE_ENTRIES;
-        if (overflow > 0) {
-          const curReq = store.index('ts').openCursor(null, 'next');
-          curReq.onsuccess = () => {
-            const cursor = curReq.result;
-            if (cursor && overflow > 0) {
-              cursor.delete();
-              overflow -= 1;
-              if (overflow > 0) cursor.continue();
-            }
-          };
-        }
-      };
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => resolve();
-    });
+    try {
+      await writeCacheEntriesOnce(db, entries);
+    } catch (err) {
+      if (err?.name === 'QuotaExceededError') {
+        await evictOldestCacheFraction(db, 0.2);
+        await writeCacheEntriesOnce(db, entries).catch(() => {});
+      }
+    }
   } catch (_) {}
 }
 
@@ -621,7 +1189,14 @@ async function cacheCount() {
   try {
     const db = await openCacheDB();
     return await new Promise((resolve) => {
-      const tx = db.transaction(STORE_NAME, 'readonly');
+      let tx;
+      try {
+        tx = db.transaction(STORE_NAME, 'readonly');
+      } catch (err) {
+        if (err?.name === 'InvalidStateError') dbPromise = null;
+        resolve(0);
+        return;
+      }
       const req = tx.objectStore(STORE_NAME).count();
       req.onsuccess = () => resolve(req.result || 0);
       req.onerror = () => resolve(0);
@@ -635,7 +1210,14 @@ async function cacheClear() {
   try {
     const db = await openCacheDB();
     await new Promise((resolve) => {
-      const tx = db.transaction(STORE_NAME, 'readwrite');
+      let tx;
+      try {
+        tx = db.transaction(STORE_NAME, 'readwrite');
+      } catch (err) {
+        if (err?.name === 'InvalidStateError') dbPromise = null;
+        resolve();
+        return;
+      }
       tx.objectStore(STORE_NAME).clear();
       tx.oncomplete = () => resolve();
       tx.onerror = () => resolve();
@@ -837,20 +1419,254 @@ function buildOpenAIRequestBody(settings, endpoint, messages, stream = true) {
   return body;
 }
 
+function redactApiKeyText(msg, apiKey, settings = null) {
+  let out = String(msg || '');
+  const keys = new Set();
+  const clean = sanitizeApiKey(apiKey);
+  if (clean) keys.add(clean);
+  if (settings && typeof settings === 'object') {
+    const kMain = sanitizeApiKey(settings.apiKey);
+    if (kMain) keys.add(kMain);
+    if (settings.providerProfiles && typeof settings.providerProfiles === 'object') {
+      for (const prof of Object.values(settings.providerProfiles)) {
+        const pk = sanitizeApiKey(prof?.apiKey);
+        if (pk) keys.add(pk);
+      }
+    }
+  }
+  for (const k of keys) {
+    if (k && k.length >= 6) {
+      out = out.split(k).join('[REDACTED_KEY]');
+    }
+  }
+  return out;
+}
+
+const MAX_CONCURRENT_PER_PROVIDER = 2;
+const providerConcurrencyState = new Map();
+
+function getProviderSlotKey(settings) {
+  return `${settings?.providerId || 'custom'}|${settings?.protocol || 'openai'}|${String(settings?.baseUrl || '').trim()}`;
+}
+
+async function acquireProviderSlot(settings, signal) {
+  const key = getProviderSlotKey(settings);
+  let entry = providerConcurrencyState.get(key);
+  if (!entry) {
+    entry = { active: 0, waiters: [] };
+    providerConcurrencyState.set(key, entry);
+  }
+  if (signal?.aborted) {
+    throw new DOMException('The operation was aborted.', 'AbortError');
+  }
+  if (entry.active >= MAX_CONCURRENT_PER_PROVIDER) {
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        entry.waiters = entry.waiters.filter((w) => w !== wake);
+        reject(new DOMException('The operation was aborted.', 'AbortError'));
+      };
+      const wake = () => {
+        if (settled) return;
+        settled = true;
+        if (signal) signal.removeEventListener('abort', onAbort);
+        resolve();
+      };
+      if (signal) signal.addEventListener('abort', onAbort, { once: true });
+      entry.waiters.push(wake);
+    });
+  }
+  entry.active += 1;
+  return () => {
+    entry.active = Math.max(0, entry.active - 1);
+    const next = entry.waiters.shift();
+    if (next) {
+      next();
+    } else if (entry.active === 0) {
+      providerConcurrencyState.delete(key);
+    }
+  };
+}
+
+function createIncrementalJsonScanner(onObjectStr) {
+  let buf = '';
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let objStart = -1;
+
+  return {
+    push(chunk) {
+      if (!chunk) return;
+      const offset = buf.length;
+      buf += chunk;
+      for (let i = offset; i < buf.length; i++) {
+        const ch = buf[i];
+        if (inStr) {
+          if (esc) esc = false;
+          else if (ch === '\\') esc = true;
+          else if (ch === '"') inStr = false;
+          continue;
+        }
+        if (ch === '"') {
+          inStr = true;
+        } else if (ch === '{') {
+          if (depth === 0) objStart = i;
+          depth += 1;
+        } else if (ch === '}') {
+          if (depth > 0) {
+            depth -= 1;
+            if (depth === 0 && objStart !== -1) {
+              const objStr = buf.slice(objStart, i + 1);
+              onObjectStr(objStr);
+              objStart = -1;
+            }
+          }
+        }
+      }
+      if (depth === 0 && objStart === -1) {
+        buf = '';
+      } else if (objStart > 0) {
+        buf = buf.slice(objStart);
+        objStart = 0;
+      }
+    },
+    flush() {
+      if (buf.trim()) {
+        onObjectStr(buf);
+      }
+      buf = '';
+      depth = 0;
+      inStr = false;
+      esc = false;
+      objStart = -1;
+    }
+  };
+}
+
+function isHardQuota429(status, bodyText) {
+  if (status !== 429) return false;
+  return /quota exceeded|exceeded your current quota|daily limit|insufficient_quota|billing|配額上限|額度已用盡/i.test(
+    String(bodyText || '')
+  );
+}
+
+const CONNECT_TIMEOUT_MS = 25000;
+const CHUNK_IDLE_TIMEOUT_MS = 28000;
+
+function parseRetryAfterMs(headerVal) {
+  if (!headerVal) return 0;
+  const num = Number(headerVal);
+  if (Number.isFinite(num) && num > 0) {
+    return Math.min(30000, Math.round(num * 1000));
+  }
+  const ts = Date.parse(headerVal);
+  if (Number.isFinite(ts)) {
+    const delta = ts - Date.now();
+    if (delta > 0) return Math.min(30000, delta);
+  }
+  return 0;
+}
+
+function computeMobileBackoffMs(status, attempt, retryAfterMs = 0) {
+  if (retryAfterMs > 0) {
+    return Math.min(30000, retryAfterMs + Math.round(Math.random() * 400));
+  }
+  if (status === 429) {
+    const base = Math.min(12000, 3000 * (2 ** Math.max(0, attempt - 1)));
+    return Math.round(base * (0.85 + Math.random() * 0.3));
+  }
+  if (status === 503 || status === 529) {
+    const base = Math.min(8000, 1500 * (2 ** Math.max(0, attempt - 1)));
+    return Math.round(base * (0.85 + Math.random() * 0.3));
+  }
+  const base = Math.min(5000, 900 * attempt);
+  return Math.round(base + Math.random() * 350);
+}
+
+function sleepWithAbort(ms, signal) {
+  if (signal?.aborted) {
+    return Promise.reject(new DOMException('The operation was aborted.', 'AbortError'));
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      if (signal && onAbort) signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException('The operation was aborted.', 'AbortError'));
+    };
+    if (signal) {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+  });
+}
+
+function buildHttpError(status, statusText, rawBodyText, apiKey, settings = null) {
+  const safeBody = redactApiKeyText(String(rawBodyText || '').slice(0, 260), apiKey, settings);
+  const msg = `HTTP ${status}: ${safeBody || statusText || 'Request failed'}`;
+  const err = new Error(msg);
+  err.httpStatus = status;
+  if (status === 401 || status === 403) {
+    err.errorCode = 'AUTH_ERROR';
+    err.retryable = false;
+  } else if (status === 404) {
+    err.errorCode = 'HTTP_404';
+    err.retryable = false;
+  } else if (status === 429) {
+    err.errorCode = 'RATE_LIMIT';
+    err.retryable = !isHardQuota429(status, rawBodyText);
+  } else if (status === 503 || status === 529) {
+    err.errorCode = 'OVERLOADED';
+    err.retryable = true;
+  } else if (status >= 500) {
+    err.errorCode = 'SERVER_ERROR';
+    err.retryable = true;
+  } else {
+    err.errorCode = `HTTP_${status}`;
+    err.retryable = false;
+  }
+  return err;
+}
+
+function isFallbackEligibleMobileError(err, signal) {
+  if (signal?.aborted) return false;
+  if (err?.name === 'AbortError' && err?.errorCode !== 'TIMEOUT') return false;
+  const code = String(err?.errorCode || '');
+  const status = Number(err?.httpStatus || 0);
+  if (code === 'NO_API_KEY' || code === 'INVALID_API_KEY_CHARS' || code === 'NO_MODEL' || code === 'AUTH_ERROR') return false;
+  if (status === 400 || status === 401 || status === 403 || status === 404) return false;
+  if (status === 429 || status === 503 || status === 529 || status >= 500) return true;
+  if (code === 'OVERLOADED' || code === 'RATE_LIMIT' || code === 'SERVER_ERROR' || code === 'TIMEOUT' || code === 'NETWORK_ERROR') return true;
+  if (err?.retryable) return true;
+  return /high demand|overloaded|timeout|timed out|failed to fetch|networkerror|load failed/i.test(
+    String(err?.message || '')
+  );
+}
+
 async function streamTranslateBatchWithCache(
   settings,
   items,
   docTitle,
   onItem,
   signal,
-  { allowEchoRetry = true } = {}
+  { allowEchoRetry = true, allowFallback = true } = {}
 ) {
-  if (!items || items.length === 0) return;
+  if (!items || items.length === 0) return { fallbackUsed: null };
 
   const cleanKey = sanitizeApiKey(settings.apiKey);
-  if (!cleanKey && !/^https?:\/\/(localhost|127\.0\.0\.1)/i.test(settings.baseUrl || '')) {
+  if (!cleanKey && !isLocalEndpoint(settings.baseUrl || '')) {
     const err = new Error('請先在「⚙ 模型與 API 設定」填入 API Key（或從電腦端掃描 QR Code 同步）');
     err.errorCode = 'NO_API_KEY';
+    throw err;
+  }
+  const keyCheck = validateApiKey(cleanKey);
+  if (!keyCheck.ok) {
+    const err = new Error(keyCheck.error);
+    err.errorCode = 'INVALID_API_KEY_CHARS';
     throw err;
   }
   if (!String(settings.model || '').trim()) {
@@ -875,120 +1691,267 @@ async function streamTranslateBatchWithCache(
     }
   }
 
-  if (uncachedItems.length === 0) return;
+  if (uncachedItems.length === 0) return { fallbackUsed: null };
 
-  const endpoint = resolveStreamEndpoint(settings);
-  const payload = uncachedItems.map((it, idx) => ({ i: idx, text: it.text }));
-  const messages = [
-    { role: 'system', content: buildStreamSystemPrompt(settings, docTitle) },
-    { role: 'user', content: JSON.stringify(payload) }
-  ];
-
-  const headers = buildProviderAuthHeaders(settings, cleanKey);
-  let bodyObj;
-  if (settings.protocol === 'gemini') {
-    bodyObj = buildGeminiRequestBody(settings, messages);
-  } else if (settings.protocol === 'anthropic') {
-    bodyObj = buildAnthropicMessagesBody(settings, messages, { stream: true, maxTokens: 32000 });
-  } else {
-    bodyObj = buildOpenAIRequestBody(settings, endpoint, messages, true);
-  }
-
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(bodyObj),
-    signal
-  });
-
-  if (!response.ok) {
-    const errText = await response.text().catch(() => '');
-    throw new Error(`HTTP ${response.status}: ${errText.slice(0, 200) || response.statusText}`);
-  }
-
+  const releaseSlot = await acquireProviderSlot(settings, signal);
   const emittedIndices = new Set();
   const toCache = [];
   const echoedItems = [];
 
-  const handleDecodedLine = (line) => {
-    const entries = parseNdjsonLine(line);
-    for (const entry of entries) {
-      if (entry.idx >= 0 && entry.idx < uncachedItems.length && !emittedIndices.has(entry.idx)) {
-        emittedIndices.add(entry.idx);
-        const item = uncachedItems[entry.idx];
-        const isEcho = isUntranslatedEcho(item.text, entry.text, langInfo.id);
-        if (isEcho && allowEchoRetry) {
-          echoedItems.push(item);
-          continue;
-        }
-        onItem(item.key, entry.text, false);
-        if (!isEcho) {
-          toCache.push({ key: `${sig}::${item.key}`, zh: entry.text });
-        }
+  try {
+    const endpoint = resolveStreamEndpoint(settings);
+    const payload = uncachedItems.map((it, idx) => ({ i: idx, text: it.text }));
+    const messages = [
+      { role: 'system', content: buildStreamSystemPrompt(settings, docTitle) },
+      { role: 'user', content: JSON.stringify(payload) }
+    ];
+
+    const headers = buildProviderAuthHeaders(settings, cleanKey);
+    let bodyObj;
+    if (settings.protocol === 'gemini') {
+      bodyObj = buildGeminiRequestBody(settings, messages);
+    } else if (settings.protocol === 'anthropic') {
+      bodyObj = buildAnthropicMessagesBody(settings, messages, { stream: true, maxTokens: 32000 });
+    } else {
+      bodyObj = buildOpenAIRequestBody(settings, endpoint, messages, true);
+    }
+
+    const bodyJson = JSON.stringify(bodyObj);
+    const maxAttempts = 4;
+    let response = null;
+    let lastAttemptErr = null;
+    let activeTimeoutCtrl = null;
+    let activeTimedOut = false;
+
+    const createLinkedController = (timeoutMs) => {
+      const child = new AbortController();
+      activeTimedOut = false;
+      const onParentAbort = () => {
+        try { child.abort(); } catch (_) {}
+      };
+      if (signal) {
+        if (signal.aborted) child.abort();
+        else signal.addEventListener('abort', onParentAbort, { once: true });
       }
-    }
-  };
-
-  const contentType = String(response.headers.get('content-type') || '').toLowerCase();
-  if (!response.body || (contentType.includes('application/json') && !contentType.includes('event-stream'))) {
-    const data = await response.json();
-    const fullText = Array.isArray(data)
-      ? data.map((c) => extractStreamTextDelta(settings.protocol, c)).join('')
-      : extractStreamTextDelta(settings.protocol, data);
-    for (const line of String(fullText || '').split('\n')) {
-      handleDecodedLine(line);
-    }
-  } else {
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let sseBuffer = '';
-    let ndjsonBuffer = '';
-
-    const processSseLine = (rawSseLine) => {
-      const line = rawSseLine.trim();
-      if (!line.startsWith('data:')) return;
-      const dataStr = line.slice(5).trim();
-      if (!dataStr || dataStr === '[DONE]') return;
-      try {
-        const chunkObj = JSON.parse(dataStr);
-        const delta = extractStreamTextDelta(settings.protocol, chunkObj);
-        if (delta) {
-          ndjsonBuffer += delta;
-          let nlIdx;
-          while ((nlIdx = ndjsonBuffer.indexOf('\n')) !== -1) {
-            const completeLine = ndjsonBuffer.slice(0, nlIdx);
-            ndjsonBuffer = ndjsonBuffer.slice(nlIdx + 1);
-            handleDecodedLine(completeLine);
-          }
+      const timerId = setTimeout(() => {
+        activeTimedOut = true;
+        try { child.abort(); } catch (_) {}
+      }, timeoutMs);
+      return {
+        controller: child,
+        clearConnectTimer() {
+          clearTimeout(timerId);
+        },
+        cleanup(currentTimer) {
+          clearTimeout(timerId);
+          if (currentTimer) clearTimeout(currentTimer);
+          if (signal) signal.removeEventListener('abort', onParentAbort);
         }
-      } catch (_) {}
+      };
     };
 
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      sseBuffer += decoder.decode(value, { stream: true });
-      let nl;
-      while ((nl = sseBuffer.indexOf('\n')) !== -1) {
-        const sseLine = sseBuffer.slice(0, nl);
-        sseBuffer = sseBuffer.slice(nl + 1);
-        processSseLine(sseLine);
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (signal?.aborted) {
+        throw new DOMException('The operation was aborted.', 'AbortError');
+      }
+      const linked = createLinkedController(CONNECT_TIMEOUT_MS);
+      activeTimeoutCtrl = linked;
+      try {
+        const resp = await fetch(endpoint, {
+          method: 'POST',
+          headers,
+          body: bodyJson,
+          signal: linked.controller.signal
+        });
+        if (resp.ok) {
+          linked.clearConnectTimer();
+          response = resp;
+          lastAttemptErr = null;
+          break;
+        }
+        linked.cleanup();
+        const errText = await resp.text().catch(() => '');
+        const httpErr = buildHttpError(resp.status, resp.statusText, errText, cleanKey, settings);
+        lastAttemptErr = httpErr;
+        if (!httpErr.retryable || attempt >= maxAttempts) {
+          break;
+        }
+        const retryAfterMs = parseRetryAfterMs(resp.headers.get('retry-after'));
+        const waitMs = computeMobileBackoffMs(resp.status, attempt, retryAfterMs);
+        await sleepWithAbort(waitMs, signal);
+      } catch (fetchErr) {
+        linked.cleanup();
+        if (signal?.aborted) {
+          throw fetchErr;
+        }
+        if (activeTimedOut) {
+          const timeoutErr = new Error('請求連線逾時（25 秒無回應）');
+          timeoutErr.errorCode = 'TIMEOUT';
+          timeoutErr.retryable = true;
+          lastAttemptErr = timeoutErr;
+        } else {
+          if (fetchErr?.name === 'AbortError') throw fetchErr;
+          const redactedMsg = redactApiKeyText(fetchErr?.message || 'Network error', cleanKey, settings);
+          const netErr = new Error(redactedMsg);
+          netErr.errorCode = fetchErr?.errorCode || 'NETWORK_ERROR';
+          netErr.retryable = true;
+          lastAttemptErr = netErr;
+        }
+        if (attempt >= maxAttempts) {
+          break;
+        }
+        const waitMs = computeMobileBackoffMs(0, attempt, 0);
+        await sleepWithAbort(waitMs, signal);
       }
     }
-    if (sseBuffer.trim()) processSseLine(sseBuffer);
-    if (ndjsonBuffer.trim()) handleDecodedLine(ndjsonBuffer);
-  }
 
-  if (toCache.length > 0) {
-    await cachePutMany(toCache);
-    updateCacheCountUI();
+    if (!response) {
+      if (allowFallback && isFallbackEligibleMobileError(lastAttemptErr, signal)) {
+        const fbSettings = resolveFallbackSettings(settings);
+        if (fbSettings) {
+          await streamTranslateBatchWithCache(
+            fbSettings,
+            uncachedItems,
+            docTitle,
+            onItem,
+            signal,
+            { allowEchoRetry, allowFallback: false }
+          );
+          return {
+            fallbackUsed: {
+              providerId: fbSettings.providerId,
+              label: PROVIDER_PRESETS[fbSettings.providerId]?.label || fbSettings.providerId,
+              model: fbSettings.model
+            }
+          };
+        }
+      }
+      throw lastAttemptErr || new Error('翻譯請求失敗');
+    }
+
+    const handleDecodedLine = (line) => {
+      const entries = parseNdjsonLine(line);
+      for (const entry of entries) {
+        if (entry.idx >= 0 && entry.idx < uncachedItems.length && !emittedIndices.has(entry.idx)) {
+          emittedIndices.add(entry.idx);
+          const item = uncachedItems[entry.idx];
+          const isEcho = isUntranslatedEcho(item.text, entry.text, langInfo.id);
+          if (isEcho && allowEchoRetry) {
+            echoedItems.push(item);
+            continue;
+          }
+          onItem(item.key, entry.text, false);
+          if (!isEcho) {
+            toCache.push({ key: `${sig}::${item.key}`, zh: entry.text });
+          }
+        }
+      }
+    };
+
+    const scanner = createIncrementalJsonScanner(handleDecodedLine);
+
+    try {
+      const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+      if (!response.body || (contentType.includes('application/json') && !contentType.includes('event-stream'))) {
+        activeTimeoutCtrl?.cleanup();
+        const data = await response.json();
+        const fullText = Array.isArray(data)
+          ? data.map((c) => extractStreamTextDelta(settings.protocol, c)).join('')
+          : extractStreamTextDelta(settings.protocol, data);
+        scanner.push(String(fullText || ''));
+        scanner.flush();
+      } else {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let sseBuffer = '';
+
+        const processSseLine = (rawSseLine) => {
+          const line = rawSseLine.trim();
+          if (!line.startsWith('data:')) return;
+          const dataStr = line.slice(5).trim();
+          if (!dataStr || dataStr === '[DONE]') return;
+          let chunkObj;
+          try {
+            chunkObj = JSON.parse(dataStr);
+          } catch (_) {
+            return;
+          }
+          if (settings.protocol === 'anthropic') {
+            const ant = extractAnthropicStreamDelta(chunkObj);
+            if (ant.error) {
+              const streamErr = new Error(redactApiKeyText(ant.error, cleanKey, settings));
+              streamErr.errorCode = 'SERVER_ERROR';
+              streamErr.retryable = true;
+              throw streamErr;
+            }
+          }
+          if (chunkObj?.error) {
+            const errTxt = typeof chunkObj.error === 'string'
+              ? chunkObj.error
+              : (chunkObj.error.message || JSON.stringify(chunkObj.error));
+            const streamErr = new Error(redactApiKeyText(errTxt, cleanKey, settings));
+            streamErr.httpStatus = Number(chunkObj.error?.code || 0) || 0;
+            throw streamErr;
+          }
+          const delta = extractStreamTextDelta(settings.protocol, chunkObj);
+          if (delta) {
+            scanner.push(delta);
+          }
+        };
+
+        let chunkTimer = null;
+        try {
+          while (true) {
+            if (chunkTimer) clearTimeout(chunkTimer);
+            activeTimedOut = false;
+            chunkTimer = activeTimeoutCtrl
+              ? setTimeout(() => {
+                  activeTimedOut = true;
+                  try { activeTimeoutCtrl.controller.abort(); } catch (_) {}
+                }, CHUNK_IDLE_TIMEOUT_MS)
+              : null;
+            const { value, done } = await reader.read();
+            if (done) break;
+            sseBuffer += decoder.decode(value, { stream: true });
+            let nl;
+            while ((nl = sseBuffer.indexOf('\n')) !== -1) {
+              const sseLine = sseBuffer.slice(0, nl);
+              sseBuffer = sseBuffer.slice(nl + 1);
+              processSseLine(sseLine);
+            }
+          }
+        } catch (streamReadErr) {
+          if (!signal?.aborted && activeTimedOut) {
+            const tErr = new Error('串流接收逾時（28 秒無新資料）');
+            tErr.errorCode = 'TIMEOUT';
+            tErr.retryable = true;
+            throw tErr;
+          }
+          throw streamReadErr;
+        } finally {
+          activeTimeoutCtrl?.cleanup(chunkTimer);
+        }
+        if (sseBuffer.trim()) processSseLine(sseBuffer);
+        scanner.flush();
+      }
+    } finally {
+      activeTimeoutCtrl?.cleanup();
+      if (toCache.length > 0) {
+        await cachePutMany(toCache).catch(() => {});
+        updateCacheCountUI();
+      }
+    }
+  } finally {
+    releaseSlot();
   }
 
   if (echoedItems.length > 0 && allowEchoRetry && !signal?.aborted) {
     await streamTranslateBatchWithCache(settings, echoedItems, docTitle, onItem, signal, {
-      allowEchoRetry: false
+      allowEchoRetry: false,
+      allowFallback
     });
   }
+  return { fallbackUsed: null };
 }
 
 // ============================================================
@@ -1001,6 +1964,7 @@ const dom = {
 
   globalStatusBadge: document.getElementById('globalStatusBadge'),
   globalStatusText: document.getElementById('globalStatusText'),
+  globalProviderSelect: document.getElementById('globalProviderSelect'),
   globalLangSelect: document.getElementById('globalLangSelect'),
 
   tabPanels: {
@@ -1055,12 +2019,18 @@ const dom = {
   // Settings Tab
   settingsForm: document.getElementById('settingsForm'),
   setProvider: document.getElementById('setProvider'),
+  setProtocol: document.getElementById('setProtocol'),
   setProviderHint: document.getElementById('setProviderHint'),
+  savedProvidersRow: document.getElementById('savedProvidersRow'),
   setApiKey: document.getElementById('setApiKey'),
   toggleApiKeyVisBtn: document.getElementById('toggleApiKeyVisBtn'),
   setModel: document.getElementById('setModel'),
+  fetchModelsBtn: document.getElementById('fetchModelsBtn'),
+  modelSuggestions: document.getElementById('modelSuggestions'),
+  modelListHint: document.getElementById('modelListHint'),
   modelChipsRow: document.getElementById('modelChipsRow'),
   setBaseUrl: document.getElementById('setBaseUrl'),
+  setFallbackProvider: document.getElementById('setFallbackProvider'),
   setTargetLang: document.getElementById('setTargetLang'),
   customLangField: document.getElementById('customLangField'),
   setCustomTargetLang: document.getElementById('setCustomTargetLang'),
@@ -1105,6 +2075,8 @@ const state = {
   cachedKeys: new Set(),
   lastError: '',
   lastErrorCode: '',
+  lastErrorDetail: '',
+  fallbackNotice: '',
 
   renderObserver: null,
   pageTrackObserver: null,
@@ -1113,7 +2085,8 @@ const state = {
   activeCompareAnchor: null,
   activeComparePara: null,
 
-  webAbortController: null
+  webAbortController: null,
+  webFetchController: null
 };
 
 // ============================================================
@@ -1138,10 +2111,10 @@ function switchTab(tabId) {
   closeComparePopover();
 }
 
-function setGlobalStatus(statusState, text) {
+function setGlobalStatus(statusState, text, tooltip = '') {
   dom.globalStatusBadge.dataset.state = statusState;
   dom.globalStatusText.textContent = text;
-  dom.globalStatusText.title = text;
+  dom.globalStatusText.title = tooltip || text;
 }
 
 function applyRootLanguageFonts(settings) {
@@ -1190,7 +2163,7 @@ function computeOverlayBox(para, viewport) {
 
 function updatePdfStatusBadge() {
   if (state.lastError) {
-    setGlobalStatus('error', state.lastError);
+    setGlobalStatus('error', state.lastError, state.lastErrorDetail || state.lastError);
     return;
   }
   if (!state.pdfDoc) {
@@ -1210,7 +2183,8 @@ function updatePdfStatusBadge() {
   if (active > 0) {
     setGlobalStatus('streaming', total > 0 ? `翻譯中 ${translated}/${total}` : '串流翻譯中...');
   } else if (translated > 0) {
-    setGlobalStatus('done', `已譯 ${translated} 段`);
+    const suffix = state.fallbackNotice ? `（${state.fallbackNotice}）` : '';
+    setGlobalStatus('done', `已譯 ${translated} 段${suffix}`);
   } else {
     setGlobalStatus('idle', `共 ${state.numPages} 頁`);
   }
@@ -1500,8 +2474,12 @@ async function translatePageParagraphs(pageRec, epoch) {
     return;
   }
 
+  const runSeq = (pageRec.translationRunSeq || 0) + 1;
+  pageRec.translationRunSeq = runSeq;
   pageRec.translationInFlight = true;
   state.lastError = '';
+  state.lastErrorCode = '';
+  state.lastErrorDetail = '';
   updatePdfStatusBadge();
 
   const controller = new AbortController();
@@ -1563,26 +2541,73 @@ async function translatePageParagraphs(pageRec, epoch) {
     const batches = buildPageBatches(toRequest);
     for (const batch of batches) {
       if (epoch !== state.translationEpoch) return;
-      await streamTranslateBatchWithCache(
+      const res = await streamTranslateBatchWithCache(
         state.settings,
         batch,
         state.docTitle,
         onItemArrived,
         controller.signal
       );
+      if (res?.fallbackUsed?.label) {
+        state.fallbackNotice = `已改用備援 ${res.fallbackUsed.label}`;
+      }
     }
     if (epoch === state.translationEpoch) {
       pageRec.translatedEpoch = epoch;
     }
   } catch (err) {
     if (controller.signal.aborted || epoch !== state.translationEpoch) return;
-    state.lastError = err?.message || '翻譯失敗';
+    const fmt = formatApiError(err, err?.httpStatus, err?.errorCode);
+    state.lastError = fmt.shortMsg;
+    state.lastErrorDetail = fmt.detailMsg;
     state.lastErrorCode = err?.errorCode || '';
   } finally {
     state.activeAbortControllers.delete(controller);
-    pageRec.translationInFlight = false;
+    if (pageRec.translationRunSeq === runSeq) {
+      pageRec.translationInFlight = false;
+    }
     updatePdfStatusBadge();
   }
+}
+
+function evictDistantCanvases(activePageNum, keepRadius = 5) {
+  for (const pageRec of state.pages.values()) {
+    if (
+      !pageRec.isVisible &&
+      Math.abs(pageRec.pageNum - activePageNum) > keepRadius &&
+      pageRec.rendered &&
+      !pageRec.translationInFlight
+    ) {
+      pageRec.canvasEl.width = 0;
+      pageRec.canvasEl.height = 0;
+      pageRec.canvasEl.style.width = '';
+      pageRec.canvasEl.style.height = '';
+      pageRec.rendered = false;
+      pageRec.renderedScale = 0;
+      if (pageRec.loaderEl) pageRec.loaderEl.hidden = false;
+    }
+  }
+}
+
+function syncCurrentPageFromViewport() {
+  if (!state.pdfDoc || !state.pages.size || !dom.pdfPageIndicator) return;
+  const targetY = (window.innerHeight || 800) * 0.35;
+  let bestPage = state.currentPage || 1;
+  let bestDist = Infinity;
+  for (const pageRec of state.pages.values()) {
+    const rect = pageRec.rowEl.getBoundingClientRect();
+    if (rect.height <= 0) continue;
+    let dist = 0;
+    if (rect.top > targetY) dist = rect.top - targetY;
+    else if (rect.bottom < targetY) dist = targetY - rect.bottom;
+    if (dist < bestDist) {
+      bestDist = dist;
+      bestPage = pageRec.pageNum;
+    }
+  }
+  state.currentPage = bestPage;
+  dom.pdfPageIndicator.hidden = false;
+  dom.pdfPageIndicator.textContent = `${bestPage} / ${state.numPages}`;
 }
 
 async function renderAndTranslatePage(pageNum, { forceCanvas = false } = {}) {
@@ -1636,6 +2661,8 @@ async function renderAndTranslatePage(pageNum, { forceCanvas = false } = {}) {
       pageRec.renderedScale = targetScale;
       pageRec.viewport = viewport;
       pageRec.loaderEl.hidden = true;
+      evictDistantCanvases(pageNum, 5);
+      syncCurrentPageFromViewport();
 
       let pageImageData = null;
       try {
@@ -1822,15 +2849,16 @@ function setupPdfObservers() {
 
   state.pageTrackObserver = new IntersectionObserver(
     (entries) => {
+      let anyIntersecting = false;
       for (const entry of entries) {
         if (entry.isIntersecting) {
-          const p = Number(entry.target.dataset.pageNum);
-          dom.pdfPageIndicator.hidden = false;
-          dom.pdfPageIndicator.textContent = `${p} / ${state.numPages}`;
+          anyIntersecting = true;
+          break;
         }
       }
+      if (anyIntersecting) syncCurrentPageFromViewport();
     },
-    { rootMargin: '-20% 0px -60% 0px', threshold: 0.1 }
+    { rootMargin: '-15% 0px -55% 0px', threshold: 0.05 }
   );
 
   for (const pageRec of state.pages.values()) {
@@ -1869,11 +2897,17 @@ async function openPdfFromArrayBuffer(arrayBuffer, { title, sourceUrl = '' }) {
     state.pdfDoc = null;
   }
 
+  state.pages.clear();
+  dom.pdfPagesContainer.replaceChildren();
   state.translations.clear();
   state.mathPlaceholdersByKey.clear();
   state.skippedEchoKeys.clear();
   state.cachedKeys.clear();
   state.lastError = '';
+  state.lastErrorCode = '';
+  state.lastErrorDetail = '';
+  state.fallbackNotice = '';
+  state.currentPage = 1;
   state.docTitle = title || 'PDF Document';
   state.sourceUrl = sourceUrl;
 
@@ -1905,12 +2939,13 @@ async function openPdfFromArrayBuffer(arrayBuffer, { title, sourceUrl = '' }) {
     state.defaultPageHeight = baseViewport.height;
 
     const availW = Math.min(840, Math.max(310, window.innerWidth - 28));
-    state.baseFitScale = Math.max(0.48, Math.min(1.55, availW / Math.max(200, baseViewport.width)));
+    state.baseFitScale = Math.max(0.25, Math.min(1.55, availW / Math.max(200, baseViewport.width)));
     state.zoom = 1.0;
     dom.pdfZoomResetBtn.textContent = '100%';
 
     buildPdfPageShells(pdfDoc.numPages, baseViewport.width, baseViewport.height);
     showPdfStage('pages');
+    syncCurrentPageFromViewport();
     dom.pdfPageIndicator.hidden = false;
     dom.pdfPageIndicator.textContent = `1 / ${pdfDoc.numPages}`;
     updatePdfStatusBadge();
@@ -2115,9 +3150,15 @@ function applyPdfZoom(nextZoom) {
     if (nearViewport) {
       renderAndTranslatePage(pageRec.pageNum, { forceCanvas: true });
     } else {
+      pageRec.canvasEl.width = 0;
+      pageRec.canvasEl.height = 0;
+      pageRec.canvasEl.style.width = '';
+      pageRec.canvasEl.style.height = '';
       pageRec.rendered = false;
+      pageRec.renderedScale = 0;
     }
   }
+  syncCurrentPageFromViewport();
 }
 
 function abortAllActiveRequests() {
@@ -2142,6 +3183,8 @@ function resetAndRetranslatePdf() {
   state.translatedParagraphs = 0;
   state.lastError = '';
   state.lastErrorCode = '';
+  state.lastErrorDetail = '';
+  state.fallbackNotice = '';
 
   for (const pageRec of state.pages.values()) {
     pageRec.translatedEpoch = -1;
@@ -2160,6 +3203,23 @@ function resetAndRetranslatePdf() {
     const rect = pageRec.rowEl.getBoundingClientRect();
     const nearViewport = pageRec.isVisible || (rect.bottom >= -500 && rect.top <= vh + 500);
     if (nearViewport) {
+      renderAndTranslatePage(pageRec.pageNum, { forceCanvas: false });
+    }
+  }
+}
+
+function resumePdfAfterProviderSwitch() {
+  if (!state.pdfDoc) return;
+  state.lastError = '';
+  state.lastErrorCode = '';
+  state.lastErrorDetail = '';
+  state.fallbackNotice = '';
+  updatePdfStatusBadge();
+  const vh = window.innerHeight || 800;
+  for (const pageRec of state.pages.values()) {
+    const rect = pageRec.rowEl.getBoundingClientRect();
+    const nearViewport = pageRec.isVisible || (rect.bottom >= -500 && rect.top <= vh + 500);
+    if (nearViewport && pageRec.translatedEpoch !== state.translationEpoch) {
       renderAndTranslatePage(pageRec.pageNum, { forceCanvas: false });
     }
   }
@@ -2232,41 +3292,93 @@ function parseMarkdownOrTextBlocks(rawText, fallbackTitle = '外文文章翻譯'
   return { title, blocks };
 }
 
-async function fetchReadableArticleFromUrl(targetUrl) {
+const WEB_FETCH_TIMEOUT_MS = 15000;
+
+async function fetchWithTimeoutSignal(url, options = {}, timeoutMs = WEB_FETCH_TIMEOUT_MS, parentSignal = null) {
+  const ctrl = new AbortController();
+  let timedOut = false;
+  const onParentAbort = () => {
+    try { ctrl.abort(); } catch (_) {}
+  };
+  if (parentSignal) {
+    if (parentSignal.aborted) ctrl.abort();
+    else parentSignal.addEventListener('abort', onParentAbort, { once: true });
+  }
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try { ctrl.abort(); } catch (_) {}
+  }, timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: ctrl.signal });
+  } catch (err) {
+    if (timedOut && !parentSignal?.aborted) {
+      const tErr = new Error('擷取網頁逾時（15 秒無回應）');
+      tErr.errorCode = 'TIMEOUT';
+      throw tErr;
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+    if (parentSignal) parentSignal.removeEventListener('abort', onParentAbort);
+  }
+}
+
+async function fetchReadableArticleFromUrl(targetUrl, signal = null) {
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(targetUrl);
+  } catch (_) {
+    throw new Error('無效的網頁連結');
+  }
+  if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+    throw new Error('僅支援 http:// 或 https:// 網址');
+  }
+
   // 1. Try r.jina.ai clean reader first
   try {
-    const jinaRes = await fetch(`https://r.jina.ai/${targetUrl}`, {
-      headers: { Accept: 'text/plain' }
-    });
+    const jinaRes = await fetchWithTimeoutSignal(
+      `https://r.jina.ai/${targetUrl}`,
+      { headers: { Accept: 'text/plain' } },
+      WEB_FETCH_TIMEOUT_MS,
+      signal
+    );
     if (jinaRes.ok) {
       const txt = await jinaRes.text();
       if (txt && txt.trim().length > 80) {
-        return parseMarkdownOrTextBlocks(txt, new URL(targetUrl).hostname);
+        return parseMarkdownOrTextBlocks(txt, parsedUrl.hostname);
       }
     }
-  } catch (_) {}
+  } catch (err) {
+    if (signal?.aborted) throw err;
+  }
 
   // 2. Fallback to AllOrigins HTML + DOMParser
   const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`;
-  const htmlRes = await fetch(proxyUrl);
+  const htmlRes = await fetchWithTimeoutSignal(proxyUrl, {}, WEB_FETCH_TIMEOUT_MS, signal);
   if (!htmlRes.ok) {
     throw new Error(`無法擷取網頁 (HTTP ${htmlRes.status})`);
   }
   const html = await htmlRes.text();
   const doc = new DOMParser().parseFromString(html, 'text/html');
-  const title = (doc.querySelector('h1')?.textContent || doc.title || new URL(targetUrl).hostname).trim();
+  const title = (doc.querySelector('h1')?.textContent || doc.title || parsedUrl.hostname).trim();
   const root = doc.querySelector('article, main, [role="main"]') || doc.body;
   const blocks = [];
+  const seenTexts = new Set();
 
   for (const node of root.querySelectorAll('h1, h2, h3, h4, p, li, blockquote, pre')) {
     if (node.closest('nav, footer, aside, script, style, noscript')) continue;
     if (node.tagName === 'PRE') {
       const codeTxt = (node.textContent || '').trim();
-      if (codeTxt) blocks.push({ kind: 'code', text: codeTxt });
+      if (codeTxt && !seenTexts.has(codeTxt)) {
+        seenTexts.add(codeTxt);
+        blocks.push({ kind: 'code', text: codeTxt });
+      }
       continue;
     }
+    if (node.parentElement?.closest('li, blockquote, p')) continue;
     const txt = (node.textContent || '').replace(/\s+/g, ' ').trim();
-    if (txt.length < 8) continue;
+    if (txt.length < 8 || seenTexts.has(txt)) continue;
+    seenTexts.add(txt);
     const isH = /^H[1-4]$/.test(node.tagName);
     blocks.push({
       kind: isH ? 'heading' : 'p',
@@ -2352,15 +3464,22 @@ async function renderAndStreamWebArticle({ title, sourceLabel, blocks }) {
 
   try {
     const batches = buildPageBatches(translatableItems);
+    let fallbackLabel = '';
     for (const batch of batches) {
       if (controller.signal.aborted) return;
-      await streamTranslateBatchWithCache(state.settings, batch, title, onItem, controller.signal);
+      const res = await streamTranslateBatchWithCache(state.settings, batch, title, onItem, controller.signal);
+      if (res?.fallbackUsed?.label) {
+        fallbackLabel = res.fallbackUsed.label;
+      }
     }
-    setGlobalStatus('done', `已完成 ${doneCount} 段`);
+    const suffix = fallbackLabel ? `（已改用備援 ${fallbackLabel}）` : '';
+    setGlobalStatus('done', `已完成 ${doneCount} 段${suffix}`);
   } catch (err) {
     if (controller.signal.aborted) return;
-    dom.webArticleProgress.textContent = err?.message || '翻譯失敗';
-    setGlobalStatus('error', err?.message || '翻譯失敗');
+    const fmt = formatApiError(err, err?.httpStatus, err?.errorCode);
+    dom.webArticleProgress.textContent = fmt.shortMsg;
+    dom.webArticleProgress.title = fmt.detailMsg;
+    setGlobalStatus('error', fmt.shortMsg, fmt.detailMsg);
   }
 }
 
@@ -2368,6 +3487,217 @@ async function renderAndStreamWebArticle({ title, sourceLabel, blocks }) {
 // 9. Settings Tab & Install Tab Helpers (Tabs 3 & 4)
 // ============================================================
 const BOOKMARKLET_SNIPPET = `javascript:(function(){var s=document.createElement('script');s.src='https://chih-kai-wang.github.io/native-read/nativeread.user.js?t='+Date.now();document.head.appendChild(s);})();`;
+
+let draftProfiles = {};
+let currentSettingsProviderId = 'gemini';
+
+function getFormProviderProfileSnapshot() {
+  const pid = currentSettingsProviderId || dom.setProvider.value || 'custom';
+  const preset = PROVIDER_PRESETS[pid] || PROVIDER_PRESETS.custom;
+  return {
+    providerId: pid,
+    profile: {
+      protocol: dom.setProtocol?.value || preset.protocol || 'openai',
+      baseUrl: dom.setBaseUrl.value.trim(),
+      apiKey: sanitizeApiKey(dom.setApiKey.value),
+      model: dom.setModel.value.trim()
+    }
+  };
+}
+
+function buildDraftProfilesFromForm() {
+  const { providerId, profile } = getFormProviderProfileSnapshot();
+  const next = normalizeProviderProfiles(draftProfiles);
+  if (isProfileSaved(providerId, profile)) {
+    next[providerId] = profile;
+  } else {
+    delete next[providerId];
+  }
+  return next;
+}
+
+function stashCurrentFormProviderToDraft() {
+  draftProfiles = buildDraftProfilesFromForm();
+}
+
+function renderGlobalProviderSelect() {
+  if (!dom.globalProviderSelect) return;
+  const s = state.settings;
+  const activeId = PROVIDER_PRESETS[s.providerId] ? s.providerId : 'custom';
+  const saved = listSavedProviders(s);
+  dom.globalProviderSelect.replaceChildren();
+
+  let hasActiveInList = false;
+  for (const item of saved) {
+    const opt = document.createElement('option');
+    opt.value = item.providerId;
+    opt.textContent = item.model ? `${item.label} (${item.model})` : item.label;
+    if (item.isActive) hasActiveInList = true;
+    dom.globalProviderSelect.appendChild(opt);
+  }
+
+  if (!hasActiveInList) {
+    const preset = PROVIDER_PRESETS[activeId] || PROVIDER_PRESETS.custom;
+    const opt = document.createElement('option');
+    opt.value = activeId;
+    opt.textContent = `${preset?.label || activeId} (未設金鑰)`;
+    dom.globalProviderSelect.prepend(opt);
+  }
+
+  const sep = document.createElement('option');
+  sep.disabled = true;
+  sep.textContent = '──────────';
+  dom.globalProviderSelect.appendChild(sep);
+
+  const manageOpt = document.createElement('option');
+  manageOpt.value = '__manage__';
+  manageOpt.textContent = '⚙ 管理供應商與金鑰...';
+  dom.globalProviderSelect.appendChild(manageOpt);
+
+  dom.globalProviderSelect.value = activeId;
+}
+
+function renderSavedProvidersRow() {
+  if (!dom.savedProvidersRow) return;
+  dom.savedProvidersRow.replaceChildren();
+  const { providerId, profile } = getFormProviderProfileSnapshot();
+  const profiles = buildDraftProfilesFromForm();
+  const fallbackVal = dom.setFallbackProvider?.value || '';
+  const list = listSavedProviders({
+    providerId,
+    protocol: profile.protocol,
+    baseUrl: profile.baseUrl,
+    apiKey: profile.apiKey,
+    model: profile.model,
+    providerProfiles: profiles,
+    fallbackProviderId: fallbackVal
+  });
+
+  if (!list.length) {
+    const empty = document.createElement('span');
+    empty.className = 'nr-field-hint';
+    empty.textContent = '尚未儲存供應商（請在下方填入 API Key 後儲存）';
+    dom.savedProvidersRow.appendChild(empty);
+    return;
+  }
+
+  for (const item of list) {
+    const chip = document.createElement('span');
+    chip.className = 'nr-provider-chip' + (item.isActive ? ' active' : '');
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'nr-provider-chip-btn';
+    const name = document.createElement('span');
+    name.textContent = item.label;
+    btn.appendChild(name);
+
+    if (item.model) {
+      const meta = document.createElement('span');
+      meta.className = 'nr-provider-chip-meta';
+      meta.textContent = item.model;
+      btn.appendChild(meta);
+    }
+
+    if (item.isActive) {
+      const badge = document.createElement('span');
+      badge.className = 'nr-provider-chip-badge';
+      badge.textContent = '使用中';
+      btn.appendChild(badge);
+    } else if (item.isFallback) {
+      const badge = document.createElement('span');
+      badge.className = 'nr-provider-chip-badge fallback';
+      badge.textContent = '備援';
+      btn.appendChild(badge);
+    }
+
+    btn.addEventListener('click', () => {
+      if (item.providerId === state.settings.providerId && currentSettingsProviderId === item.providerId) {
+        return;
+      }
+      switchActiveProviderFromUi(item.providerId);
+    });
+    chip.appendChild(btn);
+
+    if (!item.isActive) {
+      const rmBtn = document.createElement('button');
+      rmBtn.type = 'button';
+      rmBtn.className = 'nr-provider-chip-remove';
+      rmBtn.textContent = '×';
+      rmBtn.setAttribute('aria-label', `移除 ${item.label}`);
+      rmBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        delete draftProfiles[item.providerId];
+        if (dom.setFallbackProvider && dom.setFallbackProvider.value === item.providerId) {
+          dom.setFallbackProvider.value = '';
+        }
+        state.settings = saveSettings(removeProviderProfile(state.settings, item.providerId));
+        renderGlobalProviderSelect();
+        renderSavedProvidersRow();
+        renderFallbackProviderSelect();
+      });
+      chip.appendChild(rmBtn);
+    }
+
+    dom.savedProvidersRow.appendChild(chip);
+  }
+}
+
+function renderFallbackProviderSelect(preferredValue) {
+  if (!dom.setFallbackProvider) return;
+  const { providerId, profile } = getFormProviderProfileSnapshot();
+  const profiles = buildDraftProfilesFromForm();
+  const prevVal = preferredValue !== undefined ? preferredValue : dom.setFallbackProvider.value;
+  dom.setFallbackProvider.replaceChildren();
+
+  const offOpt = document.createElement('option');
+  offOpt.value = '';
+  offOpt.textContent = '停用（僅手動切換）';
+  dom.setFallbackProvider.appendChild(offOpt);
+
+  const candidates = listSavedProviders({
+    providerId,
+    protocol: profile.protocol,
+    baseUrl: profile.baseUrl,
+    apiKey: profile.apiKey,
+    model: profile.model,
+    providerProfiles: profiles,
+    fallbackProviderId: prevVal
+  }).filter((p) => !p.isActive && p.isReady);
+
+  for (const cand of candidates) {
+    const opt = document.createElement('option');
+    opt.value = cand.providerId;
+    opt.textContent = cand.model ? `${cand.label} (${cand.model})` : cand.label;
+    dom.setFallbackProvider.appendChild(opt);
+  }
+
+  dom.setFallbackProvider.value = candidates.some((c) => c.providerId === prevVal) ? prevVal : '';
+}
+
+function switchActiveProviderFromUi(targetProviderId) {
+  const prev = state.settings;
+  const hadPdfError = Boolean(state.lastError);
+  const stashedProfiles = buildDraftProfilesFromForm();
+  const baseWithDraft = { ...prev, providerProfiles: stashedProfiles };
+  const switched = switchActiveProviderSettings(baseWithDraft, targetProviderId);
+  state.settings = saveSettings(switched);
+  populateSettingsForm();
+  renderGlobalProviderSelect();
+  const label = PROVIDER_PRESETS[state.settings.providerId]?.label || state.settings.providerId;
+  showSyncBanner(`✓ 已切換供應商為 ${label}${state.settings.model ? ` (${state.settings.model})` : ''}`);
+
+  if (state.pdfDoc) {
+    if (hadPdfError) {
+      resumePdfAfterProviderSwitch();
+    } else if (state.settings.model !== prev.model || state.settings.protocol !== prev.protocol) {
+      resetAndRetranslatePdf();
+    }
+  }
+  if (state.currentWebArticle) {
+    renderAndStreamWebArticle(state.currentWebArticle);
+  }
+}
 
 function populateSettingsForm() {
   const s = state.settings;
@@ -2386,7 +3716,12 @@ function populateSettingsForm() {
     opt.textContent = preset.label;
     providerGroups.get(groupLabel).appendChild(opt);
   }
-  dom.setProvider.value = PROVIDER_PRESETS[s.providerId] ? s.providerId : 'custom';
+  const activePid = PROVIDER_PRESETS[s.providerId] ? s.providerId : 'custom';
+  const activePreset = PROVIDER_PRESETS[activePid] || PROVIDER_PRESETS.custom;
+  currentSettingsProviderId = activePid;
+  draftProfiles = normalizeProviderProfiles(s.providerProfiles, s);
+  dom.setProvider.value = activePid;
+  if (dom.setProtocol) dom.setProtocol.value = s.protocol || activePreset.protocol || 'openai';
   dom.setApiKey.value = s.apiKey || '';
   dom.setModel.value = s.model || '';
   dom.setBaseUrl.value = s.baseUrl || '';
@@ -2398,16 +3733,31 @@ function populateSettingsForm() {
   dom.setGlossary.value = s.customGlossary ?? DEFAULT_GLOSSARY;
 
   updateProviderPresetUI(dom.setProvider.value, false);
+  renderFallbackProviderSelect(s.fallbackProviderId || '');
+  renderSavedProvidersRow();
 }
 
 function updateProviderPresetUI(providerId, overwriteFields = true) {
   const preset = PROVIDER_PRESETS[providerId] || PROVIDER_PRESETS.custom;
+  if (overwriteFields && currentSettingsProviderId && currentSettingsProviderId !== providerId) {
+    stashCurrentFormProviderToDraft();
+  }
+  currentSettingsProviderId = providerId;
   dom.setProviderHint.textContent = preset.hint || '';
   dom.setApiKey.placeholder = preset.placeholderKey || '填入 API Key...';
 
   if (overwriteFields) {
-    dom.setModel.value = preset.defaultModel || '';
-    dom.setBaseUrl.value = preset.baseUrl || '';
+    const savedProfile = draftProfiles[providerId];
+    if (dom.setProtocol) dom.setProtocol.value = savedProfile?.protocol || preset.protocol || 'openai';
+    dom.setModel.value = savedProfile?.model || preset.defaultModel || '';
+    dom.setBaseUrl.value = savedProfile?.baseUrl || preset.baseUrl || '';
+    dom.setApiKey.value = savedProfile?.apiKey || '';
+  } else if (dom.setProtocol) {
+    dom.setProtocol.value = state.settings.protocol || preset.protocol || 'openai';
+  }
+  if (dom.modelListHint) {
+    dom.modelListHint.hidden = true;
+    dom.modelListHint.textContent = '';
   }
   dom.setModel.placeholder = preset.defaultModel
     ? `例如 ${preset.defaultModel}`
@@ -2421,9 +3771,14 @@ function updateProviderPresetUI(providerId, overwriteFields = true) {
     chip.textContent = m;
     chip.addEventListener('click', () => {
       dom.setModel.value = m;
+      stashCurrentFormProviderToDraft();
+      renderSavedProvidersRow();
+      renderFallbackProviderSelect();
     });
     dom.modelChipsRow.appendChild(chip);
   }
+  renderSavedProvidersRow();
+  renderFallbackProviderSelect();
 }
 
 async function updateCacheCountUI() {
@@ -2442,6 +3797,17 @@ function bindEvents() {
   for (const btn of dom.navButtons) {
     btn.addEventListener('click', () => switchTab(btn.dataset.tab));
   }
+
+  // Global provider quick switcher
+  dom.globalProviderSelect?.addEventListener('change', () => {
+    const val = dom.globalProviderSelect.value;
+    if (val === '__manage__') {
+      dom.globalProviderSelect.value = PROVIDER_PRESETS[state.settings.providerId] ? state.settings.providerId : 'custom';
+      switchTab('settings');
+      return;
+    }
+    switchActiveProviderFromUi(val);
+  });
 
   // Global target language change
   dom.globalLangSelect.addEventListener('change', () => {
@@ -2468,10 +3834,20 @@ function bindEvents() {
     pdfResizeTimer = setTimeout(() => {
       if (!state.pdfDoc) return;
       const availW = Math.min(840, Math.max(310, window.innerWidth - 28));
-      state.baseFitScale = Math.max(0.48, Math.min(1.55, availW / Math.max(200, state.defaultPageWidth)));
+      state.baseFitScale = Math.max(0.25, Math.min(1.55, availW / Math.max(200, state.defaultPageWidth)));
       applyPdfZoom(state.zoom);
     }, 220);
   });
+
+  let pdfScrollTimer = null;
+  window.addEventListener('scroll', () => {
+    if (!state.pdfDoc || state.activeTab !== 'pdf') return;
+    if (pdfScrollTimer) return;
+    pdfScrollTimer = setTimeout(() => {
+      pdfScrollTimer = null;
+      syncCurrentPageFromViewport();
+    }, 100);
+  }, { passive: true });
 
   // PDF Tab events
   dom.pdfModeSegmented.addEventListener('click', (e) => {
@@ -2554,32 +3930,47 @@ function bindEvents() {
     const url = dom.webUrlInput.value.trim();
     if (!url) return;
     // If user pasted a direct PDF link into Web tab, automatically route to PDF tab!
-    if (/\.pdf(?:$|\?)/i.test(url) || /arxiv\.org\/pdf\//i.test(url)) {
+    if (/\.pdf(?:$|\?)/i.test(url) || /arxiv\.org\/pdf\//i.test(url) || /openreview\.net\/pdf\?id=/i.test(url)) {
       switchTab('pdf');
       dom.pdfUrlInput.value = url;
       loadPdfFromUrl(url);
       return;
     }
+    if (state.webFetchController) {
+      try { state.webFetchController.abort(); } catch (_) {}
+    }
+    const fetchCtrl = new AbortController();
+    state.webFetchController = fetchCtrl;
     dom.webArticleCard.hidden = false;
     dom.webArticleTitle.textContent = '正在擷取網頁正文...';
     dom.webArticleProgress.textContent = url;
     dom.webArticleBody.replaceChildren();
     try {
-      const parsed = await fetchReadableArticleFromUrl(url);
+      const parsed = await fetchReadableArticleFromUrl(url, fetchCtrl.signal);
+      if (fetchCtrl.signal.aborted || state.webFetchController !== fetchCtrl) return;
       await renderAndStreamWebArticle({
         title: parsed.title,
         sourceLabel: new URL(url).hostname,
         blocks: parsed.blocks
       });
     } catch (err) {
+      if (fetchCtrl.signal.aborted && state.webFetchController !== fetchCtrl) return;
       dom.webArticleTitle.textContent = '無法直接擷取該網址';
       dom.webArticleProgress.textContent = err?.message || '請改展開上方「直接貼上外文段落」進行翻譯';
+    } finally {
+      if (state.webFetchController === fetchCtrl) {
+        state.webFetchController = null;
+      }
     }
   });
 
   dom.webTranslateRawBtn.addEventListener('click', () => {
     const raw = dom.webRawInput.value.trim();
     if (!raw) return;
+    if (state.webFetchController) {
+      try { state.webFetchController.abort(); } catch (_) {}
+      state.webFetchController = null;
+    }
     const parsed = parseMarkdownOrTextBlocks(raw, '自訂外文段落翻譯');
     renderAndStreamWebArticle({
       title: parsed.title,
@@ -2603,6 +3994,75 @@ function bindEvents() {
     updateProviderPresetUI(dom.setProvider.value, true);
   });
 
+  const syncDraftProviderInputs = () => {
+    stashCurrentFormProviderToDraft();
+    renderSavedProvidersRow();
+    renderFallbackProviderSelect();
+  };
+  dom.setProtocol?.addEventListener('change', syncDraftProviderInputs);
+  dom.setApiKey.addEventListener('input', syncDraftProviderInputs);
+  dom.setModel.addEventListener('input', syncDraftProviderInputs);
+  dom.setBaseUrl.addEventListener('input', syncDraftProviderInputs);
+  dom.setFallbackProvider?.addEventListener('change', () => {
+    renderSavedProvidersRow();
+  });
+
+  dom.fetchModelsBtn?.addEventListener('click', async () => {
+    const hint = dom.modelListHint;
+    const datalist = dom.modelSuggestions;
+    const btn = dom.fetchModelsBtn;
+    const candidate = { ...state.settings, ...collectFormSettings() };
+    const cleanKey = sanitizeApiKey(candidate.apiKey);
+    const keyCheck = validateApiKey(cleanKey);
+    const preset = PROVIDER_PRESETS[candidate.providerId];
+    if (!keyCheck.ok) {
+      if (hint) { hint.hidden = false; hint.textContent = keyCheck.error; }
+      return;
+    }
+    if (!cleanKey && !isLocalEndpoint(candidate.baseUrl) && !preset?.publicModelList) {
+      if (hint) { hint.hidden = false; hint.textContent = '請先填寫 API Key 再取得模型清單'; }
+      return;
+    }
+    const url = buildListModelsUrl(candidate);
+    if (!url) {
+      if (hint) { hint.hidden = false; hint.textContent = '請輸入有效的 http:// 或 https:// API Base URL'; }
+      return;
+    }
+    btn.disabled = true;
+    if (hint) {
+      hint.hidden = false;
+      hint.textContent = '正在取得模型清單...';
+    }
+    try {
+      const headers = buildProviderAuthHeaders(candidate, cleanKey);
+      const res = await fetchWithTimeoutSignal(url, { method: 'GET', headers }, WEB_FETCH_TIMEOUT_MS);
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        throw buildHttpError(res.status, res.statusText, body, cleanKey, candidate);
+      }
+      const data = await res.json();
+      const ids = extractModelIdsFromResponse(candidate.protocol, data);
+      if (datalist) {
+        datalist.replaceChildren();
+        for (const id of ids) {
+          const opt = document.createElement('option');
+          opt.value = id;
+          datalist.appendChild(opt);
+        }
+      }
+      if (hint) {
+        hint.textContent = ids.length
+          ? `已取得 ${ids.length} 個可用模型，點選模型欄位即可挑選`
+          : '供應商未回傳任何可用模型';
+      }
+    } catch (err) {
+      const fmt = formatApiError(err, err?.httpStatus, err?.errorCode);
+      if (hint) hint.textContent = `取得模型清單失敗：${fmt.shortMsg}`;
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
   dom.setTargetLang.addEventListener('change', () => {
     dom.customLangField.hidden = dom.setTargetLang.value !== 'custom';
   });
@@ -2616,12 +4076,26 @@ function bindEvents() {
   const collectFormSettings = () => {
     const providerId = dom.setProvider.value;
     const preset = PROVIDER_PRESETS[providerId] || PROVIDER_PRESETS.custom;
+    const protocol = dom.setProtocol?.value || preset.protocol || 'openai';
+    const apiKey = sanitizeApiKey(dom.setApiKey.value);
+    const model = dom.setModel.value.trim() || preset.defaultModel || '';
+    const baseUrl = dom.setBaseUrl.value.trim() || preset.baseUrl || '';
+    const profiles = buildDraftProfilesFromForm();
+    if (isProfileSaved(providerId, { protocol, baseUrl, apiKey, model })) {
+      profiles[providerId] = { protocol, baseUrl, apiKey, model };
+    } else {
+      delete profiles[providerId];
+    }
+    const rawFallback = dom.setFallbackProvider?.value || '';
+    const fallbackProviderId = rawFallback && rawFallback !== providerId ? rawFallback : '';
     return {
       providerId,
-      protocol: preset.protocol || 'openai',
-      apiKey: sanitizeApiKey(dom.setApiKey.value),
-      model: dom.setModel.value.trim() || preset.defaultModel,
-      baseUrl: dom.setBaseUrl.value.trim() || preset.baseUrl,
+      protocol,
+      apiKey,
+      model,
+      baseUrl,
+      providerProfiles: profiles,
+      fallbackProviderId,
       targetLang: dom.setTargetLang.value,
       customTargetLang: dom.setCustomTargetLang.value.trim(),
       thinkingEffort: dom.setThinkingEffort.value,
@@ -2630,30 +4104,75 @@ function bindEvents() {
     };
   };
 
+  const validateCandidateSettings = (candidate, { requireModel = false } = {}) => {
+    try {
+      const parsed = new URL(candidate.baseUrl);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        return 'API Base URL 必須以 http:// 或 https:// 開頭';
+      }
+    } catch (_) {
+      return '請輸入有效的 http:// 或 https:// API Base URL';
+    }
+    if (/YOUR-RESOURCE/i.test(candidate.baseUrl)) {
+      return '請將 Azure URL 中的 YOUR-RESOURCE 替換為實際資源名稱';
+    }
+    const keyCheck = validateApiKey(candidate.apiKey);
+    if (!keyCheck.ok) return keyCheck.error;
+    if (requireModel && !candidate.model) return '請先選擇或填寫模型名稱';
+    return '';
+  };
+
   dom.settingsForm.addEventListener('submit', (e) => {
     e.preventDefault();
+    const collected = collectFormSettings();
+    const validationErr = validateCandidateSettings(collected);
+    if (validationErr) {
+      showSyncBanner(`⚠️ ${validationErr}`);
+      return;
+    }
     const prev = state.settings;
-    state.settings = saveSettings(collectFormSettings());
+    const hadPdfError = Boolean(state.lastError);
+    state.settings = saveSettings(collected);
+    draftProfiles = normalizeProviderProfiles(state.settings.providerProfiles, state.settings);
     populateLanguageDropdowns();
+    renderGlobalProviderSelect();
+    renderSavedProvidersRow();
+    renderFallbackProviderSelect(state.settings.fallbackProviderId || '');
     applyRootLanguageFonts(state.settings);
     showSyncBanner('✅ 設定已儲存至本機！');
-    if (
-      state.pdfDoc &&
-      prev &&
-      (
+    if (state.pdfDoc && prev) {
+      const langChanged =
         state.settings.targetLang !== prev.targetLang ||
         state.settings.customTargetLang !== prev.customTargetLang ||
+        state.settings.customGlossary !== prev.customGlossary;
+      const providerChanged =
+        state.settings.providerId !== prev.providerId ||
+        state.settings.baseUrl !== prev.baseUrl ||
+        state.settings.apiKey !== prev.apiKey ||
         state.settings.model !== prev.model ||
-        state.settings.protocol !== prev.protocol
-      )
-    ) {
-      resetAndRetranslatePdf();
+        state.settings.protocol !== prev.protocol;
+      if (langChanged) {
+        resetAndRetranslatePdf();
+      } else if (providerChanged || hadPdfError) {
+        if (hadPdfError) {
+          resumePdfAfterProviderSwitch();
+        } else if (state.settings.model !== prev.model || state.settings.protocol !== prev.protocol) {
+          resetAndRetranslatePdf();
+        }
+      }
     }
   });
 
   dom.testApiBtn.addEventListener('click', async () => {
     const candidate = { ...state.settings, ...collectFormSettings() };
-    state.settings = saveSettings(candidate);
+    const validationErr = validateCandidateSettings(candidate, { requireModel: true });
+    if (validationErr) {
+      dom.settingsTestResult.hidden = false;
+      dom.settingsTestResult.dataset.status = 'error';
+      dom.settingsTestResult.textContent = `❌ ${validationErr}`;
+      return;
+    }
+    dom.testApiBtn.disabled = true;
     dom.settingsTestResult.hidden = false;
     dom.settingsTestResult.dataset.status = '';
     dom.settingsTestResult.textContent = `正在測試連線 (${candidate.protocol} · ${candidate.model})...`;
@@ -2665,14 +4184,18 @@ function bindEvents() {
         [{ key: `test_${Date.now()}`, text: 'Machine learning models prevent overfitting using cross-validation.' }],
         'API Connection Test',
         (_k, zh) => { translated = zh; },
-        null
+        null,
+        { allowFallback: false }
       );
       const ms = Math.round(performance.now() - t0);
       dom.settingsTestResult.dataset.status = 'ok';
       dom.settingsTestResult.textContent = `✅ 連線成功 (${ms} ms)\n測試譯文：${translated}`;
     } catch (err) {
+      const fmt = formatApiError(err, err?.httpStatus, err?.errorCode);
       dom.settingsTestResult.dataset.status = 'error';
-      dom.settingsTestResult.textContent = `❌ 連線失敗：${err?.message || err}`;
+      dom.settingsTestResult.textContent = `❌ 連線失敗：${fmt.detailMsg}`;
+    } finally {
+      dom.testApiBtn.disabled = false;
     }
   });
 
@@ -2687,6 +4210,7 @@ async function init() {
   const syncedFromDesktop = checkAndApplyNrSyncHash();
   state.settings = loadSettings();
   populateLanguageDropdowns();
+  renderGlobalProviderSelect();
   populateSettingsForm();
   applyRootLanguageFonts(state.settings);
   bindEvents();
@@ -2709,18 +4233,18 @@ async function init() {
     navigator.serviceWorker.register('./sw.js').catch(() => {});
   }
 
-  // Handle query parameters (?src= for PDF, ?url= / ?text= for Web Share Target)
+  // Handle query parameters (?src= for PDF, ?url= / ?text= / ?title= for Web Share Target)
   const params = new URLSearchParams(window.location.search);
   const srcPdf = params.get('src');
-  const shareUrl = params.get('url') || params.get('text');
+  const rawShare = params.get('url') || params.get('text') || params.get('title');
 
   if (srcPdf && srcPdf.trim()) {
     switchTab('pdf');
     dom.pdfUrlInput.value = srcPdf.trim();
     await loadPdfFromUrl(srcPdf.trim());
-  } else if (shareUrl && /^https?:\/\/\S+/i.test(shareUrl.trim())) {
-    const cleanUrl = shareUrl.trim().match(/https?:\/\/\S+/i)[0];
-    if (/\.pdf(?:$|\?)/i.test(cleanUrl) || /arxiv\.org\/pdf\//i.test(cleanUrl)) {
+  } else if (rawShare && /https?:\/\/\S+/i.test(rawShare.trim())) {
+    const cleanUrl = rawShare.trim().match(/https?:\/\/\S+/i)[0].replace(/[),.;:!?'"\]>]+$/, '');
+    if (/\.pdf(?:$|\?)/i.test(cleanUrl) || /arxiv\.org\/pdf\//i.test(cleanUrl) || /openreview\.net\/pdf\?id=/i.test(cleanUrl)) {
       switchTab('pdf');
       dom.pdfUrlInput.value = cleanUrl;
       await loadPdfFromUrl(cleanUrl);

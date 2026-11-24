@@ -1,12 +1,17 @@
 export function redactSecrets(input) {
   let str = typeof input === 'string' ? input : String(input ?? '');
   if (!str) return str;
-  // Google API keys, OpenAI/DeepSeek/OpenRouter keys, AQ tokens, Bearer tokens, #nr_sync payloads
+  // Google API keys, OpenAI/Anthropic/DeepSeek/OpenRouter/Groq/HF/xAI keys, AQ tokens, auth headers, #nr_sync payloads
   str = str.replace(/AIza[0-9A-Za-z_-]{16,}/g, '[REDACTED_API_KEY]');
-  str = str.replace(/\bsk-(?:or-|proj-)?[0-9A-Za-z_-]{12,}/g, '[REDACTED_API_KEY]');
+  str = str.replace(/\bsk-(?:ant-|or-|proj-)?[0-9A-Za-z_-]{12,}/g, '[REDACTED_API_KEY]');
+  str = str.replace(/\bgsk_[0-9A-Za-z_-]{12,}/g, '[REDACTED_API_KEY]');
+  str = str.replace(/\bhf_[0-9A-Za-z_-]{12,}/g, '[REDACTED_API_KEY]');
+  str = str.replace(/\bxai-[0-9A-Za-z_-]{12,}/g, '[REDACTED_API_KEY]');
   str = str.replace(/\bAQ\.[0-9A-Za-z_.-]{16,}/g, '[REDACTED_API_KEY]');
   str = str.replace(/(Authorization["':\s]+Bearer\s+)[^\s"',}]+/gi, '$1[REDACTED_TOKEN]');
   str = str.replace(/(x-goog-api-key["':\s]+)[^\s"',}]+/gi, '$1[REDACTED_TOKEN]');
+  str = str.replace(/(x-api-key["':\s]+)[^\s"',}]+/gi, '$1[REDACTED_TOKEN]');
+  str = str.replace(/(api-key["':\s]+)[^\s"',}]+/gi, '$1[REDACTED_TOKEN]');
   str = str.replace(/(#nr_sync=)[A-Za-z0-9_%-]{16,}/g, '$1[REDACTED_SYNC_PAYLOAD]');
   return str;
 }

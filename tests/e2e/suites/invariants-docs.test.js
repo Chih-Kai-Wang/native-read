@@ -184,7 +184,7 @@ export function registerTests(ctx) {
     id: 'F1-T1-02',
     tier: 1,
     feature: 'F1',
-    name: 'KCTConfig.DEFAULT_SETTINGS silent defaults and v1->v5 schema migration force autoTranslate=false',
+    name: 'KCTConfig.DEFAULT_SETTINGS silent defaults and v1->v6 schema migration force autoTranslate=false',
     usesBrowser: false,
     async run({ repoRoot }) {
       const { KCTConfig } = loadConfigInVm(repoRoot, {
@@ -196,13 +196,13 @@ export function registerTests(ctx) {
           batchSize: 8
         }
       });
-      assertEqual(KCTConfig.DEFAULT_SETTINGS.settingsSchemaVersion, 5, 'settingsSchemaVersion');
+      assertEqual(KCTConfig.DEFAULT_SETTINGS.settingsSchemaVersion, 6, 'settingsSchemaVersion');
       assertEqual(KCTConfig.DEFAULT_SETTINGS.autoTranslate, false, 'DEFAULT_SETTINGS.autoTranslate');
       assertEqual(KCTConfig.DEFAULT_SETTINGS.enabled, true, 'DEFAULT_SETTINGS.enabled');
       assertEqual(KCTConfig.DEFAULT_SETTINGS.thinkingEffort, 'fastest', 'DEFAULT_SETTINGS.thinkingEffort');
 
       const migrated = await KCTConfig.getSettings();
-      assertEqual(migrated.settingsSchemaVersion, 5, 'migrated schema version');
+      assertEqual(migrated.settingsSchemaVersion, 6, 'migrated schema version');
       assertEqual(migrated.autoTranslate, false, 'migrated autoTranslate forced false');
       assertEqual(migrated.displayMode, 'replace', 'v1 bilingual migrated to replace');
       assertEqual(migrated.batchSize, 20, 'v1 legacy batchSize migrated to 20');
@@ -504,7 +504,11 @@ export function registerTests(ctx) {
       const mockLlm = await startMockLlmServer((req, res) => {
         if (req.url.includes('/chat/completions')) {
           const userMsg = req.body?.messages?.find((m) => m.role === 'user')?.content || '';
-          const count = (userMsg.match(/\[\d+\]/g) || []).length || 1;
+          let count = 1;
+          try {
+            const parsed = JSON.parse(userMsg);
+            if (Array.isArray(parsed) && parsed.length > 0) count = parsed.length;
+          } catch (_) {}
           if (req.body?.stream) {
             res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
             for (let i = 0; i < count; i++) {
@@ -513,10 +517,9 @@ export function registerTests(ctx) {
             res.write('data: [DONE]\n\n');
             res.end();
           } else {
-            const map = {};
-            for (let i = 0; i < count; i++) map[String(i)] = `外層譯文 ${i}`;
+            const translations = Array.from({ length: count }, (_, i) => ({ id: i, zh: `外層譯文 ${i}` }));
             res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(map) } }] }));
+            res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ translations }) } }] }));
           }
           return;
         }
@@ -751,16 +754,21 @@ export function registerTests(ctx) {
           async ({ page, args }) => {
             await page.goto(`${args.baseUrl}/cache-sandbox.html`, { waitUntil: 'load' });
             return await page.evaluate(async () => {
-              const db = await KCTCacheDB.openDB();
-              const tx = db.transaction(KCTCacheDB.STORE_NAME, 'readonly');
-              const store = tx.objectStore(KCTCacheDB.STORE_NAME);
-              const hasTsIndex = store.indexNames.contains('ts');
-              const keyPath = store.keyPath;
               await KCTCacheDB.clear();
               await KCTCacheDB.putMany([
                 { key: 'sig::a', zh: '測試甲' },
                 { key: 'sig::b', zh: '測試乙' }
               ]);
+              const db = await new Promise((resolve, reject) => {
+                const req = indexedDB.open(KCTCacheDB.DB_NAME);
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => reject(req.error);
+              });
+              const tx = db.transaction(KCTCacheDB.STORE_NAME, 'readonly');
+              const store = tx.objectStore(KCTCacheDB.STORE_NAME);
+              const hasTsIndex = store.indexNames.contains('ts');
+              const keyPath = store.keyPath;
+              db.close();
               const hit = await KCTCacheDB.getMany(['sig::a', 'sig::b', 'sig::missing']);
               const stats = await KCTCacheDB.stats();
               await KCTCacheDB.clear();
@@ -816,7 +824,7 @@ export function registerTests(ctx) {
           res.end();
         } else {
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ '0': '批次 [[C0]] [[M0]] [[L0]]' }) } }] }));
+          res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ translations: [{ id: 0, zh: '批次 [[C0]] [[M0]] [[L0]]' }] }) } }] }));
         }
       });
 
@@ -874,9 +882,10 @@ export function registerTests(ctx) {
                   }
                 }
               },
-              { v1Url: mockLlm.v1Url, nonceVal: nonce }
+              args
             );
-          }
+          },
+          { args: { v1Url: mockLlm.v1Url, nonceVal: nonce } }
         );
 
         assertEqual(capturedPrompts.length, 2, 'Captured both stream and batch prompts');
@@ -961,9 +970,10 @@ export function registerTests(ctx) {
                   }
                 }
               },
-              { v1Url: mockLlm.v1Url, nonceVal: nonce }
+              args
             );
-          }
+          },
+          { args: { v1Url: mockLlm.v1Url, nonceVal: nonce } }
         );
 
         assertEqual(mockLlm.requests.length, 1, 'LLM called exactly once (2nd call served from cache)');
@@ -1001,7 +1011,11 @@ export function registerTests(ctx) {
         }
         pageReqCount++;
         const userMsg = req.body?.messages?.find((m) => m.role === 'user')?.content || '';
-        const matches = userMsg.match(/\[\d+\]/g) || [];
+        let itemCount = 0;
+        try {
+          const parsed = JSON.parse(userMsg);
+          if (Array.isArray(parsed)) itemCount = parsed.length;
+        } catch (_) {}
         if (mode === 'omitSecond' && pageReqCount === 1) {
           // Return only index 0 in stream and omit index 1 everywhere
           if (req.body?.stream) {
@@ -1011,22 +1025,21 @@ export function registerTests(ctx) {
             res.end();
           } else {
             res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ choices: [{ message: { content: '{}' } }] }));
+            res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ translations: [] }) } }] }));
           }
           return;
         }
         if (req.body?.stream) {
           res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
-          for (let i = 0; i < matches.length; i++) {
+          for (let i = 0; i < itemCount; i++) {
             res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: JSON.stringify({ i, t: `補齊譯文 ${i}` }) + '\n' } }] })}\n\n`);
           }
           res.write('data: [DONE]\n\n');
           res.end();
         } else {
-          const out = {};
-          for (let i = 0; i < matches.length; i++) out[String(i)] = `補齊譯文 ${i}`;
+          const translations = Array.from({ length: itemCount }, (_, i) => ({ id: i, zh: `補齊譯文 ${i}` }));
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(out) } }] }));
+          res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ translations }) } }] }));
         }
       });
 
@@ -1087,9 +1100,10 @@ export function registerTests(ctx) {
                   }
                 }
               },
-              { v1Url: mockLlm.v1Url, nonceVal: nonce }
+              args
             );
-          }
+          },
+          { args: { v1Url: mockLlm.v1Url, nonceVal: nonce } }
         );
 
         assertEqual(res1.type, 'ERROR', '401 emits ERROR event');
@@ -1192,7 +1206,18 @@ export function registerTests(ctx) {
           res.end();
         } else {
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ choices: [{ message: { content: '{"0":"批次甲"}\n{"1":"批次乙"}' } }] }));
+          res.end(JSON.stringify({
+            choices: [{
+              message: {
+                content: JSON.stringify({
+                  translations: [
+                    { id: 0, zh: '批次甲' },
+                    { id: 1, zh: '批次乙' }
+                  ]
+                })
+              }
+            }]
+          }));
         }
       });
 
@@ -1258,9 +1283,10 @@ export function registerTests(ctx) {
                   }
                 }
               },
-              { v1Url: mockLlm.v1Url, nonceVal: nonce }
+              args
             );
-          }
+          },
+          { args: { v1Url: mockLlm.v1Url, nonceVal: nonce } }
         );
 
         assertEqual(mockLlm.requests.length, 2, 'Exactly 1 stream request + 1 batch request (zero fallback double-billing)');
@@ -1269,8 +1295,8 @@ export function registerTests(ctx) {
         assertEqual(items.length, 2, 'Pretty-printed multi-object stream emitted 2 unique items');
         assertEqual(done?.translatedCount, 2, 'DONE translatedCount === 2');
         assertEqual(res.batchResp?.ok, true, 'Multi-object batch response succeeded');
-        assertEqual(res.batchResp?.translations?.[`kb1_${nonce}`], '批次甲', 'Multi-object batch item 0');
-        assertEqual(res.batchResp?.translations?.[`kb2_${nonce}`], '批次乙', 'Multi-object batch item 1');
+        assertEqual(res.batchResp?.results?.[`kb1_${nonce}`]?.zh, '批次甲', 'Multi-object batch item 0');
+        assertEqual(res.batchResp?.results?.[`kb2_${nonce}`]?.zh, '批次乙', 'Multi-object batch item 1');
       } finally {
         await mockLlm.close();
       }
@@ -1387,7 +1413,11 @@ export function registerTests(ctx) {
               await KCTCacheDB.getMany(['fresh_key', 'stale_key']);
               await new Promise((r) => setTimeout(r, 450));
 
-              const db = await KCTCacheDB.openDB();
+              const db = await new Promise((resolve, reject) => {
+                const req = indexedDB.open(KCTCacheDB.DB_NAME);
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => reject(req.error);
+              });
               const readRaw = (k) =>
                 new Promise((resolve, reject) => {
                   const tx = db.transaction(KCTCacheDB.STORE_NAME, 'readonly');
@@ -1397,6 +1427,7 @@ export function registerTests(ctx) {
                 });
               const freshRec = await readRaw('fresh_key');
               const staleRec = await readRaw('stale_key');
+              db.close();
               await KCTCacheDB.clear();
               return { freshTs, staleTs, freshAfter: freshRec?.ts, staleAfter: staleRec?.ts };
             });
@@ -1460,9 +1491,10 @@ export function registerTests(ctx) {
                   }
                 }
               },
-              { v1Url: mockLlm.v1Url, nonceVal: nonce }
+              args
             );
-          }
+          },
+          { args: { v1Url: mockLlm.v1Url, nonceVal: nonce } }
         );
 
         assertEqual(resp.ok, false, 'Malformed JSON batch returns ok:false');
@@ -1486,13 +1518,12 @@ export function registerTests(ctx) {
       const mockLlm = await startMockLlmServer((req, res) => {
         if (scenario === 'cancel') {
           res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
-          const t = setTimeout(() => {
+          setTimeout(() => {
             if (!res.writableEnded) {
               res.write('data: [DONE]\n\n');
               res.end();
             }
           }, 4000);
-          req.on('close', () => clearTimeout(t));
           return;
         }
         if (req.body?.stream) {
@@ -1505,7 +1536,7 @@ export function registerTests(ctx) {
           const userMsg = req.body?.messages?.find((m) => m.role === 'user')?.content || '';
           fallbackBodies.push(userMsg);
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ choices: [{ message: { content: '{"0":"補漏次項"}' } }] }));
+          res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ translations: [{ id: 0, zh: '補漏次項' }] }) } }] }));
         }
       });
 
@@ -1563,9 +1594,10 @@ export function registerTests(ctx) {
                   }
                 }
               },
-              { v1Url: mockLlm.v1Url, nonceVal: nonce }
+              args
             );
-          }
+          },
+          { args: { v1Url: mockLlm.v1Url, nonceVal: nonce } }
         );
 
         const items = res.mixedEvents.filter((e) => e.type === 'ITEM' || e.type === 'CHUNK');
@@ -1623,9 +1655,10 @@ export function registerTests(ctx) {
                   }
                 }
               },
-              { v1Url: mockLlm.v1Url, nonceVal: nonce }
+              args
             );
-          }
+          },
+          { args: { v1Url: mockLlm.v1Url, nonceVal: nonce } }
         );
 
         assertEqual(
@@ -1653,14 +1686,14 @@ export function registerTests(ctx) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(
             JSON.stringify({
-              candidates: [{ content: { parts: [{ text: JSON.stringify({ '0': '雙子譯文' }) }] } }]
+              candidates: [{ content: { parts: [{ text: JSON.stringify({ translations: [{ id: 0, zh: '雙子譯文' }] }) }] } }]
             })
           );
         } else {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(
             JSON.stringify({
-              choices: [{ message: { content: JSON.stringify({ '0': '開放譯文' }) } }]
+              choices: [{ message: { content: JSON.stringify({ translations: [{ id: 0, zh: '開放譯文' }] }) } }]
             })
           );
         }
@@ -1713,9 +1746,10 @@ export function registerTests(ctx) {
                   }
                 }
               },
-              { baseUrl: mockLlm.baseUrl, v1Url: mockLlm.v1Url, nonceVal: nonce }
+              args
             );
-          }
+          },
+          { args: { baseUrl: mockLlm.baseUrl, v1Url: mockLlm.v1Url, nonceVal: nonce } }
         );
 
         assertEqual(captured.length, 5, 'All 5 pairwise requests captured');
@@ -1741,7 +1775,7 @@ export function registerTests(ctx) {
       const mockLlm = await startMockLlmServer((req, res) => {
         seq++;
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ '0': `譯文_${seq}` }) } }] }));
+        res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ translations: [{ id: 0, zh: `譯文_${seq}` }] }) } }] }));
       });
 
       const nonce = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
@@ -1780,11 +1814,11 @@ export function registerTests(ctx) {
                   const r4 = await sendWith({ model: 'm-b', targetLang: 'custom', customTargetLang: `L2-${nonceVal}`, customGlossary: 'term1=乙' });
                   const r5 = await sendWith({ model: 'm-b', targetLang: 'custom', customTargetLang: `L2-${nonceVal}`, customGlossary: 'term1=乙' });
                   return {
-                    t1: r1.translations?.[itemKey],
-                    t2: r2.translations?.[itemKey],
-                    t3: r3.translations?.[itemKey],
-                    t4: r4.translations?.[itemKey],
-                    t5: r5.translations?.[itemKey]
+                    t1: r1.results?.[itemKey]?.zh,
+                    t2: r2.results?.[itemKey]?.zh,
+                    t3: r3.results?.[itemKey]?.zh,
+                    t4: r4.results?.[itemKey]?.zh,
+                    t5: r5.results?.[itemKey]?.zh
                   };
                 } finally {
                   if (orig.kct_settings_v1) {
@@ -1794,9 +1828,10 @@ export function registerTests(ctx) {
                   }
                 }
               },
-              { v1Url: mockLlm.v1Url, nonceVal: nonce }
+              args
             );
-          }
+          },
+          { args: { v1Url: mockLlm.v1Url, nonceVal: nonce } }
         );
 
         assertEqual(mockLlm.requests.length, 4, 'model, targetLang, and customGlossary changes each bust cache (4 calls, 5th hits)');
@@ -1840,7 +1875,7 @@ export function registerTests(ctx) {
           return;
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ '0': '重試成功譯文' }) } }] }));
+        res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ translations: [{ id: 0, zh: '重試成功譯文' }] }) } }] }));
       });
 
       const nonce = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
@@ -1878,9 +1913,10 @@ export function registerTests(ctx) {
                   }
                 }
               },
-              { v1Url: mockLlm.v1Url, nonceVal: nonce }
+              args
             );
-          }
+          },
+          { args: { v1Url: mockLlm.v1Url, nonceVal: nonce } }
         );
 
         assertEqual(resDaily.ok, false, 'Daily quota returns ok:false');
@@ -1922,13 +1958,14 @@ export function registerTests(ctx) {
                   }
                 }
               },
-              { v1Url: mockLlm.v1Url, nonceVal: nonce }
+              args
             );
-          }
+          },
+          { args: { v1Url: mockLlm.v1Url, nonceVal: nonce } }
         );
 
         assertEqual(resTransient.ok, true, 'Transient 429 recovers on retry');
-        assertEqual(resTransient.translations?.[`kr_${nonce}`], '重試成功譯文', 'Transient 429 returns translated text');
+        assertEqual(resTransient.results?.[`kr_${nonce}`]?.zh, '重試成功譯文', 'Transient 429 returns translated text');
         assertEqual(mockLlm.requests.length, 2, 'Transient 429 took exactly 2 attempts');
       } finally {
         await mockLlm.close();
@@ -2000,13 +2037,14 @@ export function registerTests(ctx) {
     name: 'docs/nativeread.user.js ==UserScript== header metadata contract',
     usesBrowser: false,
     async run({ repoRoot }) {
+      const manifest = JSON.parse(fs.readFileSync(path.join(repoRoot, 'manifest.json'), 'utf8'));
       const us = fs.readFileSync(path.join(repoRoot, 'docs/nativeread.user.js'), 'utf8');
       const header = us.match(/\/\/ ==UserScript==[\s\S]*?\/\/ ==\/UserScript==/)?.[0] || '';
       assert(header.length > 0, '==UserScript== header block present');
       for (const line of [
         '@name',
         '@namespace    https://chih-kai-wang.github.io/native-read/',
-        '@version      2.2.0',
+        `@version      ${manifest.version}`,
         '@match        *://*/*',
         '@grant        GM_getValue',
         '@grant        GM_setValue',
@@ -2122,7 +2160,7 @@ export function registerTests(ctx) {
         const src = fs.readFileSync(path.join(repoRoot, rel), 'utf8').trim();
         assertIncludes(us, src, `nativeread.user.js embeds up-to-date ${rel}`);
       }
-      const css = fs.readFileSync(path.join(repoRoot, 'content/content.css'), 'utf8').trim();
+      const css = fs.readFileSync(path.join(repoRoot, 'content/content.css'), 'utf8');
       assertIncludes(us, JSON.stringify(css), 'nativeread.user.js embeds up-to-date content/content.css');
     }
   });

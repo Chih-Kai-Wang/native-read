@@ -83,8 +83,12 @@ body {
    Sync Toast Banner
    ============================================================ */
 .nr-sync-banner {
-  position: sticky;
-  top: 0;
+  position: fixed;
+  top: calc(env(safe-area-inset-top) + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(560px, calc(100vw - 24px));
+  border-radius: 12px;
   z-index: 220;
   display: flex;
   align-items: center;
@@ -120,8 +124,9 @@ body {
   position: sticky;
   top: 0;
   z-index: 120;
-  height: var(--nr-header-h);
-  padding: 0 max(14px, env(safe-area-inset-right)) 0 max(14px, env(safe-area-inset-left));
+  min-height: calc(var(--nr-header-h) + env(safe-area-inset-top));
+  height: auto;
+  padding: env(safe-area-inset-top) max(14px, env(safe-area-inset-right)) 0 max(14px, env(safe-area-inset-left));
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -233,6 +238,62 @@ body {
   background-size: 5px 5px, 5px 5px;
   background-repeat: no-repeat;
   max-width: 132px;
+}
+
+.nr-header-provider {
+  max-width: 112px;
+  text-overflow: ellipsis;
+}
+
+@media (max-width: 520px) {
+  .nr-app-header {
+    gap: 6px;
+    padding-left: max(10px, env(safe-area-inset-left));
+    padding-right: max(10px, env(safe-area-inset-right));
+  }
+
+  .nr-header-brand {
+    gap: 6px;
+    flex: 0 1 auto;
+  }
+
+  .nr-brand-tag {
+    display: none;
+  }
+
+  .nr-brand-title {
+    font-size: 13.5px;
+  }
+
+  .nr-header-actions {
+    gap: 4px;
+    flex: 0 1 auto;
+    min-width: 0;
+  }
+
+  .nr-status-pill {
+    max-width: 72px;
+    padding: 3px 6px;
+    font-size: 11px;
+  }
+
+  .nr-header-select {
+    max-width: 78px;
+    font-size: 11px;
+    padding: 4px 16px 4px 6px;
+  }
+
+  .nr-header-provider {
+    max-width: 74px;
+  }
+}
+
+@media (max-width: 640px) {
+  .nr-text-input,
+  .nr-select-full,
+  .nr-textarea {
+    font-size: 16px;
+  }
 }
 
 @keyframes nr-pulse {
@@ -1053,6 +1114,86 @@ body {
 .nr-chip:hover {
   border-color: var(--nr-accent);
   color: var(--nr-accent);
+}
+
+.nr-provider-chip-row {
+  gap: 8px;
+}
+
+.nr-provider-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px 3px 10px;
+  border-radius: 999px;
+  background: var(--nr-bg-subtle);
+  border: 1px solid var(--nr-border-strong);
+  color: var(--nr-text);
+  max-width: 100%;
+}
+
+.nr-provider-chip.active {
+  border-color: var(--nr-accent);
+  box-shadow: 0 0 0 1px var(--nr-accent);
+}
+
+.nr-provider-chip-btn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 0;
+  cursor: pointer;
+}
+
+.nr-provider-chip-meta {
+  font-family: var(--nr-font-mono);
+  font-size: 10.5px;
+  font-weight: 400;
+  color: var(--nr-muted);
+}
+
+.nr-provider-chip-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--nr-accent);
+  color: #ffffff;
+}
+
+.nr-provider-chip-badge.fallback {
+  background: transparent;
+  border: 1px solid var(--nr-border-strong);
+  color: var(--nr-muted);
+}
+
+.nr-provider-chip-remove {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--nr-muted);
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  font-size: 14px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+}
+
+.nr-provider-chip-remove:hover {
+  background: var(--nr-error-soft);
+  color: var(--nr-error);
 }
 
 .nr-settings-actions {

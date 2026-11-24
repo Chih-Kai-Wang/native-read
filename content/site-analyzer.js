@@ -46,7 +46,7 @@
     '.google-symbols',
     '.anchor-link',
     '.jp-InternalAnchorLink',
-    '[contenteditable="true"]'
+    '[contenteditable]:not([contenteditable="false"])'
   ].join(', ');
 
   const NAV_EXCLUDE_SELECTOR = [
@@ -105,7 +105,7 @@
 
   const CHILD_BLOCK_SELECTOR = 'p, h1, h2, h3, h4, h5, h6, li, ul, ol, blockquote, table, td, th, section, article, main, nav, aside, header, footer, form, div, pre, hr, iframe, figure, figcaption, details, summary, dl, dt, dd, fieldset, dialog';
 
-  const LEAF_FORBIDDEN_DESCENDANT_SELECTOR = 'button, input, select, textarea, img, picture, video, audio, canvas, svg, [role="button"], [role="checkbox"], [role="radio"], [role="switch"], [contenteditable="true"], .material-icons, .material-icons-outlined, .material-symbols-outlined, .material-symbols-rounded, .google-symbols';
+  const LEAF_FORBIDDEN_DESCENDANT_SELECTOR = 'button, input, select, textarea, img, picture, video, audio, canvas, svg, [role="button"], [role="checkbox"], [role="radio"], [role="switch"], [contenteditable]:not([contenteditable="false"]), .material-icons, .material-icons-outlined, .material-symbols-outlined, .material-symbols-rounded, .google-symbols';
 
   const LEAF_UI_CONTROL_SELECTOR = 'button, [role="button"], [role="menu"], [role="menuitem"], [role="tab"], time, [datetime]';
 
@@ -1266,7 +1266,7 @@
     '[aria-hidden="true"]',
     '[translate="no"]',
     '.notranslate',
-    '[contenteditable="true"]',
+    '[contenteditable]:not([contenteditable="false"])',
     '[role="button"]',
     '[role="checkbox"]',
     '[role="radio"]',
@@ -1278,7 +1278,7 @@
   // Media whose state or content cannot survive cloneNode (playback, drawing, embedded documents).
   const LIVE_MEDIA_TAGS = new Set(['VIDEO', 'AUDIO', 'CANVAS', 'IFRAME', 'OBJECT', 'EMBED']);
   // Interactive controls: a clone would have no listeners/state, so they are never inside a unit.
-  const LIVE_CONTROL_SELECTOR = 'button, input, select, textarea, [role="button"], [role="checkbox"], [role="radio"], [role="switch"], [contenteditable="true"]';
+  const LIVE_CONTROL_SELECTOR = 'button, input, select, textarea, [role="button"], [role="checkbox"], [role="radio"], [role="switch"], [contenteditable]:not([contenteditable="false"])';
   const ICON_FONT_FIRST_RE = /(?:material\s*(?:icons|symbols)|google\s*symbols|font\s*awesome|fontawesome|icomoon|ionicons|octicons|codicon|bootstrap-icons|glyphicon)/i;
   const FLEX_OR_GRID_RE = /(?:^|\s)(?:inline-)?(?:flex|grid)(?:\s|$)/;
   const CLIP_RECT_RE = /^rect\(\s*([^,)\s]+)[,\s]+([^,)\s]+)[,\s]+([^,)\s]+)[,\s]+([^,)\s]+)\s*\)$/i;

@@ -147,6 +147,16 @@
   const TOKEN_SPLIT_RE = /(\[\[\s*\/?[CMLAS]\d+\s*\]\])/g;
   const TOKEN_MATCH_RE = /^\[\[\s*(\/?)([CMLAS])(\d+)\s*\]\]$/;
 
+  function normalizeBracketTokens(zhText) {
+    return String(zhText || '')
+      .replace(/[［【]{2}\s*(\/?)\s*([cmlasCMLAS])\s*(\d+)\s*[］】]{2}/g, (_, slash, type, id) => {
+        return `[[${slash}${type.toUpperCase()}${id}]]`;
+      })
+      .replace(/\[\[\s*(\/?)([cmlas])(\d+)\s*\]\]/g, (_, slash, type, id) => {
+        return `[[${slash}${type.toUpperCase()}${id}]]`;
+      });
+  }
+
   function stripAllTokens(zhText) {
     return String(zhText || '').replace(/\[\[\s*\/?[CMLAS]\d+\s*\]\]/g, '');
   }
@@ -942,7 +952,8 @@
       origWrap.appendChild(child);
     }
 
-    const validation = validateTranslatedTokens(zh, placeholders);
+    const normalizedZh = normalizeBracketTokens(zh);
+    const validation = validateTranslatedTokens(normalizedZh, placeholders);
     const transWrap = document.createElement('span');
     transWrap.className = 'kct-trans-wrap';
     transWrap.setAttribute('data-kct-ui', 'trans');
@@ -951,11 +962,11 @@
     if (validation.ok) {
       el.removeAttribute('data-kct-structure-fallback');
       if (placeholders instanceof Map) placeholders.clonePairs = [];
-      transWrap.appendChild(buildTranslatedFragment(zh, placeholders));
+      transWrap.appendChild(buildTranslatedFragment(normalizedZh, placeholders));
     } else {
       console.debug('[NativeRead] structure fallback:', validation.reason);
       el.setAttribute('data-kct-structure-fallback', '1');
-      transWrap.appendChild(buildTranslatedFragment(stripAllTokens(zh), null));
+      transWrap.appendChild(buildTranslatedFragment(stripAllTokens(normalizedZh), null));
     }
 
     if (needsInlineInjection(el)) {

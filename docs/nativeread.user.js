@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NativeRead — 原版美感 AI 網頁翻譯 (Mobile & Desktop)
 // @namespace    https://chih-kai-wang.github.io/native-read/
-// @version      2.6.1
+// @version      2.8.0
 // @description  保留原網站 Serif / Sans 排版氣質的 AI 串流網頁與程式碼註解翻譯器（支援 iOS Safari Stay / Userscripts 與 Android Tampermonkey / 狐猴 / Kiwi）
 // @author       Chih-Kai Wang
 // @homepageURL  https://github.com/Chih-Kai-Wang/native-read
@@ -11,6 +11,8 @@
 // @match        *://*/*
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM.getValue
+// @grant        GM.setValue
 // @grant        GM_xmlhttpRequest
 // @grant        GM.xmlHttpRequest
 // @connect      *
@@ -77,6 +79,7 @@
       defaultModel: 'google/gemini-2.5-flash',
       suggestedModels: ['google/gemini-2.5-flash'],
       placeholderKey: 'sk-or-...',
+      publicModelList: true,
       hint: '聚合數百個模型，模型清單不需金鑰即可查詢。'
     },
     groq: {
@@ -154,6 +157,7 @@
       defaultModel: '',
       suggestedModels: [],
       placeholderKey: '...',
+      publicModelList: true,
       hint: '開源模型託管；模型清單不需金鑰即可查詢。'
     },
     huggingface: {
@@ -165,6 +169,7 @@
       defaultModel: '',
       suggestedModels: [],
       placeholderKey: 'hf_...',
+      publicModelList: true,
       hint: '使用 Hugging Face Token；模型清單不需金鑰即可查詢。'
     },
     novita: {
@@ -176,6 +181,7 @@
       defaultModel: '',
       suggestedModels: [],
       placeholderKey: '...',
+      publicModelList: true,
       hint: '開源模型託管；模型清單不需金鑰即可查詢。'
     },
     deepseek: {
@@ -507,7 +513,7 @@
     'hyperparameter -> 超參數'
   ].join('\n');
 
-  const CURRENT_SCHEMA_VERSION = 5;
+  const CURRENT_SCHEMA_VERSION = 6;
 
   const DEFAULT_SETTINGS = {
     settingsSchemaVersion: CURRENT_SCHEMA_VERSION,
@@ -532,6 +538,8 @@
     baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
     apiKey: '',
     model: 'gemini-3.5-flash-lite',
+    providerProfiles: {},
+    fallbackProviderId: '',
     temperature: 0.2,
     batchSize: 20,
     maxBatchChars: 5500,
@@ -559,27 +567,56 @@
   }
 
   function normalizeOpenAIEndpoint(baseUrl) {
-    const clean = String(baseUrl || '').trim().replace(/\/+$/, '');
-    if (!clean) return '';
-    if (clean.endsWith('/chat/completions')) return clean;
-    if (/\/(v\d+|openai|compatible-mode\/v1|api\/paas\/v\d+)$/i.test(clean)) {
-      return `${clean}/chat/completions`;
+    const raw = String(baseUrl || '').trim();
+    if (!raw) return '';
+    let parsed;
+    try {
+      parsed = new URL(raw);
+    } catch (_) {
+      return '';
     }
-    return `${clean}/v1/chat/completions`;
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return '';
+    }
+    const pathname = parsed.pathname.replace(/\/+$/, '');
+    if (/\/chat\/completions$/i.test(pathname)) {
+      parsed.pathname = pathname;
+      return parsed.toString();
+    }
+    if (/\/(v\d+|openai|compatible-mode\/v1|api\/paas\/v\d+|openai\/deployments\/[^/]+)$/i.test(pathname) || (isAzureOpenAIEndpoint(raw) && pathname && pathname !== '/')) {
+      parsed.pathname = `${pathname}/chat/completions`;
+    } else {
+      parsed.pathname = `${pathname}/v1/chat/completions`;
+    }
+    return parsed.toString();
   }
 
   function normalizeGeminiEndpoint(baseUrl, model) {
-    const clean = String(baseUrl || 'https://generativelanguage.googleapis.com/v1beta')
-      .trim()
-      .replace(/\/+$/, '');
-    const m = String(model || 'gemini-2.5-flash').trim().replace(/^models\//, '');
-    if (clean.includes(':generateContent') || clean.includes(':streamGenerateContent')) {
-      return clean;
+    const raw = String(baseUrl || '').trim() || 'https://generativelanguage.googleapis.com/v1beta';
+    let parsed;
+    try {
+      parsed = new URL(raw);
+    } catch (_) {
+      return '';
     }
-    if (/\/v1(beta)?$/i.test(clean)) {
-      return `${clean}/models/${encodeURIComponent(m)}:generateContent`;
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return '';
     }
-    return `${clean}/v1beta/models/${encodeURIComponent(m)}:generateContent`;
+    const pathname = parsed.pathname.replace(/\/+$/, '');
+    if (/:(?:stream)?generateContent$/i.test(pathname)) {
+      parsed.pathname = pathname;
+      return parsed.toString();
+    }
+    const m = String(model ?? '').trim().replace(/^models\//i, '');
+    if (!m) return '';
+    if (/\/v1(?:alpha|beta)?\/models$/i.test(pathname)) {
+      parsed.pathname = `${pathname}/${encodeURIComponent(m)}:generateContent`;
+    } else if (/\/v1(?:alpha|beta)?$/i.test(pathname)) {
+      parsed.pathname = `${pathname}/models/${encodeURIComponent(m)}:generateContent`;
+    } else {
+      parsed.pathname = `${pathname}/v1beta/models/${encodeURIComponent(m)}:generateContent`;
+    }
+    return parsed.toString();
   }
 
   function isAzureOpenAIEndpoint(baseUrl) {
@@ -609,16 +646,29 @@
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
       return '';
     }
-    const clean = parsed.toString().replace(/\/+$/, '');
-    if (clean.endsWith('/v1/messages')) return clean;
-    if (clean.endsWith('/v1')) return `${clean}/messages`;
-    return `${clean}/v1/messages`;
+    const pathname = parsed.pathname.replace(/\/+$/, '');
+    if (/\/v1\/messages$/i.test(pathname)) {
+      parsed.pathname = pathname;
+    } else if (/\/v1$/i.test(pathname)) {
+      parsed.pathname = `${pathname}/messages`;
+    } else {
+      parsed.pathname = `${pathname}/v1/messages`;
+    }
+    return parsed.toString();
   }
 
   function buildProviderAuthHeaders(settings, cleanKey) {
     const headers = { 'Content-Type': 'application/json' };
     const protocol = settings?.protocol || 'openai';
-    const key = String(cleanKey || '').trim();
+    const check = validateApiKey(cleanKey);
+    if (!check.ok) {
+      const err = new Error(check.error);
+      err.errorCode = 'INVALID_API_KEY_CHARS';
+      err.noRetry = true;
+      err.noSplit = true;
+      throw err;
+    }
+    const key = check.cleanKey;
 
     if (protocol === 'gemini') {
       if (key) headers['x-goog-api-key'] = key;
@@ -806,45 +856,53 @@
 
     try {
       if (protocol === 'gemini') {
-        let base = (rawBase || 'https://generativelanguage.googleapis.com/v1beta')
+        const parsed = new URL(rawBase || 'https://generativelanguage.googleapis.com/v1beta');
+        if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return '';
+        let pathname = parsed.pathname
           .replace(/\/+$/, '')
           .replace(/\/models\/[^/?#]+$/i, '')
           .replace(/\/models$/i, '')
           .replace(/\/+$/, '');
-        if (!/\/v1(beta)?$/i.test(base)) {
-          base = `${base}/v1beta`;
+        if (!/\/v1(?:alpha|beta)?$/i.test(pathname)) {
+          pathname = `${pathname}/v1beta`;
         }
-        const u = new URL(`${base}/models`);
-        if (u.protocol !== 'https:' && u.protocol !== 'http:') return '';
-        u.searchParams.set('pageSize', '1000');
+        parsed.pathname = `${pathname}/models`;
+        parsed.searchParams.set('pageSize', '1000');
         if (pageToken) {
-          u.searchParams.set('pageToken', String(pageToken));
+          parsed.searchParams.set('pageToken', String(pageToken));
         }
-        return u.toString();
+        return parsed.toString();
       }
 
       if (protocol === 'anthropic') {
-        const base = rawBase || 'https://api.anthropic.com/v1';
-        const parsed = new URL(base);
+        const parsed = new URL(rawBase || 'https://api.anthropic.com/v1');
         if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return '';
-        const u = new URL(`${parsed.origin}/v1/models`);
-        u.searchParams.set('limit', '1000');
+        const pathname = parsed.pathname
+          .replace(/\/+$/, '')
+          .replace(/\/messages$/i, '')
+          .replace(/\/models$/i, '')
+          .replace(/\/+$/, '');
+        parsed.pathname = /\/v1$/i.test(pathname) ? `${pathname}/models` : `${pathname}/v1/models`;
+        parsed.searchParams.set('limit', '1000');
         if (pageToken) {
-          u.searchParams.set('after_id', String(pageToken));
+          parsed.searchParams.set('after_id', String(pageToken));
         }
-        return u.toString();
+        return parsed.toString();
       }
 
       if (protocol === 'openai') {
         if (!rawBase) return '';
-        const base = rawBase
+        const parsed = new URL(rawBase);
+        if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return '';
+        const pathname = parsed.pathname
           .replace(/\/+$/, '')
           .replace(/\/chat\/completions$/i, '')
+          .replace(/\/models$/i, '')
           .replace(/\/+$/, '');
-        if (!base) return '';
-        const u = new URL(`${base}/models`);
-        if (u.protocol !== 'https:' && u.protocol !== 'http:') return '';
-        return u.toString();
+        parsed.pathname = /\/(v\d+|openai|compatible-mode\/v1|api\/paas\/v\d+|openai\/deployments\/[^/]+)$/i.test(pathname) || (isAzureOpenAIEndpoint(rawBase) && pathname && pathname !== '/')
+          ? `${pathname}/models`
+          : `${pathname}/v1/models`;
+        return parsed.toString();
       }
     } catch {
       return '';
@@ -1013,14 +1071,16 @@
       return false;
     }
     const host = parsed.hostname.toLowerCase();
+    const pathname = (parsed.pathname || '').toLowerCase();
     if (host === 'chromewebstore.google.com') return false;
-    if (host === 'chrome.google.com' && parsed.pathname.startsWith('/webstore')) return false;
-    if (host === 'microsoftedge.microsoft.com' && parsed.pathname.startsWith('/addons')) return false;
+    if (host === 'addons.mozilla.org') return false;
+    if (host === 'chrome.google.com' && pathname.startsWith('/webstore')) return false;
+    if (host === 'microsoftedge.microsoft.com' && pathname.startsWith('/addons')) return false;
     return true;
   }
 
   function isLocalEndpoint(baseUrl) {
-    return /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?(\/|$)/i.test(String(baseUrl || '').trim());
+    return /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d+)?(\/|$)/i.test(String(baseUrl || '').trim());
   }
 
   const EXTENSIONLESS_PDF_HOSTS = new Set([
@@ -1073,6 +1133,7 @@
     }
     if (/\.pdf$/i.test(pathname)) return true;
     if (EXTENSIONLESS_PDF_HOSTS.has(host) && /^\/pdf\/[^/]+/i.test(pathname)) return true;
+    if (host === 'openreview.net' && /^\/pdf\/?$/i.test(pathname) && parsed.searchParams.has('id')) return true;
     for (const [k, v] of parsed.searchParams.entries()) {
       if (k.toLowerCase() === 'format' && v.toLowerCase() === 'pdf') return true;
     }
@@ -1112,17 +1173,17 @@
 
   async function getSettings() {
     if (!chrome?.runtime?.id) {
-      return { ...DEFAULT_SETTINGS, autoTranslateHosts: [] };
+      return { ...DEFAULT_SETTINGS, autoTranslateHosts: [], providerProfiles: {} };
     }
     let data;
     try {
       data = await chrome.storage.local.get(SETTINGS_KEY);
     } catch (_) {
-      return { ...DEFAULT_SETTINGS, autoTranslateHosts: [] };
+      return { ...DEFAULT_SETTINGS, autoTranslateHosts: [], providerProfiles: {} };
     }
     const raw = data[SETTINGS_KEY];
     if (!raw) {
-      return { ...DEFAULT_SETTINGS, autoTranslateHosts: [] };
+      return { ...DEFAULT_SETTINGS, autoTranslateHosts: [], providerProfiles: {} };
     }
     const ver = raw.settingsSchemaVersion || 1;
     if (ver < CURRENT_SCHEMA_VERSION) {
@@ -1138,7 +1199,11 @@
             : raw.customGlossary
         };
       }
-      migrated.autoTranslate = false;
+      if (ver < 5) {
+        migrated.autoTranslate = false;
+      } else {
+        migrated.autoTranslate = Boolean(raw.autoTranslate);
+      }
       migrated.autoTranslateHosts = Array.isArray(raw.autoTranslateHosts)
         ? raw.autoTranslateHosts.map(normalizeHostname).filter(Boolean)
         : [];
@@ -1146,12 +1211,18 @@
       migrated.streamTranslation = raw.streamTranslation ?? true;
       migrated.thinkingEffort = raw.thinkingEffort || 'fastest';
       migrated.typographyMatch = raw.typographyMatch || 'native';
-      migrated.batchSize = (!raw.batchSize || raw.batchSize === 8 || raw.batchSize === 16 || raw.batchSize === 24)
-        ? 20
-        : raw.batchSize;
-      migrated.maxBatchChars = (!raw.maxBatchChars || raw.maxBatchChars === 1800 || raw.maxBatchChars === 4500 || raw.maxBatchChars === 6500)
-        ? 5500
-        : raw.maxBatchChars;
+      if (ver < 4) {
+        migrated.batchSize = (!raw.batchSize || raw.batchSize === 8 || raw.batchSize === 16 || raw.batchSize === 24)
+          ? 20
+          : raw.batchSize;
+        migrated.maxBatchChars = (!raw.maxBatchChars || raw.maxBatchChars === 1800 || raw.maxBatchChars === 4500 || raw.maxBatchChars === 6500)
+          ? 5500
+          : raw.maxBatchChars;
+      }
+      migrated.apiKey = sanitizeApiKey(migrated.apiKey);
+      migrated.providerProfiles = normalizeProviderProfiles(raw.providerProfiles, migrated);
+      const rawFb = String(raw.fallbackProviderId || '').trim();
+      migrated.fallbackProviderId = rawFb === migrated.providerId ? '' : rawFb;
       migrated.settingsSchemaVersion = CURRENT_SCHEMA_VERSION;
       try {
         await chrome.storage.local.set({ [SETTINGS_KEY]: migrated });
@@ -1160,31 +1231,57 @@
       }
       return migrated;
     }
-    return {
+    const normalized = {
       ...DEFAULT_SETTINGS,
       ...raw,
+      apiKey: sanitizeApiKey(raw.apiKey),
       autoTranslateHosts: Array.isArray(raw.autoTranslateHosts)
         ? raw.autoTranslateHosts.map(normalizeHostname).filter(Boolean)
-        : []
+        : [],
+      fallbackProviderId: String(raw.fallbackProviderId || '').trim()
     };
+    if (normalized.fallbackProviderId === normalized.providerId) {
+      normalized.fallbackProviderId = '';
+    }
+    normalized.providerProfiles = normalizeProviderProfiles(raw.providerProfiles, normalized);
+    return normalized;
   }
 
-  async function saveSettings(partial) {
-    const current = await getSettings();
-    const next = {
-      ...current,
-      ...partial,
-      settingsSchemaVersion: CURRENT_SCHEMA_VERSION
-    };
-    if (Array.isArray(next.autoTranslateHosts)) {
-      next.autoTranslateHosts = Array.from(
-        new Set(next.autoTranslateHosts.map(normalizeHostname).filter(Boolean))
-      );
-    } else {
-      next.autoTranslateHosts = [];
-    }
-    await chrome.storage.local.set({ [SETTINGS_KEY]: next });
-    return next;
+  let settingsSaveChain = Promise.resolve();
+
+  function saveSettings(partial) {
+    const run = settingsSaveChain.then(async () => {
+      const current = await getSettings();
+      const hasExplicitProfiles =
+        Boolean(partial) &&
+        typeof partial.providerProfiles === 'object' &&
+        partial.providerProfiles !== null &&
+        !Array.isArray(partial.providerProfiles);
+      const baseProfiles = hasExplicitProfiles ? partial.providerProfiles : current.providerProfiles;
+      const next = {
+        ...current,
+        ...(partial && typeof partial === 'object' ? partial : {}),
+        providerProfiles: baseProfiles,
+        settingsSchemaVersion: CURRENT_SCHEMA_VERSION
+      };
+      next.apiKey = sanitizeApiKey(next.apiKey);
+      if (Array.isArray(next.autoTranslateHosts)) {
+        next.autoTranslateHosts = Array.from(
+          new Set(next.autoTranslateHosts.map(normalizeHostname).filter(Boolean))
+        );
+      } else {
+        next.autoTranslateHosts = [];
+      }
+      next.fallbackProviderId = String(next.fallbackProviderId || '').trim();
+      if (next.fallbackProviderId === next.providerId) {
+        next.fallbackProviderId = '';
+      }
+      next.providerProfiles = normalizeProviderProfiles(next.providerProfiles, next);
+      await chrome.storage.local.set({ [SETTINGS_KEY]: next });
+      return next;
+    });
+    settingsSaveChain = run.catch(() => {});
+    return run;
   }
 
   function hashText(str) {
@@ -1203,9 +1300,356 @@
 
   function sanitizeApiKey(rawKey) {
     return String(rawKey || '')
+      .replace(/[\u200B-\u200D\uFEFF\r\n\t]+/g, '')
       .trim()
       .replace(/^Bearer\s+/i, '')
       .trim();
+  }
+
+  function validateApiKey(rawKey) {
+    const cleanKey = sanitizeApiKey(rawKey);
+    if (!cleanKey) return { ok: true, cleanKey: '', error: '' };
+    if (!/^[\x21-\x7E]+$/.test(cleanKey)) {
+      return {
+        ok: false,
+        cleanKey,
+        error: 'API Key 格式錯誤：包含空白、不可見字元或非 ASCII 字元，請重新複製純金鑰。'
+      };
+    }
+    return { ok: true, cleanKey, error: '' };
+  }
+
+  function normalizeProviderProfiles(rawProfiles, activeSettings = null) {
+    const out = {};
+    if (rawProfiles && typeof rawProfiles === 'object' && !Array.isArray(rawProfiles)) {
+      for (const [id, entry] of Object.entries(rawProfiles)) {
+        const pid = String(id || '').trim();
+        if (!pid || !entry || typeof entry !== 'object') continue;
+        const preset = PROVIDER_PRESETS[pid] || null;
+        const cleanEntry = {
+          protocol: String(entry.protocol || preset?.protocol || 'openai').trim(),
+          baseUrl: String(entry.baseUrl ?? preset?.baseUrl ?? '').trim(),
+          apiKey: sanitizeApiKey(entry.apiKey),
+          model: String(entry.model ?? preset?.defaultModel ?? '').trim(),
+          thinkingEffort: String(entry.thinkingEffort || 'fastest').trim()
+        };
+        if (isProfileSaved(pid, cleanEntry)) {
+          out[pid] = cleanEntry;
+        }
+      }
+    }
+    const activeId = String(activeSettings?.providerId || '').trim();
+    if (activeId) {
+      const preset = PROVIDER_PRESETS[activeId] || null;
+      const cleanKey = sanitizeApiKey(activeSettings.apiKey);
+      const activeUrl = String(activeSettings.baseUrl ?? preset?.baseUrl ?? '').trim();
+      const activeModel = String(activeSettings.model ?? preset?.defaultModel ?? out[activeId]?.model ?? '').trim();
+      const candidate = {
+        protocol: String(activeSettings.protocol || preset?.protocol || out[activeId]?.protocol || 'openai').trim(),
+        baseUrl: activeUrl,
+        apiKey: cleanKey,
+        model: activeModel,
+        thinkingEffort: String(activeSettings.thinkingEffort || out[activeId]?.thinkingEffort || 'fastest').trim()
+      };
+      if (isProfileSaved(activeId, candidate) || Object.prototype.hasOwnProperty.call(out, activeId)) {
+        out[activeId] = candidate;
+      }
+    }
+    return out;
+  }
+
+  function isProfileSaved(providerId, profile) {
+    if (!profile || typeof profile !== 'object') return false;
+    if (sanitizeApiKey(profile.apiKey)) return true;
+    const rawUrl = profile.baseUrl !== undefined ? profile.baseUrl : (PROVIDER_PRESETS[providerId]?.baseUrl || '');
+    const url = String(rawUrl || '').trim();
+    const model = String(profile.model || '').trim();
+    if (isLocalEndpoint(url) && model) return true;
+    if (providerId === 'custom' && url && model) return true;
+    return false;
+  }
+
+  function isProfileReady(providerId, profile) {
+    if (!isProfileSaved(providerId, profile)) return false;
+    const rawUrl = profile.baseUrl !== undefined ? profile.baseUrl : (PROVIDER_PRESETS[providerId]?.baseUrl || '');
+    const url = String(rawUrl || '').trim();
+    const model = String(profile?.model || PROVIDER_PRESETS[providerId]?.defaultModel || '').trim();
+    const hasKey = Boolean(sanitizeApiKey(profile?.apiKey));
+    return Boolean(model) && (hasKey || isLocalEndpoint(url));
+  }
+
+  function listSavedProviders(settings) {
+    const profiles = normalizeProviderProfiles(settings?.providerProfiles, settings);
+    const activeId = String(settings?.providerId || '').trim();
+    const fallbackId = String(settings?.fallbackProviderId || '').trim();
+    const seen = new Set();
+    const orderedIds = [];
+    if (activeId) {
+      orderedIds.push(activeId);
+      seen.add(activeId);
+    }
+    for (const presetId of Object.keys(PROVIDER_PRESETS)) {
+      if (!seen.has(presetId) && profiles[presetId] && isProfileSaved(presetId, profiles[presetId])) {
+        orderedIds.push(presetId);
+        seen.add(presetId);
+      }
+    }
+    for (const pid of Object.keys(profiles)) {
+      if (!seen.has(pid) && isProfileSaved(pid, profiles[pid])) {
+        orderedIds.push(pid);
+        seen.add(pid);
+      }
+    }
+    return orderedIds.map((pid) => {
+      const preset = PROVIDER_PRESETS[pid] || null;
+      const prof = (pid === activeId)
+        ? {
+            protocol: settings?.protocol || preset?.protocol || 'openai',
+            baseUrl: settings?.baseUrl ?? preset?.baseUrl ?? '',
+            apiKey: sanitizeApiKey(settings?.apiKey),
+            model: settings?.model ?? preset?.defaultModel ?? '',
+            thinkingEffort: settings?.thinkingEffort || 'fastest'
+          }
+        : (profiles[pid] || {});
+      const rawUrl = prof.baseUrl !== undefined ? prof.baseUrl : (preset?.baseUrl || '');
+      const url = String(rawUrl || '').trim();
+      const hasKey = Boolean(sanitizeApiKey(prof.apiKey));
+      const local = isLocalEndpoint(url);
+      const model = String(prof.model || '').trim();
+      const isReady = isProfileReady(pid, { ...prof, baseUrl: url, model });
+      return {
+        providerId: pid,
+        label: preset?.label || pid,
+        model,
+        protocol: prof.protocol || preset?.protocol || 'openai',
+        baseUrl: url,
+        hasKey,
+        isLocal: local,
+        isReady,
+        isActive: pid === activeId,
+        isFallback: Boolean(fallbackId && pid === fallbackId && pid !== activeId)
+      };
+    });
+  }
+
+  function switchActiveProviderSettings(settings, targetProviderId) {
+    const cur = settings && typeof settings === 'object' ? settings : { ...DEFAULT_SETTINGS };
+    const targetId = String(targetProviderId || '').trim();
+    if (!targetId) return { ...cur };
+    const targetPreset = PROVIDER_PRESETS[targetId] || null;
+    const nextProfiles = normalizeProviderProfiles(cur.providerProfiles, null);
+    const curId = String(cur.providerId || '').trim();
+    if (curId) {
+      const curPreset = PROVIDER_PRESETS[curId] || null;
+      const curKey = sanitizeApiKey(cur.apiKey);
+      const curUrl = String(cur.baseUrl ?? curPreset?.baseUrl ?? '').trim();
+      const curModel = String(cur.model || '').trim();
+      const isNonDefaultModel = Boolean(curModel && curModel !== (curPreset?.defaultModel || ''));
+      if (curKey || (isLocalEndpoint(curUrl) && curModel) || isNonDefaultModel || Object.prototype.hasOwnProperty.call(nextProfiles, curId)) {
+        nextProfiles[curId] = {
+          protocol: String(cur.protocol || curPreset?.protocol || 'openai').trim(),
+          baseUrl: curUrl,
+          apiKey: curKey,
+          model: curModel,
+          thinkingEffort: String(cur.thinkingEffort || 'fastest').trim()
+        };
+      }
+    }
+    const savedTarget = nextProfiles[targetId] || null;
+    return {
+      ...cur,
+      providerId: targetId,
+      protocol: savedTarget?.protocol || targetPreset?.protocol || cur.protocol || 'openai',
+      baseUrl: savedTarget?.baseUrl || targetPreset?.baseUrl || '',
+      apiKey: savedTarget ? sanitizeApiKey(savedTarget.apiKey) : '',
+      model: savedTarget?.model || targetPreset?.defaultModel || '',
+      thinkingEffort: savedTarget?.thinkingEffort || cur.thinkingEffort || 'fastest',
+      providerProfiles: nextProfiles,
+      fallbackProviderId: cur.fallbackProviderId === targetId ? '' : String(cur.fallbackProviderId || '')
+    };
+  }
+
+  function removeProviderProfile(settings, providerId) {
+    const cur = settings && typeof settings === 'object' ? settings : { ...DEFAULT_SETTINGS };
+    const targetId = String(providerId || '').trim();
+    const curId = String(cur.providerId || '').trim();
+    const nextProfiles = normalizeProviderProfiles(cur.providerProfiles, cur);
+    if (!targetId || targetId === curId) {
+      return {
+        ...cur,
+        providerProfiles: nextProfiles
+      };
+    }
+    delete nextProfiles[targetId];
+    return {
+      ...cur,
+      providerProfiles: nextProfiles,
+      fallbackProviderId: cur.fallbackProviderId === targetId ? '' : String(cur.fallbackProviderId || '')
+    };
+  }
+
+  function resolveFallbackSettings(settings) {
+    const fbId = String(settings?.fallbackProviderId || '').trim();
+    const curId = String(settings?.providerId || '').trim();
+    if (!fbId || fbId === curId) return null;
+    const prof = settings?.providerProfiles?.[fbId];
+    if (!isProfileReady(fbId, prof)) return null;
+    const preset = PROVIDER_PRESETS[fbId] || null;
+    return {
+      ...settings,
+      providerId: fbId,
+      protocol: String(prof.protocol || preset?.protocol || 'openai').trim(),
+      baseUrl: String(prof.baseUrl || preset?.baseUrl || '').trim(),
+      apiKey: sanitizeApiKey(prof.apiKey),
+      model: String(prof.model || preset?.defaultModel || '').trim(),
+      thinkingEffort: String(prof.thinkingEffort || settings?.thinkingEffort || 'fastest').trim(),
+      fallbackProviderId: ''
+    };
+  }
+
+  function formatApiError(errOrMsg, httpStatus = 0, errorCode = '') {
+    const rawMsg = (
+      typeof errOrMsg === 'string'
+        ? errOrMsg
+        : (errOrMsg?.message || String(errOrMsg || ''))
+    ).replace(/\s+/g, ' ').trim();
+    let status = Number(httpStatus || (typeof errOrMsg === 'object' && errOrMsg?.httpStatus) || 0);
+    if (!status && rawMsg) {
+      const m = rawMsg.match(/\bHTTP(?:_|\s+)(\d{3})\b/i);
+      if (m) status = Number(m[1]);
+    }
+    const code = String(errorCode || (typeof errOrMsg === 'object' && errOrMsg?.errorCode) || '').trim();
+
+    if (code === 'INVALID_API_KEY_CHARS' || /API Key 格式錯誤|non ISO-8859-1|Invalid header value/i.test(rawMsg)) {
+      return {
+        shortMsg: 'API Key 格式有誤',
+        detailMsg: 'API Key 含有不可見字元或非英文 ASCII 符號，請重新複製純金鑰並儲存',
+        rawMsg,
+        retryable: false,
+        suggestSwitch: true
+      };
+    }
+
+    if (code === 'NO_API_KEY' || /尚未設定.*API Key/i.test(rawMsg)) {
+      return {
+        shortMsg: '尚未設定 API Key',
+        detailMsg: '尚未設定 API Key，請先填寫金鑰或切換其他已設定的供應商',
+        rawMsg,
+        retryable: false,
+        suggestSwitch: true
+      };
+    }
+
+    if (code === 'NO_MODEL' || /尚未選擇模型/i.test(rawMsg)) {
+      return {
+        shortMsg: '尚未選擇模型',
+        detailMsg: rawMsg || '尚未選擇模型，請先至設定頁選擇模型',
+        rawMsg,
+        retryable: false,
+        suggestSwitch: false
+      };
+    }
+
+    if (status === 401 || status === 403 || code === 'AUTH_ERROR' || code === 'HTTP_401' || code === 'HTTP_403') {
+      const displayStatus = status || (code === 'HTTP_403' ? 403 : 401);
+      return {
+        shortMsg: 'API Key 驗證失敗',
+        detailMsg: `API Key 無效或無存取權限（HTTP ${displayStatus}），請檢查金鑰設定`,
+        rawMsg,
+        retryable: false,
+        suggestSwitch: true
+      };
+    }
+
+    if (status === 404 || code === 'HTTP_404') {
+      return {
+        shortMsg: '模型不存在 (404)',
+        detailMsg: '找不到指定模型（HTTP 404），請至設定重新取得模型清單',
+        rawMsg,
+        retryable: false,
+        suggestSwitch: true
+      };
+    }
+
+    if (
+      status === 429 ||
+      code === 'QUOTA_EXCEEDED' ||
+      code === 'RATE_LIMITED' ||
+      code === 'RATE_LIMIT' ||
+      /rate limit|PerDay|RequestsPerDay|GenerateRequestsPerDay/i.test(rawMsg)
+    ) {
+      if (
+        code === 'QUOTA_EXCEEDED' ||
+        /PerDay|RequestsPerDay|GenerateRequestsPerDay|每日.*額度|配額上限|額度已用盡|配額為 0|quota/i.test(rawMsg)
+      ) {
+        return {
+          shortMsg: '每日額度已用盡 (429)',
+          detailMsg: '已達此供應商配額上限（HTTP 429），建議切換其他供應商或模型',
+          rawMsg,
+          retryable: false,
+          suggestSwitch: true
+        };
+      }
+      return {
+        shortMsg: '請求過頻 (429)',
+        detailMsg: 'API 請求頻率達上限（HTTP 429），請稍候重試或切換供應商',
+        rawMsg,
+        retryable: true,
+        suggestSwitch: true
+      };
+    }
+
+    const noExplicitStatusOrOverload = !status || status === 503 || status === 529;
+    if (
+      status === 503 ||
+      status === 529 ||
+      code === 'OVERLOADED' ||
+      (noExplicitStatusOrOverload && /high demand|overloaded|UNAVAILABLE|capacity|temporarily unavailable/i.test(rawMsg))
+    ) {
+      const displayStatus = status === 529 ? 529 : 503;
+      return {
+        shortMsg: `模型尖峰過載 (${displayStatus})`,
+        detailMsg: `目前模型流量過載（HTTP ${displayStatus}），可重試或立即切換其他供應商`,
+        rawMsg,
+        retryable: true,
+        suggestSwitch: true
+      };
+    }
+
+    if (status === 500 || status === 502 || status === 504 || code === 'SERVER_ERROR') {
+      const displayStatus = status || 500;
+      return {
+        shortMsg: `服務暫時異常 (${displayStatus})`,
+        detailMsg: `AI 服務端暫時異常（HTTP ${displayStatus}），可重試或切換供應商`,
+        rawMsg,
+        retryable: true,
+        suggestSwitch: true
+      };
+    }
+
+    if (code === 'TIMEOUT' || code === 'NETWORK_ERROR' || /timeout|timed out|逾時|failed to fetch|networkerror|load failed/i.test(rawMsg)) {
+      return {
+        shortMsg: '連線逾時或網路異常',
+        detailMsg: rawMsg || '請求逾時或網路連線失敗，可重試或切換其他供應商',
+        rawMsg,
+        retryable: true,
+        suggestSwitch: true
+      };
+    }
+
+    const fallbackShort = rawMsg
+      ? (rawMsg.length > 22 ? `${rawMsg.slice(0, 21)}…` : rawMsg)
+      : '翻譯失敗';
+    const fallbackDetail = rawMsg
+      ? (rawMsg.length > 90 ? `${rawMsg.slice(0, 89)}…` : rawMsg)
+      : '翻譯失敗，請稍後重試或切換供應商';
+    return {
+      shortMsg: fallbackShort,
+      detailMsg: fallbackDetail,
+      rawMsg,
+      retryable: true,
+      suggestSwitch: true
+    };
   }
 
   globalThis.KCTConfig = {
@@ -1242,6 +1686,15 @@
     extractAnthropicStreamDelta,
     isLocalEndpoint,
     sanitizeApiKey,
+    validateApiKey,
+    normalizeProviderProfiles,
+    isProfileSaved,
+    isProfileReady,
+    listSavedProviders,
+    switchActiveProviderSettings,
+    removeProviderProfile,
+    resolveFallbackSettings,
+    formatApiError,
     getSettings,
     saveSettings,
     hashText
@@ -1296,7 +1749,7 @@
     '.google-symbols',
     '.anchor-link',
     '.jp-InternalAnchorLink',
-    '[contenteditable="true"]'
+    '[contenteditable]:not([contenteditable="false"])'
   ].join(', ');
 
   const NAV_EXCLUDE_SELECTOR = [
@@ -1355,7 +1808,7 @@
 
   const CHILD_BLOCK_SELECTOR = 'p, h1, h2, h3, h4, h5, h6, li, ul, ol, blockquote, table, td, th, section, article, main, nav, aside, header, footer, form, div, pre, hr, iframe, figure, figcaption, details, summary, dl, dt, dd, fieldset, dialog';
 
-  const LEAF_FORBIDDEN_DESCENDANT_SELECTOR = 'button, input, select, textarea, img, picture, video, audio, canvas, svg, [role="button"], [role="checkbox"], [role="radio"], [role="switch"], [contenteditable="true"], .material-icons, .material-icons-outlined, .material-symbols-outlined, .material-symbols-rounded, .google-symbols';
+  const LEAF_FORBIDDEN_DESCENDANT_SELECTOR = 'button, input, select, textarea, img, picture, video, audio, canvas, svg, [role="button"], [role="checkbox"], [role="radio"], [role="switch"], [contenteditable]:not([contenteditable="false"]), .material-icons, .material-icons-outlined, .material-symbols-outlined, .material-symbols-rounded, .google-symbols';
 
   const LEAF_UI_CONTROL_SELECTOR = 'button, [role="button"], [role="menu"], [role="menuitem"], [role="tab"], time, [datetime]';
 
@@ -2516,7 +2969,7 @@
     '[aria-hidden="true"]',
     '[translate="no"]',
     '.notranslate',
-    '[contenteditable="true"]',
+    '[contenteditable]:not([contenteditable="false"])',
     '[role="button"]',
     '[role="checkbox"]',
     '[role="radio"]',
@@ -2528,7 +2981,7 @@
   // Media whose state or content cannot survive cloneNode (playback, drawing, embedded documents).
   const LIVE_MEDIA_TAGS = new Set(['VIDEO', 'AUDIO', 'CANVAS', 'IFRAME', 'OBJECT', 'EMBED']);
   // Interactive controls: a clone would have no listeners/state, so they are never inside a unit.
-  const LIVE_CONTROL_SELECTOR = 'button, input, select, textarea, [role="button"], [role="checkbox"], [role="radio"], [role="switch"], [contenteditable="true"]';
+  const LIVE_CONTROL_SELECTOR = 'button, input, select, textarea, [role="button"], [role="checkbox"], [role="radio"], [role="switch"], [contenteditable]:not([contenteditable="false"])';
   const ICON_FONT_FIRST_RE = /(?:material\s*(?:icons|symbols)|google\s*symbols|font\s*awesome|fontawesome|icomoon|ionicons|octicons|codicon|bootstrap-icons|glyphicon)/i;
   const FLEX_OR_GRID_RE = /(?:^|\s)(?:inline-)?(?:flex|grid)(?:\s|$)/;
   const CLIP_RECT_RE = /^rect\(\s*([^,)\s]+)[,\s]+([^,)\s]+)[,\s]+([^,)\s]+)[,\s]+([^,)\s]+)\s*\)$/i;
@@ -4217,6 +4670,16 @@
   const TOKEN_SPLIT_RE = /(\[\[\s*\/?[CMLAS]\d+\s*\]\])/g;
   const TOKEN_MATCH_RE = /^\[\[\s*(\/?)([CMLAS])(\d+)\s*\]\]$/;
 
+  function normalizeBracketTokens(zhText) {
+    return String(zhText || '')
+      .replace(/[［【]{2}\s*(\/?)\s*([cmlasCMLAS])\s*(\d+)\s*[］】]{2}/g, (_, slash, type, id) => {
+        return `[[${slash}${type.toUpperCase()}${id}]]`;
+      })
+      .replace(/\[\[\s*(\/?)([cmlas])(\d+)\s*\]\]/g, (_, slash, type, id) => {
+        return `[[${slash}${type.toUpperCase()}${id}]]`;
+      });
+  }
+
   function stripAllTokens(zhText) {
     return String(zhText || '').replace(/\[\[\s*\/?[CMLAS]\d+\s*\]\]/g, '');
   }
@@ -5012,7 +5475,8 @@
       origWrap.appendChild(child);
     }
 
-    const validation = validateTranslatedTokens(zh, placeholders);
+    const normalizedZh = normalizeBracketTokens(zh);
+    const validation = validateTranslatedTokens(normalizedZh, placeholders);
     const transWrap = document.createElement('span');
     transWrap.className = 'kct-trans-wrap';
     transWrap.setAttribute('data-kct-ui', 'trans');
@@ -5021,11 +5485,11 @@
     if (validation.ok) {
       el.removeAttribute('data-kct-structure-fallback');
       if (placeholders instanceof Map) placeholders.clonePairs = [];
-      transWrap.appendChild(buildTranslatedFragment(zh, placeholders));
+      transWrap.appendChild(buildTranslatedFragment(normalizedZh, placeholders));
     } else {
       console.debug('[NativeRead] structure fallback:', validation.reason);
       el.setAttribute('data-kct-structure-fallback', '1');
-      transWrap.appendChild(buildTranslatedFragment(stripAllTokens(zh), null));
+      transWrap.appendChild(buildTranslatedFragment(stripAllTokens(normalizedZh), null));
     }
 
     if (needsInlineInjection(el)) {
@@ -5395,7 +5859,13 @@
     resolveThinkingConfig,
     normalizeHostname,
     isHostWhitelisted,
+    isLocalEndpoint,
     sanitizeApiKey,
+    validateApiKey,
+    normalizeProviderProfiles,
+    switchActiveProviderSettings,
+    resolveFallbackSettings,
+    formatApiError,
     hashText
   } = globalThis.KCTConfig;
 
@@ -5406,66 +5876,142 @@
   const PAGE_STYLE_CSS = "/* Universal AI Web & Notebook Translator v2.0 - Page Typography & Mode Rules */\n/* Note: Floating control pill & selection popover are encapsulated in Shadow DOM. */\n\n:root {\n  --kct-accent: #0284c7;\n  --kct-accent-soft: rgba(2, 132, 199, 0.08);\n  --kct-hairline: rgba(148, 163, 184, 0.45);\n  --kct-border: rgba(15, 23, 42, 0.12);\n  --kct-text: #1e293b;\n  --kct-bilingual-ink: #475569;\n  --kct-bg: rgba(255, 255, 255, 0.9);\n\n  /* Default target language: Traditional Chinese (zh-TW) */\n  --kct-font-serif: \"Noto Serif TC\", \"Songti TC\", \"PMingLiU\", \"Source Han Serif TC\", Georgia, serif;\n  --kct-font-sans: \"PingFang TC\", \"Noto Sans TC\", \"Microsoft JhengHei\", \"Heiti TC\", -apple-system, BlinkMacSystemFont, sans-serif;\n  --kct-font-mono: \"JetBrains Mono\", \"SFMono-Regular\", Menlo, Monaco, Consolas, \"PingFang TC\", \"Noto Sans TC\", \"Microsoft JhengHei\", monospace;\n}\n\nhtml.kct-lang-sc {\n  --kct-font-serif: \"Noto Serif SC\", \"Songti SC\", \"STSong\", \"SimSun\", \"Source Han Serif SC\", Georgia, serif;\n  --kct-font-sans: \"PingFang SC\", \"Noto Sans SC\", \"Hiragino Sans GB\", \"Microsoft YaHei\", -apple-system, BlinkMacSystemFont, sans-serif;\n  --kct-font-mono: \"JetBrains Mono\", \"SFMono-Regular\", Menlo, Monaco, Consolas, \"PingFang SC\", \"Noto Sans SC\", \"Microsoft YaHei\", monospace;\n}\n\nhtml.kct-lang-ja {\n  --kct-font-serif: \"Hiragino Mincho ProN\", \"Yu Mincho\", \"Noto Serif JP\", \"MS PMincho\", Georgia, serif;\n  --kct-font-sans: \"Hiragino Sans\", \"Hiragino Kaku Gothic ProN\", \"Noto Sans JP\", \"Yu Gothic\", -apple-system, BlinkMacSystemFont, sans-serif;\n  --kct-font-mono: \"JetBrains Mono\", \"SFMono-Regular\", Menlo, Monaco, Consolas, \"Hiragino Sans\", \"Noto Sans JP\", monospace;\n}\n\nhtml.kct-lang-ko {\n  --kct-font-serif: \"Noto Serif KR\", \"AppleMyungjo\", \"Batang\", Georgia, serif;\n  --kct-font-sans: \"Apple SD Gothic Neo\", \"Noto Sans KR\", \"Malgun Gothic\", -apple-system, BlinkMacSystemFont, sans-serif;\n  --kct-font-mono: \"JetBrains Mono\", \"SFMono-Regular\", Menlo, Monaco, Consolas, \"Apple SD Gothic Neo\", \"Noto Sans KR\", monospace;\n}\n\nhtml.kct-lang-latin {\n  --kct-font-serif: Georgia, \"Charter\", \"Times New Roman\", serif;\n  --kct-font-sans: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"Inter\", sans-serif;\n  --kct-font-mono: \"JetBrains Mono\", \"SFMono-Regular\", Menlo, Monaco, Consolas, monospace;\n}\n\nhtml.kct-page-dark,\nbody[data-jp-theme-light=\"false\"],\nhtml[data-theme=\"dark\"],\nhtml.dark,\nbody.theme-dark {\n  --kct-accent: #38bdf8;\n  --kct-accent-soft: rgba(56, 189, 248, 0.12);\n  --kct-hairline: rgba(148, 163, 184, 0.34);\n  --kct-border: rgba(255, 255, 255, 0.16);\n  --kct-text: #f1f5f9;\n  --kct-bilingual-ink: #cbd5e1;\n  --kct-bg: rgba(15, 23, 42, 0.9);\n}\n\n/* Preserve table & Infobox column widths when CJK labels sit next to long unbroken URLs */\nhtml.kct-active:not(.kct-mode-original) table th[data-kct-has-trans=\"1\"] {\n  min-width: 4.5em;\n  word-break: keep-all;\n  overflow-wrap: break-word;\n}\n\nhtml.kct-active:not(.kct-mode-original) table td[data-kct-has-trans=\"1\"],\nhtml.kct-active:not(.kct-mode-original) .infobox td {\n  overflow-wrap: anywhere;\n  word-break: break-word;\n}\n\n/* =========================================================\n   1. Replace Mode (Native-Feel Typography Matching)\n   ========================================================= */\nhtml.kct-mode-replace .kct-orig-wrap {\n  display: none !important;\n}\n\nhtml.kct-mode-replace .kct-trans-wrap {\n  display: contents;\n}\n\n/* Bilingual mode shows the original too: hide media/box copies so they are not shown twice. */\nhtml.kct-mode-bilingual .kct-trans-wrap [data-kct-atomic=\"box\"] {\n  display: none !important;\n}\n\n/* Flex/grid hosts: each translated text run is ONE item (.kct-flex-run), atomic clones stay items. */\n.kct-flex-run {\n  min-width: 0;\n}\n\nhtml.kct-mode-replace [data-kct-has-trans=\"1\"] {\n  line-break: strict;\n  font-kerning: normal;\n  text-wrap: pretty;\n  text-autospace: normal;\n  text-rendering: optimizeLegibility;\n  -webkit-font-smoothing: antialiased;\n}\n\n/* Native mode: keep original site Latin font first (when non-generic), fall back to matched Serif/Sans/Mono CJK */\nhtml.kct-typo-native.kct-mode-replace [data-kct-has-trans=\"1\"][data-kct-typo=\"serif\"] {\n  font-family: var(--kct-font-serif) !important;\n}\n\nhtml.kct-typo-native.kct-mode-replace [data-kct-has-trans=\"1\"][data-kct-typo=\"sans\"] {\n  font-family: var(--kct-font-sans) !important;\n}\n\nhtml.kct-typo-native.kct-mode-replace [data-kct-has-trans=\"1\"][data-kct-typo=\"mono\"] {\n  font-family: var(--kct-font-mono) !important;\n}\n\nhtml.kct-typo-native.kct-mode-replace [data-kct-has-trans=\"1\"][data-kct-has-orig-font=\"1\"][data-kct-typo=\"serif\"] {\n  font-family: var(--kct-orig-font), var(--kct-font-serif) !important;\n}\n\nhtml.kct-typo-native.kct-mode-replace [data-kct-has-trans=\"1\"][data-kct-has-orig-font=\"1\"][data-kct-typo=\"sans\"] {\n  font-family: var(--kct-orig-font), var(--kct-font-sans) !important;\n}\n\nhtml.kct-typo-native.kct-mode-replace [data-kct-has-trans=\"1\"][data-kct-has-orig-font=\"1\"][data-kct-typo=\"mono\"] {\n  font-family: var(--kct-orig-font), var(--kct-font-mono) !important;\n}\n\n/* System mode: uniform clean sans font */\nhtml.kct-typo-system.kct-mode-replace [data-kct-has-trans=\"1\"] {\n  font-family: var(--kct-font-sans) !important;\n}\n\n/* Preserve mode: do not override font-family or line-height */\n\n/* Selective line-height lift ONLY on dense multi-line reading prose */\nhtml.kct-mode-replace:not(.kct-typo-preserve) [data-kct-has-trans=\"1\"][data-kct-lh-lift=\"1\"] {\n  line-height: 1.72 !important;\n}\n\n/* =========================================================\n   2. Original Mode (Instant Zero-Cost Compare)\n   ========================================================= */\nhtml.kct-mode-original .kct-trans-wrap {\n  display: none !important;\n}\n\nhtml.kct-mode-original .kct-orig-wrap {\n  display: contents;\n}\n\n/* =========================================================\n   3. Bilingual Mode (Clean Hairline Contrast)\n   ========================================================= */\nhtml.kct-mode-bilingual .kct-orig-wrap {\n  display: contents;\n}\n\nhtml.kct-mode-bilingual .kct-trans-wrap {\n  display: block;\n  color: var(--kct-bilingual-ink);\n  margin-top: 0.35em;\n  padding-left: 10px;\n  border-left: 2px solid var(--kct-hairline);\n  font-size: 0.94em;\n  line-height: 1.7;\n  font-weight: 400;\n  line-break: strict;\n  font-kerning: normal;\n  text-wrap: pretty;\n  text-autospace: normal;\n  text-rendering: optimizeLegibility;\n  -webkit-font-smoothing: antialiased;\n}\n\nhtml.kct-typo-native.kct-mode-bilingual [data-kct-has-trans=\"1\"][data-kct-typo=\"serif\"] > .kct-trans-wrap {\n  font-family: var(--kct-font-serif);\n}\n\nhtml.kct-typo-native.kct-mode-bilingual [data-kct-has-trans=\"1\"][data-kct-typo=\"sans\"] > .kct-trans-wrap {\n  font-family: var(--kct-font-sans);\n}\n\nhtml.kct-typo-native.kct-mode-bilingual [data-kct-has-trans=\"1\"][data-kct-typo=\"mono\"] > .kct-trans-wrap {\n  font-family: var(--kct-font-mono);\n}\n\nhtml.kct-typo-native.kct-mode-bilingual [data-kct-has-trans=\"1\"][data-kct-has-orig-font=\"1\"][data-kct-typo=\"serif\"] > .kct-trans-wrap {\n  font-family: var(--kct-orig-font), var(--kct-font-serif);\n}\n\nhtml.kct-typo-native.kct-mode-bilingual [data-kct-has-trans=\"1\"][data-kct-has-orig-font=\"1\"][data-kct-typo=\"sans\"] > .kct-trans-wrap {\n  font-family: var(--kct-orig-font), var(--kct-font-sans);\n}\n\nhtml.kct-typo-native.kct-mode-bilingual [data-kct-has-trans=\"1\"][data-kct-has-orig-font=\"1\"][data-kct-typo=\"mono\"] > .kct-trans-wrap {\n  font-family: var(--kct-orig-font), var(--kct-font-mono);\n}\n\nhtml.kct-typo-system.kct-mode-bilingual .kct-trans-wrap {\n  font-family: var(--kct-font-sans);\n}\n\nhtml.kct-mode-bilingual [data-kct-inline-layout=\"1\"] > .kct-trans-wrap {\n  display: inline;\n  margin-top: 0;\n  margin-left: 0.45em;\n  padding-left: 0.45em;\n  border-left: 1px solid var(--kct-hairline);\n}\n\n/* =========================================================\n   Non-destructive Code Comment Translation\n   - Static <pre>: CSS attr() + font-size:0 swap\n   - CodeMirror 6 (.cm-editor): non-intrusive .cm-scroller overlay layer\n   ========================================================= */\nhtml.kct-comments-on:not(.kct-mode-original) pre span[data-kct-comment-trans] {\n  font-size: 0 !important;\n  letter-spacing: 0 !important;\n}\n\nhtml.kct-comments-on:not(.kct-mode-original) pre span[data-kct-comment-trans]::after {\n  content: attr(data-kct-comment-trans);\n  font-size: var(--kct-code-font-size, 13px);\n  letter-spacing: normal;\n  font-family: var(--kct-font-mono);\n}\n\n.kct-cm-layer {\n  position: absolute;\n  inset: 0;\n  pointer-events: none;\n  z-index: 4;\n  overflow: visible;\n}\n\n.kct-cm-comment {\n  position: absolute;\n  display: flex;\n  align-items: center;\n  white-space: pre;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  font-family: var(--kct-font-mono);\n  pointer-events: none;\n  box-sizing: border-box;\n}\n\nhtml.kct-mode-original .kct-cm-layer,\nhtml:not(.kct-comments-on) .kct-cm-layer,\nhtml .cm-editor.cm-focused .kct-cm-layer {\n  display: none !important;\n}\n\n/* =========================================================\n   Jupyter Code Cell Output Quick Translate Button & Result\n   ========================================================= */\n.kct-output-host {\n  position: relative;\n}\n\n.kct-output-btn {\n  all: unset;\n  box-sizing: border-box;\n  position: absolute;\n  top: 6px;\n  right: 8px;\n  z-index: 10;\n  cursor: pointer;\n  font-family: var(--kct-font-sans);\n  font-size: 11px;\n  font-weight: 600;\n  padding: 2px 8px;\n  border-radius: 999px;\n  background: var(--kct-bg);\n  color: var(--kct-accent);\n  border: 1px solid var(--kct-border);\n  box-shadow: 0 2px 6px rgba(15, 23, 42, 0.08);\n  opacity: 0.85;\n  transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;\n}\n\n.kct-output-btn:hover {\n  opacity: 1;\n  background: var(--kct-accent);\n  color: #ffffff;\n  border-color: transparent;\n}\n\n.kct-output-trans {\n  font-family: var(--kct-font-sans);\n  color: var(--kct-text);\n  background: var(--kct-accent-soft);\n  border-left: 2px solid var(--kct-accent);\n  border-radius: 0 6px 6px 0;\n  padding: 8px 12px;\n  margin-top: 8px;\n  font-size: 13px;\n  line-height: 1.65;\n  white-space: pre-wrap;\n  word-break: break-word;\n}\n\n/* =========================================================\n   5. Image/Canvas-Backed PDF Text Layer Overlay (Google Drive PDF Viewer)\n   ========================================================= */\nhtml.kct-active:not(.kct-mode-original) [data-kct-pdf-layer=\"1\"] {\n  z-index: 2 !important;\n  opacity: 1 !important;\n  pointer-events: none !important;\n  overflow: visible !important;\n}\n\nhtml.kct-active:not(.kct-mode-original) [data-kct-pdf-layer=\"1\"] > :not([data-kct-has-trans=\"1\"]),\nhtml.kct-active:not(.kct-mode-original) [data-kct-pdf-layer=\"1\"] > [data-kct-pdf-merged=\"absorbed\"] {\n  opacity: 0 !important;\n  pointer-events: none !important;\n}\n\nhtml.kct-active:not(.kct-mode-original) [data-kct-pdf-layer=\"1\"] > p[data-kct-pdf-block=\"1\"][data-kct-has-trans=\"1\"] {\n  opacity: 1 !important;\n  pointer-events: auto !important;\n  background-color: var(--kct-pdf-bg, #ffffff) !important;\n  box-shadow: 0 0 0 2px var(--kct-pdf-bg, #ffffff) !important;\n  color: var(--kct-pdf-fg, #1e293b) !important;\n  font-size: var(--kct-pdf-fs, 13px) !important;\n  line-height: var(--kct-pdf-lh, 1.42) !important;\n  font-weight: var(--kct-pdf-fw, 400) !important;\n  box-sizing: border-box !important;\n  margin: 0 !important;\n  padding: 1px 4px !important;\n  border-radius: 2px !important;\n  display: block !important;\n  white-space: normal !important;\n  word-break: break-word !important;\n  overflow: hidden !important;\n  transition: box-shadow 0.14s ease;\n}\n\nhtml.kct-active:not(.kct-mode-original) [data-kct-pdf-layer=\"1\"] > p[data-kct-pdf-block=\"1\"][data-kct-has-trans=\"1\"]:hover {\n  z-index: 30 !important;\n  overflow: visible !important;\n  height: auto !important;\n}\n\n/* In fixed-coordinate PDF overlay layers, keep layout clean in Bilingual mode and expand full bilingual card on hover */\nhtml.kct-active.kct-mode-bilingual [data-kct-pdf-layer=\"1\"] > p[data-kct-pdf-block=\"1\"][data-kct-has-trans=\"1\"] > .kct-orig-wrap {\n  display: none !important;\n}\n\nhtml.kct-active.kct-mode-bilingual [data-kct-pdf-layer=\"1\"] > p[data-kct-pdf-block=\"1\"][data-kct-has-trans=\"1\"] > .kct-trans-wrap {\n  display: contents !important;\n  color: var(--kct-pdf-fg, #1e293b) !important;\n  margin: 0 !important;\n  padding: 0 !important;\n  border: none !important;\n  font-size: inherit !important;\n  line-height: inherit !important;\n  font-weight: inherit !important;\n}\n\nhtml.kct-active.kct-mode-bilingual [data-kct-pdf-layer=\"1\"] > p[data-kct-pdf-block=\"1\"][data-kct-has-trans=\"1\"]:hover {\n  z-index: 30 !important;\n  height: auto !important;\n  padding: 8px 10px !important;\n  border-radius: 6px !important;\n  border: 1px solid var(--kct-accent) !important;\n  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.25) !important;\n}\n\nhtml.kct-active.kct-mode-bilingual [data-kct-pdf-layer=\"1\"] > p[data-kct-pdf-block=\"1\"][data-kct-has-trans=\"1\"]:hover > .kct-orig-wrap {\n  display: block !important;\n  font-size: 0.86em !important;\n  line-height: 1.4 !important;\n  opacity: 0.76 !important;\n  margin-bottom: 6px !important;\n  padding-bottom: 6px !important;\n  border-bottom: 1px dashed rgba(148, 163, 184, 0.45) !important;\n}\n\n/* =========================================================\n   Google Drive PDF: table-of-contents rows\n   (translated title + native dot leader + right-aligned page number).\n   Placed last so it overrides the generic overlay / bilingual hover rules above.\n   ========================================================= */\nhtml.kct-active:not(.kct-mode-original) [data-kct-pdf-layer=\"1\"] > p[data-kct-pdf-block=\"1\"][data-kct-pdf-toc=\"1\"][data-kct-has-trans=\"1\"] {\n  display: flex !important;\n  align-items: baseline !important;\n  white-space: nowrap !important;\n  overflow: hidden !important;\n}\n\nhtml.kct-active:not(.kct-mode-original) [data-kct-pdf-layer=\"1\"] > p[data-kct-pdf-block=\"1\"][data-kct-pdf-toc=\"1\"][data-kct-has-trans=\"1\"] > .kct-orig-wrap,\nhtml.kct-active:not(.kct-mode-original) [data-kct-pdf-layer=\"1\"] > p[data-kct-pdf-block=\"1\"][data-kct-pdf-toc=\"1\"][data-kct-has-trans=\"1\"]:hover > .kct-orig-wrap {\n  display: none !important;\n}\n\nhtml.kct-active:not(.kct-mode-original) [data-kct-pdf-layer=\"1\"] > p[data-kct-pdf-block=\"1\"][data-kct-pdf-toc=\"1\"][data-kct-has-trans=\"1\"] > .kct-trans-wrap {\n  display: block !important;\n  flex: 0 1 auto !important;\n  min-width: 0 !important;\n  overflow: hidden !important;\n  text-overflow: ellipsis !important;\n  white-space: nowrap !important;\n}\n\nhtml.kct-active.kct-mode-bilingual [data-kct-pdf-layer=\"1\"] > p[data-kct-pdf-block=\"1\"][data-kct-pdf-toc=\"1\"][data-kct-has-trans=\"1\"]:hover {\n  height: auto !important;\n  padding: 1px 4px !important;\n}\n\n[data-kct-pdf-layer=\"1\"] > p > .kct-pdf-toc-tail {\n  display: none;\n}\n\nhtml.kct-active:not(.kct-mode-original) [data-kct-pdf-layer=\"1\"] > p[data-kct-pdf-block=\"1\"][data-kct-pdf-toc=\"1\"][data-kct-has-trans=\"1\"] > .kct-pdf-toc-tail {\n  display: flex !important;\n  flex: 1 1 auto !important;\n  align-items: baseline !important;\n  min-width: 2.2em !important;\n}\n\n[data-kct-pdf-layer=\"1\"] .kct-pdf-toc-leader {\n  flex: 1 1 auto;\n  height: 0;\n  margin: 0 0.5em;\n  border-bottom: 0.13em dotted currentColor;\n  opacity: 0.6;\n}\n\n[data-kct-pdf-layer=\"1\"] > p[data-kct-pdf-toc-leader=\"none\"] .kct-pdf-toc-leader {\n  border-bottom-color: transparent;\n}\n\n[data-kct-pdf-layer=\"1\"] .kct-pdf-toc-num {\n  flex: none;\n  font-variant-numeric: tabular-nums;\n}\n\n/* =========================================================\n   6. R4: On-Demand Vision Image Overlay Translation\n   ========================================================= */\n.kct-img-overlay-host {\n  position: relative;\n  line-height: 0;\n}\n\n.kct-img-overlay-layer {\n  position: absolute;\n  pointer-events: none;\n  z-index: 6;\n  overflow: hidden;\n  box-sizing: border-box;\n}\n\nhtml.kct-mode-original .kct-img-overlay-layer,\n.kct-img-overlay-host > img[data-kct-img-mode=\"original\"] ~ .kct-img-overlay-layer {\n  display: none !important;\n}\n\n.kct-img-overlay-block {\n  position: absolute;\n  box-sizing: border-box;\n  background-color: var(--kct-img-bg, #ffffff);\n  box-shadow: 0 0 0 2px var(--kct-img-bg, #ffffff);\n  color: var(--kct-img-fg, #1e293b);\n  font-family: var(--kct-font-sans);\n  line-height: 1.28;\n  padding: 1px 3px;\n  border-radius: 3px;\n  display: flex;\n  align-items: center;\n  white-space: normal;\n  word-break: break-word;\n  overflow: hidden;\n  pointer-events: auto;\n}\n\n.kct-img-overlay-block.kct-img-role-title {\n  font-weight: 700;\n  line-height: 1.22;\n}\n\n.kct-img-overlay-block.kct-img-role-badge {\n  font-weight: 600;\n  justify-content: center;\n  text-align: center;\n  border-radius: 999px;\n}\n\n.kct-img-overlay-block:hover {\n  z-index: 20;\n  overflow: visible;\n  height: auto !important;\n  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.18), 0 0 0 1px var(--kct-accent);\n}\n\n/* =========================================================\n   Structure guard: when a translation lost a link or protected node,\n   keep the clickable original visible next to the translation.\n   ========================================================= */\nhtml.kct-mode-replace [data-kct-structure-fallback=\"1\"] > .kct-orig-wrap {\n  display: contents !important;\n}\n\nhtml.kct-mode-replace [data-kct-structure-fallback=\"1\"] > .kct-trans-wrap {\n  display: block;\n  color: var(--kct-bilingual-ink);\n  margin-top: 0.35em;\n  padding-left: 10px;\n  border-left: 2px solid var(--kct-hairline);\n  font-size: 0.94em;\n  line-height: 1.7;\n  font-weight: 400;\n  line-break: strict;\n  font-kerning: normal;\n  text-wrap: pretty;\n  text-autospace: normal;\n  text-rendering: optimizeLegibility;\n  -webkit-font-smoothing: antialiased;\n}\n";
 
   // ============================================================
-  // 1. Storage Adapter (GM_getValue / GM_setValue + localStorage)
+  // 1. Storage Adapter (GM_getValue / GM.getValue ONLY on untrusted origins;
+  //    localStorage fallback strictly restricted to trusted PWA origin)
   // ============================================================
-  function readStoredSettings() {
+  function hasGmGet() {
+    return typeof GM_getValue === 'function' || (typeof GM !== 'undefined' && typeof GM.getValue === 'function');
+  }
+
+  function hasGmSet() {
+    return typeof GM_setValue === 'function' || (typeof GM !== 'undefined' && typeof GM.setValue === 'function');
+  }
+
+  function isTrustedOriginForFallback() {
+    try {
+      const host = String(location.hostname || '').toLowerCase();
+      const pathname = String(location.pathname || '');
+      if (host === 'chih-kai-wang.github.io' && pathname.startsWith('/native-read')) return true;
+      if (host === 'localhost' || host === '127.0.0.1') return true;
+    } catch (_) {}
+    return false;
+  }
+
+  function buildDefaultUserscriptSettings() {
+    return {
+      ...DEFAULT_SETTINGS,
+      providerId: 'gemini',
+      protocol: 'gemini',
+      baseUrl: PROVIDER_PRESETS.gemini.baseUrl,
+      model: PROVIDER_PRESETS.gemini.defaultModel,
+      providerProfiles: {},
+      autoTranslateHosts: []
+    };
+  }
+
+  function parseStoredRawSettings(raw) {
+    const base = buildDefaultUserscriptSettings();
+    if (!raw) return base;
+    try {
+      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      const merged = {
+        ...base,
+        ...parsed,
+        apiKey: sanitizeApiKey(parsed?.apiKey),
+        autoTranslateHosts: Array.isArray(parsed?.autoTranslateHosts)
+          ? Array.from(new Set(parsed.autoTranslateHosts.map(normalizeHostname).filter(Boolean)))
+          : []
+      };
+      merged.providerProfiles = normalizeProviderProfiles(parsed?.providerProfiles, merged);
+      return merged;
+    } catch (_) {
+      return base;
+    }
+  }
+
+  let cachedSettings = buildDefaultUserscriptSettings();
+
+  async function initStoredSettings() {
     let raw = null;
     try {
       if (typeof GM_getValue === 'function') {
-        raw = GM_getValue(SETTINGS_KEY, null);
+        raw = await Promise.resolve(GM_getValue(SETTINGS_KEY, null));
+      } else if (typeof GM !== 'undefined' && typeof GM.getValue === 'function') {
+        raw = await GM.getValue(SETTINGS_KEY, null);
       }
     } catch (_) {}
-    if (!raw) {
+
+    if (!raw && !hasGmGet() && isTrustedOriginForFallback()) {
       try {
         raw = localStorage.getItem(SETTINGS_KEY);
       } catch (_) {}
     }
-    if (!raw) {
-      return { ...DEFAULT_SETTINGS, providerId: 'gemini', protocol: 'gemini', baseUrl: PROVIDER_PRESETS.gemini.baseUrl, model: PROVIDER_PRESETS.gemini.defaultModel, autoTranslateHosts: [] };
-    }
+    cachedSettings = parseStoredRawSettings(raw);
+    return cachedSettings;
+  }
+
+  function readStoredSettings() {
+    return cachedSettings;
+  }
+
+  async function persistStoredSettings(next) {
+    const serialized = JSON.stringify(next);
+    let wroteGm = false;
     try {
-      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-      return {
-        ...DEFAULT_SETTINGS,
-        ...parsed,
-        autoTranslateHosts: Array.isArray(parsed?.autoTranslateHosts)
-          ? parsed.autoTranslateHosts.map(normalizeHostname).filter(Boolean)
-          : []
-      };
-    } catch (_) {
-      return { ...DEFAULT_SETTINGS, autoTranslateHosts: [] };
+      if (typeof GM_setValue === 'function') {
+        await Promise.resolve(GM_setValue(SETTINGS_KEY, serialized));
+        wroteGm = true;
+      } else if (typeof GM !== 'undefined' && typeof GM.setValue === 'function') {
+        await GM.setValue(SETTINGS_KEY, serialized);
+        wroteGm = true;
+      }
+    } catch (_) {}
+    if (!wroteGm && !hasGmSet() && isTrustedOriginForFallback()) {
+      try {
+        localStorage.setItem(SETTINGS_KEY, serialized);
+      } catch (_) {}
     }
+    return next;
   }
 
   function writeStoredSettings(partial) {
     const current = readStoredSettings();
+    const hasExplicitProfiles = Boolean(
+      partial &&
+      typeof partial.providerProfiles === 'object' &&
+      partial.providerProfiles !== null &&
+      !Array.isArray(partial.providerProfiles)
+    );
     const next = {
       ...current,
-      ...partial
+      ...(partial && typeof partial === 'object' ? partial : {})
     };
+    next.apiKey = sanitizeApiKey(next.apiKey);
     if (Array.isArray(next.autoTranslateHosts)) {
       next.autoTranslateHosts = Array.from(new Set(next.autoTranslateHosts.map(normalizeHostname).filter(Boolean)));
     } else {
       next.autoTranslateHosts = [];
     }
-    const serialized = JSON.stringify(next);
-    try {
-      if (typeof GM_setValue === 'function') {
-        GM_setValue(SETTINGS_KEY, serialized);
-      }
-    } catch (_) {}
-    try {
-      localStorage.setItem(SETTINGS_KEY, serialized);
-    } catch (_) {}
+    const baseProfiles = hasExplicitProfiles ? partial.providerProfiles : current.providerProfiles;
+    next.providerProfiles = normalizeProviderProfiles(baseProfiles, next);
+    if (next.fallbackProviderId === next.providerId) {
+      next.fallbackProviderId = '';
+    }
+    cachedSettings = next;
+    void persistStoredSettings(next);
     return next;
   }
 
   // Override KCTConfig.getSettings / saveSettings so shared modules work seamlessly
   globalThis.KCTConfig.getSettings = async () => readStoredSettings();
-  globalThis.KCTConfig.saveSettings = async (partial) => writeStoredSettings(partial);
+  globalThis.KCTConfig.saveSettings = async (partial) => {
+    const next = writeStoredSettings(partial);
+    await persistStoredSettings(next);
+    return next;
+  };
 
   // ============================================================
-  // 2. #nr_sync Zero-Typing Sync Decoder
+  // 2. #nr_sync Zero-Typing Sync Decoder (Trusted Origin Only)
   // ============================================================
   function decodeBase64UrlJson(b64url) {
     const base64 = String(b64url || '').trim().replace(/-/g, '+').replace(/_/g, '/');
@@ -5478,72 +6024,145 @@
     return JSON.parse(new TextDecoder().decode(bytes));
   }
 
-  function checkAndApplyNrSyncHash() {
+  async function checkAndApplyNrSyncHash() {
+    if (!isTrustedOriginForFallback()) return false;
     const hash = String(window.location.hash || '');
     if (!hash.includes('nr_sync=')) return false;
     const match = hash.match(/(?:^|[#&])nr_sync=([^&]+)/);
-    if (!match || !match[1]) return false;
+    const scrubHash = () => {
+      try {
+        history.replaceState(null, '', window.location.pathname + window.location.search);
+      } catch (_) {}
+    };
+    if (!match || !match[1]) {
+      scrubHash();
+      return false;
+    }
 
     try {
       const payload = decodeBase64UrlJson(decodeURIComponent(match[1]));
-      if (!payload || typeof payload !== 'object') return false;
-      const providerId = payload.providerId || payload.p || 'gemini';
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
+      const rawPid = String(payload.providerId || payload.p || 'gemini').trim();
+      const providerId = PROVIDER_PRESETS[rawPid] ? rawPid : 'custom';
       const preset = PROVIDER_PRESETS[providerId] || PROVIDER_PRESETS.gemini;
-      const protocol = payload.protocol || payload.r || preset.protocol || 'gemini';
-      const baseUrl = payload.baseUrl || payload.u || preset.baseUrl;
-      const apiKey = sanitizeApiKey(payload.apiKey ?? payload.k ?? '');
-      const model = payload.model || payload.m || preset.defaultModel;
-      const targetLang = payload.targetLang || payload.l || 'zh-TW';
-      const customTargetLang = payload.customTargetLang ?? payload.c ?? '';
-      const thinkingEffort = payload.thinkingEffort || payload.e || 'fastest';
-      const typographyMatch = payload.typographyMatch || payload.t || 'native';
+      const protocol = String(payload.protocol || payload.r || preset.protocol || 'gemini').trim().toLowerCase();
+      if (!['openai', 'gemini', 'anthropic'].includes(protocol)) return false;
+      const baseUrl = String(payload.baseUrl || payload.u || preset.baseUrl || '').trim();
+      try {
+        const parsed = new URL(baseUrl);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+      } catch (_) {
+        return false;
+      }
+      const keyCheck = validateApiKey(payload.apiKey ?? payload.k ?? '');
+      if (!keyCheck.ok) return false;
+      const apiKey = keyCheck.cleanKey;
+      const model = String(payload.model || payload.m || preset.defaultModel || '').trim();
+      const rawLang = String(payload.targetLang || payload.l || 'zh-TW').trim();
+      const targetLang = TARGET_LANGUAGES[rawLang] ? rawLang : 'zh-TW';
+      const customTargetLang = String(payload.customTargetLang ?? payload.c ?? '').trim();
+      const rawEffort = String(payload.thinkingEffort || payload.e || 'fastest').trim();
+      const thinkingEffort = ['fastest', 'balanced', 'deep'].includes(rawEffort) ? rawEffort : 'fastest';
+      const rawTypo = String(payload.typographyMatch || payload.t || 'native').trim();
+      const typographyMatch = ['native', 'system', 'preserve'].includes(rawTypo) ? rawTypo : 'native';
 
-      writeStoredSettings({
+      const current = readStoredSettings();
+      const mergedProfiles = normalizeProviderProfiles(current.providerProfiles, {
+        providerId,
+        protocol,
+        baseUrl,
+        apiKey,
+        model
+      });
+      const next = writeStoredSettings({
         providerId,
         protocol,
         baseUrl,
         apiKey,
         model,
+        providerProfiles: mergedProfiles,
         targetLang,
         customTargetLang,
         thinkingEffort,
         typographyMatch
       });
-      history.replaceState(null, '', window.location.pathname + window.location.search);
+      await persistStoredSettings(next);
       return true;
     } catch (_) {
       return false;
+    } finally {
+      scrubHash();
     }
   }
 
   // ============================================================
-  // 3. Persistent Cache (IndexedDB + GM memory fallback)
+  // 3. Persistent Cache (IndexedDB with 'ts' index/LRU + memory fallback)
   // ============================================================
   const DB_NAME = 'kct_cache_db_v2';
   const STORE_NAME = 'entries';
+  const MAX_CACHE_ENTRIES = 10000;
+  const IDB_OPEN_TIMEOUT_MS = 3000;
   let dbPromise = null;
   const memCache = new Map();
 
   function openCacheDB() {
     if (typeof indexedDB === 'undefined') return Promise.reject(new Error('No IDB'));
     if (dbPromise) return dbPromise;
-    dbPromise = new Promise((resolve, reject) => {
+    const currentPromise = new Promise((resolve, reject) => {
+      let settled = false;
+      let req = null;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        if (dbPromise === currentPromise) dbPromise = null;
+        reject(new Error('IndexedDB open timeout'));
+      }, IDB_OPEN_TIMEOUT_MS);
+
+      const finishOk = (db) => {
+        if (settled) {
+          try { db.close(); } catch (_) {}
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        db.onversionchange = () => {
+          try { db.close(); } catch (_) {}
+          if (dbPromise === currentPromise) dbPromise = null;
+        };
+        db.onclose = () => {
+          if (dbPromise === currentPromise) dbPromise = null;
+        };
+        resolve(db);
+      };
+
+      const finishErr = (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (dbPromise === currentPromise) dbPromise = null;
+        reject(err);
+      };
+
       try {
-        const req = indexedDB.open(DB_NAME, 1);
+        req = indexedDB.open(DB_NAME, 1);
         req.onupgradeneeded = () => {
           const db = req.result;
-          if (!db.objectStoreNames.contains(STORE_NAME)) {
-            db.createObjectStore(STORE_NAME, { keyPath: 'key' });
+          const store = db.objectStoreNames.contains(STORE_NAME)
+            ? req.transaction.objectStore(STORE_NAME)
+            : db.createObjectStore(STORE_NAME, { keyPath: 'key' });
+          if (!store.indexNames.contains('ts')) {
+            store.createIndex('ts', 'ts', { unique: false });
           }
         };
-        req.onsuccess = () => resolve(req.result);
-        req.onerror = () => { dbPromise = null; reject(req.error); };
+        req.onsuccess = () => finishOk(req.result);
+        req.onerror = () => finishErr(req.error || new Error('IDB open error'));
+        req.onblocked = () => finishErr(new Error('IDB open blocked'));
       } catch (e) {
-        dbPromise = null;
-        reject(e);
+        finishErr(e);
       }
     });
-    return dbPromise;
+    dbPromise = currentPromise;
+    return currentPromise;
   }
 
   async function cacheGetMany(keys) {
@@ -5554,7 +6173,14 @@
     try {
       const db = await openCacheDB();
       await new Promise((resolve) => {
-        const tx = db.transaction(STORE_NAME, 'readonly');
+        let tx;
+        try {
+          tx = db.transaction(STORE_NAME, 'readonly');
+        } catch (err) {
+          if (err?.name === 'InvalidStateError') dbPromise = null;
+          resolve();
+          return;
+        }
         const store = tx.objectStore(STORE_NAME);
         for (const k of keys) {
           if (out.has(k)) continue;
@@ -5568,27 +6194,118 @@
         }
         tx.oncomplete = () => resolve();
         tx.onerror = () => resolve();
+        tx.onabort = () => resolve();
       });
     } catch (_) {}
     return out;
   }
 
+  function deleteOldestUserscriptCacheKeys(store, source, count) {
+    if (!store || !source || !Number.isFinite(count) || count <= 0) return;
+    if (typeof source.getAllKeys === 'function') {
+      const keysReq = source.getAllKeys(null, count);
+      keysReq.onsuccess = () => {
+        try {
+          const keys = Array.isArray(keysReq.result) ? keysReq.result : [];
+          for (const pk of keys) {
+            const delReq = store.delete(pk);
+            if (delReq && typeof delReq === 'object') {
+              delReq.onerror = (e) => {
+                try { e?.preventDefault?.(); e?.stopPropagation?.(); } catch (_) {}
+              };
+            }
+          }
+        } catch (_) {}
+      };
+      keysReq.onerror = (e) => {
+        try { e?.preventDefault?.(); e?.stopPropagation?.(); } catch (_) {}
+      };
+      return;
+    }
+
+    let remaining = count;
+    const curReq = source.openCursor(null, 'next');
+    curReq.onsuccess = () => {
+      const cursor = curReq.result;
+      if (cursor && remaining > 0) {
+        cursor.delete();
+        remaining -= 1;
+        if (remaining > 0) cursor.continue();
+      }
+    };
+  }
+
+  async function evictOldestUserscriptCacheFraction(db, fraction = 0.2) {
+    await new Promise((resolve) => {
+      let tx;
+      try {
+        tx = db.transaction(STORE_NAME, 'readwrite');
+      } catch (_) {
+        resolve();
+        return;
+      }
+      const store = tx.objectStore(STORE_NAME);
+      const countReq = store.count();
+      countReq.onsuccess = () => {
+        const toDelete = Math.max(1, Math.ceil((countReq.result || 0) * fraction));
+        const cursorSource = store.indexNames.contains('ts') ? store.index('ts') : store;
+        deleteOldestUserscriptCacheKeys(store, cursorSource, toDelete);
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+      tx.onabort = () => resolve();
+    });
+  }
+
+  async function writeUserscriptCacheOnce(db, entries) {
+    const now = Date.now();
+    return new Promise((resolve, reject) => {
+      let tx;
+      try {
+        tx = db.transaction(STORE_NAME, 'readwrite');
+      } catch (err) {
+        if (err?.name === 'InvalidStateError') dbPromise = null;
+        reject(err);
+        return;
+      }
+      const store = tx.objectStore(STORE_NAME);
+      entries.forEach((e, idx) => {
+        if (e?.key && e?.zh) store.put({ key: e.key, zh: e.zh, ts: now + idx });
+      });
+      const countReq = store.count();
+      countReq.onsuccess = () => {
+        const overflow = (countReq.result || 0) - MAX_CACHE_ENTRIES;
+        if (overflow > 0) {
+          const cursorSource = store.indexNames.contains('ts') ? store.index('ts') : store;
+          deleteOldestUserscriptCacheKeys(store, cursorSource, overflow);
+        }
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error || new Error('IDB put failed'));
+      tx.onabort = () => reject(tx.error || new Error('IDB put aborted'));
+    });
+  }
+
   async function cachePutMany(entries) {
     for (const e of entries) {
-      if (e?.key && e?.zh) memCache.set(e.key, e.zh);
+      if (e?.key && e?.zh) {
+        memCache.set(e.key, e.zh);
+        if (memCache.size > MAX_CACHE_ENTRIES) {
+          const oldestKey = memCache.keys().next().value;
+          if (oldestKey !== undefined) memCache.delete(oldestKey);
+        }
+      }
     }
     try {
       const db = await openCacheDB();
-      const now = Date.now();
-      await new Promise((resolve) => {
-        const tx = db.transaction(STORE_NAME, 'readwrite');
-        const store = tx.objectStore(STORE_NAME);
-        entries.forEach((e, idx) => {
-          if (e?.key && e?.zh) store.put({ key: e.key, zh: e.zh, ts: now + idx });
-        });
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => resolve();
-      });
+      try {
+        await writeUserscriptCacheOnce(db, entries);
+      } catch (err) {
+        if (err?.name === 'QuotaExceededError') {
+          await evictOldestUserscriptCacheFraction(db, 0.2);
+          await writeUserscriptCacheOnce(db, entries).catch(() => {});
+        }
+      }
     } catch (_) {}
   }
 
@@ -5708,11 +6425,115 @@
     return c?.delta?.content || c?.message?.content || '';
   }
 
+  function redactAllUserscriptKeys(msg, settings = null) {
+    let out = String(msg || '');
+    const keys = new Set();
+    const s = settings || readStoredSettings();
+    const mainKey = sanitizeApiKey(s?.apiKey);
+    if (mainKey) keys.add(mainKey);
+    if (s?.providerProfiles && typeof s.providerProfiles === 'object') {
+      for (const p of Object.values(s.providerProfiles)) {
+        const pk = sanitizeApiKey(p?.apiKey);
+        if (pk) keys.add(pk);
+      }
+    }
+    for (const k of keys) {
+      if (k && k.length >= 6) {
+        out = out.split(k).join('[REDACTED_KEY]');
+      }
+    }
+    return out;
+  }
+
+  function isHardQuota429Userscript(status, bodyText) {
+    if (status !== 429) return false;
+    return /quota exceeded|exceeded your current quota|daily limit|insufficient_quota|billing|配額上限|額度已用盡/i.test(
+      String(bodyText || '')
+    );
+  }
+
+  function buildUserscriptHttpError(status, statusText, rawBodyText, settings = null) {
+    const safeBody = redactAllUserscriptKeys(String(rawBodyText || '').slice(0, 260), settings);
+    const msg = `HTTP ${status}: ${safeBody || statusText || 'Request failed'}`;
+    const err = new Error(msg);
+    err.isHttpError = true;
+    err.httpStatus = status;
+    if (status === 401 || status === 403) {
+      err.errorCode = 'AUTH_ERROR';
+      err.retryable = false;
+    } else if (status === 404) {
+      err.errorCode = 'HTTP_404';
+      err.retryable = false;
+    } else if (status === 429) {
+      err.errorCode = 'RATE_LIMIT';
+      err.retryable = !isHardQuota429Userscript(status, rawBodyText);
+    } else if (status === 503 || status === 529) {
+      err.errorCode = 'OVERLOADED';
+      err.retryable = true;
+    } else if (status >= 500) {
+      err.errorCode = 'SERVER_ERROR';
+      err.retryable = true;
+    } else {
+      err.errorCode = `HTTP_${status}`;
+      err.retryable = false;
+    }
+    return err;
+  }
+
+  function computeUserscriptBackoffMs(status, attempt, retryAfterMs = 0) {
+    if (retryAfterMs > 0) {
+      return Math.min(30000, retryAfterMs + Math.round(Math.random() * 400));
+    }
+    if (status === 429) {
+      return Math.round(Math.min(12000, 3000 * (2 ** Math.max(0, attempt - 1))) * (0.85 + Math.random() * 0.3));
+    }
+    if (status === 503 || status === 529) {
+      return Math.round(Math.min(8000, 1500 * (2 ** Math.max(0, attempt - 1))) * (0.85 + Math.random() * 0.3));
+    }
+    return Math.round(Math.min(5000, 900 * attempt) + Math.random() * 350);
+  }
+
+  function sleepUserscriptWithAbort(ms, signal) {
+    if (signal?.aborted) {
+      return Promise.reject(new DOMException('The operation was aborted.', 'AbortError'));
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (signal && onAbort) signal.removeEventListener('abort', onAbort);
+        resolve();
+      }, ms);
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(new DOMException('The operation was aborted.', 'AbortError'));
+      };
+      if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
+  function parseUserscriptRetryAfterMs(val) {
+    if (!val) return 0;
+    const n = Number(val);
+    if (Number.isFinite(n) && n > 0) return Math.min(30000, Math.round(n * 1000));
+    const ts = Date.parse(val);
+    if (Number.isFinite(ts) && ts > Date.now()) return Math.min(30000, ts - Date.now());
+    return 0;
+  }
+
+  function isUserscriptEcho(orig, trans, targetLangId) {
+    const cleanOrig = String(orig || '').replace(/\[\[[A-Z]+\d+\]\]|\[\[\/[A-Z]+\d+\]\]/g, '').replace(/[\s\p{P}\p{S}]+/gu, '').toLowerCase();
+    const cleanTrans = String(trans || '').replace(/\[\[[A-Z]+\d+\]\]|\[\[\/[A-Z]+\d+\]\]/g, '').replace(/[\s\p{P}\p{S}]+/gu, '').toLowerCase();
+    if (!cleanTrans || cleanOrig.length < 18) return false;
+    const isAsian = targetLangId === 'zh-TW' || targetLangId === 'zh-CN' || targetLangId === 'ja' || targetLangId === 'ko';
+    if (isAsian && !/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(cleanTrans) && cleanTrans === cleanOrig) {
+      return true;
+    }
+    return cleanTrans === cleanOrig;
+  }
+
   function buildRequestPayload(settings, messages, stream) {
     const cleanKey = sanitizeApiKey(settings.apiKey);
-    const headers = { 'Content-Type': 'application/json' };
+    const headers = buildProviderAuthHeaders(settings, cleanKey);
     if (settings.protocol === 'gemini') {
-      if (cleanKey) headers['x-goog-api-key'] = cleanKey;
       const sys = messages.find((m) => m.role === 'system');
       const usr = messages.filter((m) => m.role !== 'system');
       const normModel = String(settings.model || '').replace(/^models\//i, '').trim().toLowerCase();
@@ -5722,7 +6543,7 @@
       const tc = resolveThinkingConfig(settings.model, settings.thinkingEffort || 'fastest');
       if (tc) generationConfig.thinkingConfig = tc;
       const body = {
-        contents: usr.map((m) => ({ role: 'user', parts: [{ text: m.content }] })),
+        contents: usr.map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })),
         generationConfig
       };
       if (sys) body.systemInstruction = { parts: [{ text: sys.content }] };
@@ -5732,16 +6553,13 @@
         body: JSON.stringify(body)
       };
     } else if (settings.protocol === 'anthropic') {
-      // Claude Messages API (no temperature / thinking fields; JSON is requested in the prompt)
       const body = buildAnthropicMessagesBody(settings, messages, { stream: Boolean(stream), maxTokens: 32000 });
       return {
         url: resolveEndpoint(settings),
-        headers: buildProviderAuthHeaders(settings, cleanKey),
+        headers,
         body: JSON.stringify(body)
       };
     } else {
-      // OpenAI-compatible; Azure OpenAI endpoints get the api-key header
-      Object.assign(headers, buildProviderAuthHeaders(settings, cleanKey));
       const model = String(settings.model || '').trim();
       const body = { model, messages, stream: Boolean(stream) };
       if (!/^o[134](?:-|$)|deepseek-reasoner|^r1\b/i.test(model)) {
@@ -5755,43 +6573,95 @@
     }
   }
 
-  function callViaGmXhr(reqConfig) {
+  function callViaGmXhr(reqConfig, signal, settings = null) {
     const gmXhr = typeof GM_xmlhttpRequest === 'function'
       ? GM_xmlhttpRequest
       : (typeof GM !== 'undefined' && typeof GM.xmlHttpRequest === 'function' ? GM.xmlHttpRequest : null);
     if (!gmXhr) {
-      return Promise.reject(new Error('此頁面 CSP 阻擋了直接連線，請在 Tampermonkey / Stay Userscript 環境執行'));
+      const netErr = new Error('此頁面 CSP 阻擋了直接連線，請在 Tampermonkey / Stay Userscript 環境執行');
+      netErr.errorCode = 'NETWORK_ERROR';
+      return Promise.reject(netErr);
+    }
+    if (signal?.aborted) {
+      return Promise.reject(new DOMException('The operation was aborted.', 'AbortError'));
     }
     return new Promise((resolve, reject) => {
-      gmXhr({
+      let settled = false;
+      let handle = null;
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        try { handle?.abort?.(); } catch (_) {}
+        reject(new DOMException('The operation was aborted.', 'AbortError'));
+      };
+      if (signal) signal.addEventListener('abort', onAbort, { once: true });
+      const cleanup = () => {
+        if (signal) signal.removeEventListener('abort', onAbort);
+      };
+      handle = gmXhr({
         method: 'POST',
         url: reqConfig.url,
         headers: reqConfig.headers,
         data: reqConfig.body,
-        timeout: 35000,
+        timeout: 30000,
         onload(res) {
+          if (settled) return;
+          settled = true;
+          cleanup();
           if (res.status >= 200 && res.status < 300) {
             resolve(res.responseText || '');
           } else {
-            reject(new Error(`HTTP ${res.status}: ${String(res.responseText || '').slice(0, 180)}`));
+            reject(buildUserscriptHttpError(res.status, res.statusText || '', res.responseText || '', settings));
           }
         },
         onerror() {
-          reject(new Error('GM_xmlhttpRequest 網路請求失敗'));
+          if (settled) return;
+          settled = true;
+          cleanup();
+          const netErr = new Error('GM_xmlhttpRequest 網路請求失敗');
+          netErr.errorCode = 'NETWORK_ERROR';
+          netErr.retryable = true;
+          reject(netErr);
         },
         ontimeout() {
-          reject(new Error('GM_xmlhttpRequest 請求逾時'));
+          if (settled) return;
+          settled = true;
+          cleanup();
+          const tErr = new Error('GM_xmlhttpRequest 請求逾時');
+          tErr.errorCode = 'TIMEOUT';
+          tErr.retryable = true;
+          reject(tErr);
         }
       });
     });
   }
 
-  async function translateBatchItems(settings, items, pageContext, onItem) {
+  function isUserscriptFallbackEligible(err, signal) {
+    if (signal?.aborted) return false;
+    if (err?.name === 'AbortError' && err?.errorCode !== 'TIMEOUT') return false;
+    const code = String(err?.errorCode || '');
+    const status = Number(err?.httpStatus || 0);
+    if (code === 'NO_API_KEY' || code === 'INVALID_API_KEY_CHARS' || code === 'NO_MODEL' || code === 'AUTH_ERROR') return false;
+    if (status === 400 || status === 401 || status === 403 || status === 404) return false;
+    if (status === 429 || status === 503 || status === 529 || status >= 500) return true;
+    return code === 'OVERLOADED' || code === 'RATE_LIMIT' || code === 'SERVER_ERROR' || code === 'TIMEOUT' || code === 'NETWORK_ERROR' || Boolean(err?.retryable);
+  }
+
+  const USERSCRIPT_CONNECT_TIMEOUT_MS = 25000;
+  const USERSCRIPT_CHUNK_TIMEOUT_MS = 28000;
+
+  async function translateBatchItems(settings, items, pageContext, onItem, signal = null, { allowFallback = true } = {}) {
     if (!items || items.length === 0) return;
     const cleanKey = sanitizeApiKey(settings.apiKey);
-    if (!cleanKey && !/^https?:\/\/(localhost|127\.0\.0\.1)/i.test(settings.baseUrl || '')) {
+    if (!cleanKey && !isLocalEndpoint(settings.baseUrl || '')) {
       const err = new Error('請先點擊 ⚙ 設定 API Key');
       err.errorCode = 'NO_API_KEY';
+      throw err;
+    }
+    const keyCheck = validateApiKey(cleanKey);
+    if (!keyCheck.ok) {
+      const err = new Error(keyCheck.error);
+      err.errorCode = 'INVALID_API_KEY_CHARS';
       throw err;
     }
     if (!String(settings.model || '').trim()) {
@@ -5800,6 +6670,7 @@
       throw err;
     }
 
+    const langInfo = resolveTargetLanguage(settings);
     const sig = buildCacheSignature(settings);
     const cacheKeys = items.map((it) => `${sig}::${it.key}`);
     const hits = await cacheGetMany(cacheKeys);
@@ -5807,7 +6678,7 @@
 
     for (let i = 0; i < items.length; i++) {
       const hit = hits.get(cacheKeys[i]);
-      if (hit) {
+      if (hit && !isUserscriptEcho(items[i].text, hit, langInfo.id)) {
         onItem(items[i], hit, true);
       } else {
         uncached.push(items[i]);
@@ -5831,78 +6702,185 @@
           emitted.add(entry.idx);
           const item = uncached[entry.idx];
           onItem(item, entry.text, false);
-          toCache.push({ key: `${sig}::${item.key}`, zh: entry.text });
+          if (!isUserscriptEcho(item.text, entry.text, langInfo.id)) {
+            toCache.push({ key: `${sig}::${item.key}`, zh: entry.text });
+          }
         }
       }
     };
 
-    try {
-      const reqConfig = buildRequestPayload(settings, messages, true);
-      const response = await fetch(reqConfig.url, {
-        method: 'POST',
-        headers: reqConfig.headers,
-        body: reqConfig.body
-      });
-      if (!response.ok) {
-        const errText = await response.text().catch(() => '');
-        throw new Error(`HTTP ${response.status}: ${errText.slice(0, 180)}`);
-      }
+    const reqConfig = buildRequestPayload(settings, messages, true);
+    const nonStreamConfig = buildRequestPayload(settings, messages, false);
+    const maxAttempts = 4;
+    let lastAttemptErr = null;
+    let succeeded = false;
 
-      if (response.body) {
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let sseBuf = '';
-        let ndjsonBuf = '';
-        const processSse = (raw) => {
-          const line = raw.trim();
-          if (!line.startsWith('data:')) return;
-          const d = line.slice(5).trim();
-          if (!d || d === '[DONE]') return;
-          try {
-            const delta = extractDelta(settings.protocol, JSON.parse(d));
-            if (delta) {
-              ndjsonBuf += delta;
+    try {
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        if (signal?.aborted) {
+          throw new DOMException('The operation was aborted.', 'AbortError');
+        }
+        const ctrl = new AbortController();
+        let timedOut = false;
+        const onAbort = () => { try { ctrl.abort(); } catch (_) {} };
+        if (signal) {
+          if (signal.aborted) ctrl.abort();
+          else signal.addEventListener('abort', onAbort, { once: true });
+        }
+        let connectTimer = setTimeout(() => {
+          timedOut = true;
+          try { ctrl.abort(); } catch (_) {}
+        }, USERSCRIPT_CONNECT_TIMEOUT_MS);
+        let chunkTimer = null;
+        let retryAfterMs = 0;
+
+        try {
+          const response = await fetch(reqConfig.url, {
+            method: 'POST',
+            headers: reqConfig.headers,
+            body: reqConfig.body,
+            signal: ctrl.signal
+          });
+          clearTimeout(connectTimer);
+          connectTimer = null;
+
+          if (!response.ok) {
+            retryAfterMs = parseUserscriptRetryAfterMs(response.headers?.get?.('retry-after'));
+            const errText = await response.text().catch(() => '');
+            throw buildUserscriptHttpError(response.status, response.statusText || '', errText, settings);
+          }
+
+          if (response.body) {
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let sseBuf = '';
+            let ndjsonBuf = '';
+            const processSse = (raw) => {
+              const line = raw.trim();
+              if (!line.startsWith('data:')) return;
+              const d = line.slice(5).trim();
+              if (!d || d === '[DONE]') return;
+              let chunkObj;
+              try {
+                chunkObj = JSON.parse(d);
+              } catch (_) {
+                return;
+              }
+              if (settings.protocol === 'anthropic') {
+                const ant = extractAnthropicStreamDelta(chunkObj);
+                if (ant.error) {
+                  const sErr = new Error(redactAllUserscriptKeys(ant.error, settings));
+                  sErr.errorCode = 'SERVER_ERROR';
+                  sErr.retryable = true;
+                  throw sErr;
+                }
+              }
+              if (chunkObj?.error) {
+                const msg = typeof chunkObj.error === 'string'
+                  ? chunkObj.error
+                  : (chunkObj.error.message || JSON.stringify(chunkObj.error));
+                const sErr = new Error(redactAllUserscriptKeys(msg, settings));
+                sErr.httpStatus = Number(chunkObj.error?.code || 0) || 0;
+                throw sErr;
+              }
+              const delta = extractDelta(settings.protocol, chunkObj);
+              if (delta) {
+                ndjsonBuf += delta;
+                let nl;
+                while ((nl = ndjsonBuf.indexOf('\n')) !== -1) {
+                  const l = ndjsonBuf.slice(0, nl);
+                  ndjsonBuf = ndjsonBuf.slice(nl + 1);
+                  handleLine(l);
+                }
+              }
+            };
+            while (true) {
+              if (chunkTimer) clearTimeout(chunkTimer);
+              timedOut = false;
+              chunkTimer = setTimeout(() => {
+                timedOut = true;
+                try { ctrl.abort(); } catch (_) {}
+              }, USERSCRIPT_CHUNK_TIMEOUT_MS);
+              const { value, done } = await reader.read();
+              if (done) break;
+              sseBuf += decoder.decode(value, { stream: true });
               let nl;
-              while ((nl = ndjsonBuf.indexOf('\n')) !== -1) {
-                const l = ndjsonBuf.slice(0, nl);
-                ndjsonBuf = ndjsonBuf.slice(nl + 1);
-                handleLine(l);
+              while ((nl = sseBuf.indexOf('\n')) !== -1) {
+                const l = sseBuf.slice(0, nl);
+                sseBuf = sseBuf.slice(nl + 1);
+                processSse(l);
               }
             }
-          } catch (_) {}
-        };
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          sseBuf += decoder.decode(value, { stream: true });
-          let nl;
-          while ((nl = sseBuf.indexOf('\n')) !== -1) {
-            const l = sseBuf.slice(0, nl);
-            sseBuf = sseBuf.slice(nl + 1);
-            processSse(l);
+            if (chunkTimer) { clearTimeout(chunkTimer); chunkTimer = null; }
+            if (sseBuf.trim()) processSse(sseBuf);
+            if (ndjsonBuf.trim()) handleLine(ndjsonBuf);
+          } else {
+            const rawText = await response.text();
+            for (const l of rawText.split('\n')) handleLine(l);
           }
+          succeeded = true;
+          lastAttemptErr = null;
+          break;
+        } catch (err) {
+          if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
+          if (chunkTimer) { clearTimeout(chunkTimer); chunkTimer = null; }
+          if (signal?.aborted) {
+            throw err;
+          }
+          let attemptErr = err;
+          if (timedOut) {
+            const tErr = new Error('請求逾時，模型長時間無回應');
+            tErr.errorCode = 'TIMEOUT';
+            tErr.retryable = true;
+            attemptErr = tErr;
+          } else if (!err?.isHttpError && err?.name !== 'AbortError') {
+            // Transport / CSP connect-src error ONLY: fall back to GM_xmlhttpRequest!
+            try {
+              const rawResp = await callViaGmXhr(nonStreamConfig, signal, settings);
+              try {
+                const parsed = JSON.parse(rawResp);
+                const fullText = extractDelta(settings.protocol, parsed);
+                for (const l of String(fullText || '').split('\n')) handleLine(l);
+              } catch (_) {
+                for (const l of String(rawResp || '').split('\n')) handleLine(l);
+              }
+              succeeded = true;
+              lastAttemptErr = null;
+              break;
+            } catch (gmErr) {
+              if (signal?.aborted) throw gmErr;
+              attemptErr = gmErr;
+            }
+          }
+          lastAttemptErr = attemptErr;
+          const status = Number(attemptErr?.httpStatus || 0);
+          const canRetry = Boolean(attemptErr?.retryable) && attempt < maxAttempts;
+          if (!canRetry) {
+            break;
+          }
+          const waitMs = computeUserscriptBackoffMs(status, attempt, retryAfterMs);
+          await sleepUserscriptWithAbort(waitMs, signal);
+        } finally {
+          if (connectTimer) clearTimeout(connectTimer);
+          if (chunkTimer) clearTimeout(chunkTimer);
+          if (signal) signal.removeEventListener('abort', onAbort);
         }
-        if (sseBuf.trim()) processSse(sseBuf);
-        if (ndjsonBuf.trim()) handleLine(ndjsonBuf);
-      } else {
-        const rawText = await response.text();
-        for (const l of rawText.split('\n')) handleLine(l);
       }
-    } catch (fetchErr) {
-      // Automatic fallback to GM_xmlhttpRequest if page CSP blocks connect-src!
-      const nonStreamConfig = buildRequestPayload(settings, messages, false);
-      const rawResp = await callViaGmXhr(nonStreamConfig);
-      try {
-        const parsed = JSON.parse(rawResp);
-        const fullText = extractDelta(settings.protocol, parsed);
-        for (const l of String(fullText || '').split('\n')) handleLine(l);
-      } catch (_) {
-        for (const l of String(rawResp || '').split('\n')) handleLine(l);
+    } finally {
+      if (toCache.length > 0) {
+        await cachePutMany(toCache);
       }
     }
 
-    if (toCache.length > 0) {
-      await cachePutMany(toCache);
+    if (!succeeded) {
+      if (allowFallback && isUserscriptFallbackEligible(lastAttemptErr, signal)) {
+        const fbSettings = resolveFallbackSettings(settings);
+        if (fbSettings) {
+          await translateBatchItems(fbSettings, uncached, pageContext, onItem, signal, { allowFallback: false });
+          return;
+        }
+      }
+      throw lastAttemptErr || new Error('翻譯失敗');
     }
   }
 
@@ -5910,9 +6888,10 @@
   // 5. Page Translation Orchestrator + Lazy IntersectionObserver
   // ============================================================
   const state = {
-    settings: readStoredSettings(),
+    settings: buildDefaultUserscriptSettings(),
     isPageActive: false,
     isTranslating: false,
+    haltedByError: false,
     translationEpoch: 0,
     elementState: new WeakMap(),
     pendingItems: [],
@@ -5920,7 +6899,10 @@
     totalTranslated: 0,
     lastErrorMsg: '',
     viewportObserver: null,
-    flushTimer: null
+    flushTimer: null,
+    activeController: null,
+    spaHooked: false,
+    lastHrefPath: location.pathname + location.search
   };
 
   function ensurePageStyleInjected() {
@@ -5931,7 +6913,39 @@
     (document.head || document.documentElement).appendChild(style);
   }
 
+  function releasePendingUserscriptItems() {
+    const released = state.pendingItems.splice(0);
+    for (const item of released) {
+      if (item?.el && state.elementState.get(item.el) === 'queued') {
+        state.elementState.delete(item.el);
+      }
+    }
+  }
+
+  function isCircuitBreakingUserscriptError(err) {
+    const code = String(err?.errorCode || '');
+    const status = Number(err?.httpStatus || 0);
+    if (
+      code === 'NO_API_KEY' ||
+      code === 'INVALID_API_KEY_CHARS' ||
+      code === 'NO_MODEL' ||
+      code === 'AUTH_ERROR' ||
+      code === 'OVERLOADED' ||
+      code === 'RATE_LIMIT' ||
+      code === 'SERVER_ERROR' ||
+      code === 'TIMEOUT' ||
+      code === 'NETWORK_ERROR'
+    ) {
+      return true;
+    }
+    return status >= 400;
+  }
+
   function enqueueItemForTranslation(item) {
+    if (state.haltedByError) {
+      if (item?.el) state.elementState.delete(item.el);
+      return;
+    }
     state.pendingItems.push(item);
     if (!state.flushTimer) {
       state.flushTimer = setTimeout(() => {
@@ -5942,16 +6956,28 @@
   }
 
   async function flushTranslationQueue() {
-    if (state.isTranslating || state.pendingItems.length === 0) return;
+    if (state.isTranslating || state.haltedByError || state.pendingItems.length === 0) return;
     state.isTranslating = true;
     const epoch = state.translationEpoch;
+    const controller = new AbortController();
+    state.activeController = controller;
     const pageContext = KCTSiteAnalyzer.classifyPage();
     updatePillStatus();
 
     try {
-      while (state.pendingItems.length > 0 && epoch === state.translationEpoch) {
+      while (state.pendingItems.length > 0 && epoch === state.translationEpoch && !state.haltedByError) {
         const batchSize = Math.max(1, Number(state.settings.batchSize || 16));
-        const batch = state.pendingItems.splice(0, batchSize);
+        const maxBatchChars = Math.max(800, Number(state.settings.maxBatchChars || 5500));
+        const batch = [];
+        let batchChars = 0;
+        while (state.pendingItems.length > 0 && batch.length < batchSize) {
+          const next = state.pendingItems[0];
+          const nextLen = String(next?.text || '').length;
+          if (batch.length > 0 && batchChars + nextLen > maxBatchChars) break;
+          batch.push(state.pendingItems.shift());
+          batchChars += nextLen;
+        }
+        if (batch.length === 0) break;
 
         await translateBatchItems(state.settings, batch, pageContext, (item, zh) => {
           if (epoch !== state.translationEpoch) return;
@@ -5962,14 +6988,24 @@
           }
           state.totalTranslated += 1;
           updatePillStatus();
-        });
+        }, controller.signal);
       }
     } catch (err) {
-      state.lastErrorMsg = err?.message || '翻譯失敗';
-      if (err?.errorCode === 'NO_API_KEY') {
+      if (controller.signal.aborted || err?.name === 'AbortError') return;
+      const fmt = formatApiError(err, err?.httpStatus, err?.errorCode);
+      state.lastErrorMsg = fmt.shortMsg || err?.message || '翻譯失敗';
+      if (isCircuitBreakingUserscriptError(err)) {
+        state.haltedByError = true;
+        releasePendingUserscriptItems();
+        if (state.viewportObserver) state.viewportObserver.disconnect();
+      }
+      if (err?.errorCode === 'NO_API_KEY' || err?.errorCode === 'INVALID_API_KEY_CHARS') {
         openSettingsModal();
       }
     } finally {
+      if (state.activeController === controller) {
+        state.activeController = null;
+      }
       state.isTranslating = false;
       updatePillStatus();
     }
@@ -5994,15 +7030,47 @@
     };
   }
 
+  function hookSpaNavigation() {
+    if (state.spaHooked) return;
+    state.spaHooked = true;
+    const handleUrlChange = () => {
+      const nextHrefPath = location.pathname + location.search;
+      if (nextHrefPath === state.lastHrefPath) return;
+      state.lastHrefPath = nextHrefPath;
+      const wasActive = state.isPageActive;
+      revertPageTranslation();
+      if (wasActive || isHostWhitelisted(location.hostname, state.settings)) {
+        setTimeout(() => {
+          if (!state.isPageActive) startPageTranslation();
+        }, 350);
+      }
+    };
+    const wrapHistoryMethod = (methodName) => {
+      const orig = history[methodName];
+      if (typeof orig !== 'function') return;
+      history[methodName] = function wrappedHistoryMethod(...args) {
+        const res = orig.apply(this, args);
+        setTimeout(handleUrlChange, 0);
+        return res;
+      };
+    };
+    wrapHistoryMethod('pushState');
+    wrapHistoryMethod('replaceState');
+    window.addEventListener('popstate', () => setTimeout(handleUrlChange, 0));
+  }
+
   function startPageTranslation() {
     ensurePageStyleInjected();
+    hookSpaNavigation();
     state.isPageActive = true;
+    state.haltedByError = false;
     state.lastErrorMsg = '';
     KCTRenderer.applyDisplayModeClass({ ...state.settings, enabled: true });
 
     if (!state.viewportObserver) {
       state.viewportObserver = new IntersectionObserver(
         (entries) => {
+          if (!state.isPageActive || state.haltedByError) return;
           for (const entry of entries) {
             if (!entry.isIntersecting) continue;
             const el = entry.target;
@@ -6049,7 +7117,7 @@
     if (!state.domMutationObserver && document.body) {
       let mutTimer = null;
       state.domMutationObserver = new MutationObserver((mutations) => {
-        if (!state.isPageActive) return;
+        if (!state.isPageActive || state.haltedByError) return;
         let hasNew = false;
         for (const m of mutations) {
           if (m.target?.closest?.('[data-kct-ui]')) continue;
@@ -6066,7 +7134,7 @@
         if (hasNew) {
           if (mutTimer) clearTimeout(mutTimer);
           mutTimer = setTimeout(() => {
-            if (state.isPageActive) startPageTranslation();
+            if (state.isPageActive && !state.haltedByError) startPageTranslation();
           }, 320);
         }
       });
@@ -6077,6 +7145,18 @@
   }
 
   function revertPageTranslation() {
+    state.translationEpoch += 1;
+    if (state.activeController) {
+      try { state.activeController.abort(); } catch (_) {}
+      state.activeController = null;
+    }
+    if (state.flushTimer) {
+      clearTimeout(state.flushTimer);
+      state.flushTimer = null;
+    }
+    releasePendingUserscriptItems();
+    state.haltedByError = false;
+    state.lastErrorMsg = '';
     if (state.viewportObserver) {
       state.viewportObserver.disconnect();
     }
@@ -6346,6 +7426,18 @@
       providerSelect.appendChild(opt);
     }
 
+    const protocolSelect = document.createElement('select');
+    for (const [val, lbl] of [['openai', 'OpenAI 相容'], ['gemini', 'Google Gemini'], ['anthropic', 'Anthropic Claude']]) {
+      const opt = document.createElement('option');
+      opt.value = val;
+      opt.textContent = lbl;
+      protocolSelect.appendChild(opt);
+    }
+
+    const baseUrlInput = document.createElement('input');
+    baseUrlInput.type = 'url';
+    baseUrlInput.placeholder = 'https://...';
+
     const apiKeyInput = document.createElement('input');
     apiKeyInput.type = 'password';
     apiKeyInput.placeholder = '填入 API Key...';
@@ -6366,8 +7458,13 @@
     }
 
     providerSelect.addEventListener('change', () => {
-      const preset = PROVIDER_PRESETS[providerSelect.value] || PROVIDER_PRESETS.gemini;
-      modelInput.value = preset.defaultModel || '';
+      const pid = providerSelect.value;
+      const preset = PROVIDER_PRESETS[pid] || PROVIDER_PRESETS.gemini;
+      const prof = state.settings?.providerProfiles?.[pid];
+      protocolSelect.value = prof?.protocol || preset.protocol || 'openai';
+      baseUrlInput.value = prof?.baseUrl || preset.baseUrl || '';
+      modelInput.value = prof?.model || preset.defaultModel || '';
+      apiKeyInput.value = prof?.apiKey || '';
     });
 
     const modalActions = document.createElement('div');
@@ -6387,6 +7484,8 @@
     modal.append(
       modalTitle,
       makeField('AI 服務商', providerSelect),
+      makeField('API 協定', protocolSelect),
+      makeField('API Base URL', baseUrlInput),
       makeField('API Key 金鑰', apiKeyInput),
       makeField('模型 ID', modelInput),
       makeField('目標語言', langSelect),
@@ -6415,6 +7514,8 @@
       closeBtn,
       modalBackdrop,
       providerSelect,
+      protocolSelect,
+      baseUrlInput,
       apiKeyInput,
       modelInput,
       langSelect,
@@ -6500,12 +7601,38 @@
     saveModalBtn.addEventListener('click', () => {
       const pid = providerSelect.value;
       const preset = PROVIDER_PRESETS[pid] || PROVIDER_PRESETS.gemini;
+      const nextUrl = String(baseUrlInput.value || preset.baseUrl || '').trim();
+      try {
+        const parsed = new URL(nextUrl);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+          showToast('⚠️ Base URL 必須為 http:// 或 https://');
+          return;
+        }
+      } catch (_) {
+        showToast('⚠️ 請輸入有效的 API Base URL');
+        return;
+      }
+      const keyCheck = validateApiKey(apiKeyInput.value);
+      if (!keyCheck.ok) {
+        showToast(`⚠️ ${keyCheck.error}`);
+        return;
+      }
+      const nextProtocol = protocolSelect.value || preset.protocol || 'openai';
+      const nextModel = modelInput.value.trim() || preset.defaultModel || '';
+      const mergedProfiles = normalizeProviderProfiles(state.settings?.providerProfiles, {
+        providerId: pid,
+        protocol: nextProtocol,
+        baseUrl: nextUrl,
+        apiKey: keyCheck.cleanKey,
+        model: nextModel
+      });
       state.settings = writeStoredSettings({
         providerId: pid,
-        protocol: preset.protocol,
-        baseUrl: preset.baseUrl,
-        apiKey: sanitizeApiKey(apiKeyInput.value),
-        model: modelInput.value.trim() || preset.defaultModel,
+        protocol: nextProtocol,
+        baseUrl: nextUrl,
+        apiKey: keyCheck.cleanKey,
+        model: nextModel,
+        providerProfiles: mergedProfiles,
         targetLang: langSelect.value
       });
       modalBackdrop.hidden = true;
@@ -6528,7 +7655,11 @@
     if (!uiRefs) return;
     uiRefs.edgeTab.hidden = true;
     uiRefs.pill.hidden = false;
-    uiRefs.providerSelect.value = PROVIDER_PRESETS[state.settings.providerId] ? state.settings.providerId : 'gemini';
+    const pid = PROVIDER_PRESETS[state.settings.providerId] ? state.settings.providerId : 'custom';
+    const preset = PROVIDER_PRESETS[pid] || PROVIDER_PRESETS.gemini;
+    uiRefs.providerSelect.value = pid;
+    if (uiRefs.protocolSelect) uiRefs.protocolSelect.value = state.settings.protocol || preset.protocol || 'openai';
+    if (uiRefs.baseUrlInput) uiRefs.baseUrlInput.value = state.settings.baseUrl || preset.baseUrl || '';
     uiRefs.apiKeyInput.value = state.settings.apiKey || '';
     uiRefs.modelInput.value = state.settings.model || '';
     uiRefs.langSelect.value = state.settings.targetLang || 'zh-TW';
@@ -6567,9 +7698,10 @@
   // ============================================================
   // 7. Boot
   // ============================================================
-  function boot() {
+  async function boot() {
     if (!KCTSiteAnalyzer.isTopFrame()) return;
-    const synced = checkAndApplyNrSyncHash();
+    await initStoredSettings();
+    const synced = await checkAndApplyNrSyncHash();
     state.settings = readStoredSettings();
     buildShadowUI();
     if (synced) {
@@ -6581,8 +7713,8 @@
   }
 
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', boot, { once: true });
+    document.addEventListener('DOMContentLoaded', () => { void boot(); }, { once: true });
   } else {
-    boot();
+    void boot();
   }
 })();

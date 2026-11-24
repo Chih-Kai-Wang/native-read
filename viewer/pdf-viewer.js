@@ -19,7 +19,8 @@ const {
   getSettings,
   saveSettings,
   hashText,
-  resolveTargetLanguage
+  resolveTargetLanguage,
+  formatApiError
 } = globalThis.KCTConfig;
 
 const ZOOM_STEPS = [0.75, 0.85, 1.0, 1.15, 1.25, 1.5, 1.75];
@@ -101,6 +102,8 @@ const state = {
   cachedKeys: new Set(),
   lastError: '',
   lastErrorCode: '',
+  lastErrorRetryable: false,
+  fallbackNotice: '',
 
   // Observers & Scroll Tracking
   renderObserver: null,
@@ -152,13 +155,23 @@ function recomputeProgressMetrics() {
 function updateStatusBadge() {
   if (state.lastError) {
     dom.statusBadge.dataset.state = 'error';
-    dom.statusText.textContent = state.lastError;
-    dom.statusText.title = state.lastError;
+    const fmt = typeof formatApiError === 'function'
+      ? formatApiError(state.lastError, 0, state.lastErrorCode)
+      : null;
+    dom.statusText.textContent = fmt ? fmt.shortMsg : state.lastError;
+    dom.statusText.title = fmt ? fmt.detailMsg : state.lastError;
     if (state.lastErrorCode === 'NO_API_KEY') {
       dom.statusActionBtn.textContent = '前往設定';
+      dom.statusActionBtn.dataset.action = 'options';
+      dom.statusActionBtn.hidden = false;
+    } else if (state.lastErrorRetryable || fmt?.retryable) {
+      dom.statusActionBtn.textContent = '重試';
+      dom.statusActionBtn.dataset.action = 'retry';
       dom.statusActionBtn.hidden = false;
     } else {
-      dom.statusActionBtn.hidden = true;
+      dom.statusActionBtn.textContent = '前往設定';
+      dom.statusActionBtn.dataset.action = 'options';
+      dom.statusActionBtn.hidden = false;
     }
     return;
   }
@@ -186,7 +199,8 @@ function updateStatusBadge() {
 
   if (translated > 0) {
     dom.statusBadge.dataset.state = 'done';
-    const label = `已譯 ${translated} 段`;
+    const suffix = state.fallbackNotice ? `（${state.fallbackNotice}）` : '';
+    const label = `已譯 ${translated} 段${suffix}`;
     dom.statusText.textContent = label;
     dom.statusText.title = label;
     return;
@@ -618,6 +632,10 @@ function handleStreamMessage(msg) {
     }, 60000);
   }
 
+  if (msg.type === 'HEARTBEAT') {
+    return;
+  }
+
   if (msg.type === 'ITEM') {
     if (req.epoch !== state.translationEpoch) return;
     if (msg.key && typeof msg.zh === 'string' && msg.zh.trim()) {
@@ -630,7 +648,11 @@ function handleStreamMessage(msg) {
   if (msg.type === 'DONE') {
     if (req.timer) clearTimeout(req.timer);
     state.activeStreamRequests.delete(msg.requestId);
-    req.resolve({ ok: true, translatedCount: msg.translatedCount || 0 });
+    req.resolve({
+      ok: true,
+      translatedCount: msg.translatedCount || 0,
+      fallbackUsed: msg.fallbackUsed || null
+    });
     return;
   }
 
@@ -720,6 +742,9 @@ async function sendBatchViaFallback(uniqueItems, pageContext, epoch, onItem) {
     err.errorCode = response?.errorCode || '';
     throw err;
   }
+  if (response.fallbackUsed?.label) {
+    state.fallbackNotice = `已改用備援 ${response.fallbackUsed.label}`;
+  }
   const results = response.results || {};
   for (const item of uniqueItems) {
     const hit = results[item.key];
@@ -727,6 +752,7 @@ async function sendBatchViaFallback(uniqueItems, pageContext, epoch, onItem) {
       onItem(item.key, hit.zh.trim(), Boolean(hit.cached));
     }
   }
+  return { ok: true, fallbackUsed: response.fallbackUsed || null };
 }
 
 function buildPageBatches(items) {
@@ -834,6 +860,8 @@ async function translatePageParagraphs(pageRec, epoch) {
   pageRec.translationInFlight = true;
   state.lastError = '';
   state.lastErrorCode = '';
+  state.lastErrorRetryable = false;
+  state.fallbackNotice = '';
   updateStatusBadge();
 
   const batches = buildPageBatches(toRequest);
@@ -905,6 +933,9 @@ async function translatePageParagraphs(pageRec, epoch) {
         try {
           const res = await sendBatchViaStreamPort(batch, pageContext, epoch, receivedKeys, onItemArrived);
           if (res?.cancelled || epoch !== state.translationEpoch) return;
+          if (res?.fallbackUsed?.label) {
+            state.fallbackNotice = `已改用備援 ${res.fallbackUsed.label}`;
+          }
         } catch (err) {
           if (epoch !== state.translationEpoch) return;
           if (err?.portFallback) {
@@ -912,6 +943,10 @@ async function translatePageParagraphs(pageRec, epoch) {
           } else {
             state.lastError = err?.error || err?.message || '串流翻譯失敗';
             state.lastErrorCode = err?.errorCode || '';
+            state.lastErrorRetryable = Boolean(
+              typeof formatApiError === 'function' &&
+              formatApiError(state.lastError, 0, state.lastErrorCode).retryable
+            );
             allSucceeded = false;
             if (state.lastErrorCode === 'NO_API_KEY') break;
           }
@@ -921,10 +956,17 @@ async function translatePageParagraphs(pageRec, epoch) {
           const remaining = batch.filter((it) => !receivedKeys.has(it.key));
           if (remaining.length > 0) {
             try {
-              await sendBatchViaFallback(remaining, pageContext, epoch, onItemArrived);
+              const fbRes = await sendBatchViaFallback(remaining, pageContext, epoch, onItemArrived);
+              if (fbRes?.fallbackUsed?.label) {
+                state.fallbackNotice = `已改用備援 ${fbRes.fallbackUsed.label}`;
+              }
             } catch (fbErr) {
               state.lastError = fbErr?.message || '翻譯請求失敗';
               state.lastErrorCode = fbErr?.errorCode || '';
+              state.lastErrorRetryable = Boolean(
+                typeof formatApiError === 'function' &&
+                formatApiError(state.lastError, 0, state.lastErrorCode).retryable
+              );
               allSucceeded = false;
               if (state.lastErrorCode === 'NO_API_KEY') break;
             }
@@ -932,10 +974,17 @@ async function translatePageParagraphs(pageRec, epoch) {
         }
       } else {
         try {
-          await sendBatchViaFallback(batch, pageContext, epoch, onItemArrived);
+          const fbRes = await sendBatchViaFallback(batch, pageContext, epoch, onItemArrived);
+          if (fbRes?.fallbackUsed?.label) {
+            state.fallbackNotice = `已改用備援 ${fbRes.fallbackUsed.label}`;
+          }
         } catch (err) {
           state.lastError = err?.message || '翻譯請求失敗';
           state.lastErrorCode = err?.errorCode || '';
+          state.lastErrorRetryable = Boolean(
+            typeof formatApiError === 'function' &&
+            formatApiError(state.lastError, 0, state.lastErrorCode).retryable
+          );
           allSucceeded = false;
           if (state.lastErrorCode === 'NO_API_KEY') break;
         }
@@ -1309,6 +1358,8 @@ async function openPdfFromArrayBuffer(arrayBuffer, { title, host, sourceUrl = ''
   for (const pageRec of state.pages.values()) {
     cancelPageRender(pageRec);
   }
+  state.pages.clear();
+  dom.pagesContainer.replaceChildren();
 
   if (state.pdfDoc) {
     try {
@@ -1325,6 +1376,8 @@ async function openPdfFromArrayBuffer(arrayBuffer, { title, host, sourceUrl = ''
   state.translatedParagraphs = 0;
   state.lastError = '';
   state.lastErrorCode = '';
+  state.lastErrorRetryable = false;
+  state.fallbackNotice = '';
   state.docTitle = title || 'PDF Document';
   state.docHost = host || 'local-pdf';
   state.sourceUrl = sourceUrl;
@@ -1692,7 +1745,22 @@ function bindEvents() {
     chrome.runtime.sendMessage({ type: 'OPEN_OPTIONS' }).catch(() => {});
   };
   dom.settingsBtn.addEventListener('click', openOptions);
-  dom.statusActionBtn.addEventListener('click', openOptions);
+  dom.statusActionBtn.addEventListener('click', () => {
+    if (dom.statusActionBtn.dataset.action === 'retry' && state.pdfDoc) {
+      state.lastError = '';
+      state.lastErrorCode = '';
+      state.lastErrorRetryable = false;
+      state.fallbackNotice = '';
+      updateStatusBadge();
+      for (const pageRec of state.pages.values()) {
+        if (pageRec.isVisible && pageRec.translatedEpoch !== state.translationEpoch) {
+          renderAndTranslatePage(pageRec.pageNum, { forceCanvas: false });
+        }
+      }
+      return;
+    }
+    openOptions();
+  });
 
   // Compare popover controls
   dom.compareCloseBtn.addEventListener('click', closeComparePopover);
@@ -1812,26 +1880,39 @@ function bindEvents() {
     state.settings = nextSettings;
     populateLanguageSelect(nextSettings.targetLang || 'zh-TW');
 
-    const needsRetranslate = Boolean(
+    const nonProviderChanged = Boolean(
       prev && (
         nextSettings.targetLang !== prev.targetLang ||
         nextSettings.customTargetLang !== prev.customTargetLang ||
-        nextSettings.model !== prev.model ||
-        nextSettings.protocol !== prev.protocol ||
         nextSettings.customGlossary !== prev.customGlossary
       )
     );
+    const providerChanged = Boolean(
+      prev && (
+        nextSettings.providerId !== prev.providerId ||
+        nextSettings.baseUrl !== prev.baseUrl ||
+        nextSettings.apiKey !== prev.apiKey ||
+        nextSettings.model !== prev.model ||
+        nextSettings.protocol !== prev.protocol
+      )
+    );
 
-    if (state.pdfDoc && needsRetranslate) {
+    if (state.pdfDoc && nonProviderChanged) {
       handleTargetLanguageChange(nextSettings.targetLang || 'zh-TW', { persist: false });
-    } else if (state.pdfDoc && hadError) {
-      state.lastError = '';
-      state.lastErrorCode = '';
-      updateStatusBadge();
-      for (const pageRec of state.pages.values()) {
-        if (pageRec.isVisible && pageRec.translatedEpoch !== state.translationEpoch) {
-          renderAndTranslatePage(pageRec.pageNum, { forceCanvas: false });
+    } else if (state.pdfDoc && (hadError || providerChanged)) {
+      if (hadError) {
+        state.lastError = '';
+        state.lastErrorCode = '';
+        state.lastErrorRetryable = false;
+        state.fallbackNotice = '';
+        updateStatusBadge();
+        for (const pageRec of state.pages.values()) {
+          if (pageRec.isVisible && pageRec.translatedEpoch !== state.translationEpoch) {
+            renderAndTranslatePage(pageRec.pageNum, { forceCanvas: false });
+          }
         }
+      } else if (nextSettings.model !== prev.model || nextSettings.protocol !== prev.protocol) {
+        handleTargetLanguageChange(nextSettings.targetLang || 'zh-TW', { persist: false });
       }
     }
   });

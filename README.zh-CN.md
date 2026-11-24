@@ -2,7 +2,7 @@
 
 [English](README.md) · [繁體中文](README.zh-TW.md) · **简体中文** · [日本語](README.ja.md) · [한국어](README.ko.md) · [Español](README.es.md) · [Français](README.fr.md) · [Deutsch](README.de.md)
 
-**NativeRead (v2.6.1)** 是一款基于 Manifest V3 的浏览器扩展程序与移动端 PWA，可在保留原始页面排版与布局的前提下，翻译网页、PDF、代码注释及嵌入式信息图。它默认保持静默，仅在需要时使用你自己的 LLM API 密钥按需运行，并逐段流式输出译文，不打断阅读节奏。
+**NativeRead (v2.8.0)** 是一款基于 Manifest V3 的浏览器扩展程序与移动端 PWA，可在保留原始页面排版与布局的前提下，翻译网页、PDF、代码注释及嵌入式信息图。它默认保持静默，仅在需要时使用你自己的 LLM API 密钥按需运行，并逐段流式输出译文，不打断阅读节奏。
 
 ---
 
@@ -17,7 +17,7 @@
 | **Google Drive PDF 页内叠加** | 原位识别 `.ndfHFb-c4YZDc-cYSp0e-DARUcf` 浏览层，合并同栏文本框、重建目录点线引导符，并从页面光栅图像中测量原生字形度量。 | 无需离开当前标签页，即可直接在 Google Drive 内翻译多页 PDF。 |
 | **按需图片与信息图叠加翻译** | 严格按需触发：对 `>= 200x140` px 的图片通过右键菜单（**NativeRead 翻譯圖片文字**）或悬停胶囊按钮（**譯圖**）启用；从不自动扫描页面图片。 | 采样背景色与前景色后原位替换文本块，同时保留 3D 图表与插画。 |
 | **代码注释与 Notebook 输出** | 对静态 `<pre>` 代码块（Pygments、Prism、Highlight.js、GitHub `.pl-c`）采用非破坏性 CSS `attr()` 替换；为 CodeMirror 6（`.cm-editor`）提供只读叠加层；为 Jupyter 输出提供快捷翻译按钮。 | 代码保持可编辑、可运行；聚焦编辑器或切换回原文模式时叠加层自动隐藏。 |
-| **移动端与跨平台支持** | 提供独立移动端 PWA（`docs/`）、通用用户脚本（`docs/nativeread.user.js`）、Android 扩展程序 ZIP 包（`docs/nativeread-android-extension.zip`）以及本地二维码 `#nr_sync` 同步。 | 在 iOS Safari 与 Android 浏览器上无需重复输入 API 密钥即可获得完整翻译体验。 |
+| **移动端与跨平台支持** | 提供独立移动端 PWA（`docs/`）、通用用户脚本（`docs/nativeread.user.js`）、Android 扩展程序 ZIP 包（`docs/nativeread-android-extension.zip`）以及本地 QR 二维码 `#nr_sync` 同步。 | 在 iOS Safari 与 Android 浏览器上无需重复输入 API 密钥即可获得完整翻译体验。 |
 
 ### 快速开始（桌面端扩展程序）
 

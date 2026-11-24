@@ -190,6 +190,9 @@ export async function startFixtureServer(opts = {}) {
     close: () =>
       new Promise((resolve) => {
         server.close(() => resolve());
+        if (typeof server.closeAllConnections === 'function') {
+          server.closeAllConnections();
+        }
       })
   };
 }
@@ -257,6 +260,9 @@ export async function startMockLlmServer(handler) {
     close: () =>
       new Promise((resolve) => {
         server.close(() => resolve());
+        if (typeof server.closeAllConnections === 'function') {
+          server.closeAllConnections();
+        }
       })
   };
 }

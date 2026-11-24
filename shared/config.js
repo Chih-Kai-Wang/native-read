@@ -58,6 +58,7 @@
       defaultModel: 'google/gemini-2.5-flash',
       suggestedModels: ['google/gemini-2.5-flash'],
       placeholderKey: 'sk-or-...',
+      publicModelList: true,
       hint: '聚合數百個模型，模型清單不需金鑰即可查詢。'
     },
     groq: {
@@ -135,6 +136,7 @@
       defaultModel: '',
       suggestedModels: [],
       placeholderKey: '...',
+      publicModelList: true,
       hint: '開源模型託管；模型清單不需金鑰即可查詢。'
     },
     huggingface: {
@@ -146,6 +148,7 @@
       defaultModel: '',
       suggestedModels: [],
       placeholderKey: 'hf_...',
+      publicModelList: true,
       hint: '使用 Hugging Face Token；模型清單不需金鑰即可查詢。'
     },
     novita: {
@@ -157,6 +160,7 @@
       defaultModel: '',
       suggestedModels: [],
       placeholderKey: '...',
+      publicModelList: true,
       hint: '開源模型託管；模型清單不需金鑰即可查詢。'
     },
     deepseek: {
@@ -488,7 +492,7 @@
     'hyperparameter -> 超參數'
   ].join('\n');
 
-  const CURRENT_SCHEMA_VERSION = 5;
+  const CURRENT_SCHEMA_VERSION = 6;
 
   const DEFAULT_SETTINGS = {
     settingsSchemaVersion: CURRENT_SCHEMA_VERSION,
@@ -513,6 +517,8 @@
     baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
     apiKey: '',
     model: 'gemini-3.5-flash-lite',
+    providerProfiles: {},
+    fallbackProviderId: '',
     temperature: 0.2,
     batchSize: 20,
     maxBatchChars: 5500,
@@ -540,27 +546,56 @@
   }
 
   function normalizeOpenAIEndpoint(baseUrl) {
-    const clean = String(baseUrl || '').trim().replace(/\/+$/, '');
-    if (!clean) return '';
-    if (clean.endsWith('/chat/completions')) return clean;
-    if (/\/(v\d+|openai|compatible-mode\/v1|api\/paas\/v\d+)$/i.test(clean)) {
-      return `${clean}/chat/completions`;
+    const raw = String(baseUrl || '').trim();
+    if (!raw) return '';
+    let parsed;
+    try {
+      parsed = new URL(raw);
+    } catch (_) {
+      return '';
     }
-    return `${clean}/v1/chat/completions`;
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return '';
+    }
+    const pathname = parsed.pathname.replace(/\/+$/, '');
+    if (/\/chat\/completions$/i.test(pathname)) {
+      parsed.pathname = pathname;
+      return parsed.toString();
+    }
+    if (/\/(v\d+|openai|compatible-mode\/v1|api\/paas\/v\d+|openai\/deployments\/[^/]+)$/i.test(pathname) || (isAzureOpenAIEndpoint(raw) && pathname && pathname !== '/')) {
+      parsed.pathname = `${pathname}/chat/completions`;
+    } else {
+      parsed.pathname = `${pathname}/v1/chat/completions`;
+    }
+    return parsed.toString();
   }
 
   function normalizeGeminiEndpoint(baseUrl, model) {
-    const clean = String(baseUrl || 'https://generativelanguage.googleapis.com/v1beta')
-      .trim()
-      .replace(/\/+$/, '');
-    const m = String(model || 'gemini-2.5-flash').trim().replace(/^models\//, '');
-    if (clean.includes(':generateContent') || clean.includes(':streamGenerateContent')) {
-      return clean;
+    const raw = String(baseUrl || '').trim() || 'https://generativelanguage.googleapis.com/v1beta';
+    let parsed;
+    try {
+      parsed = new URL(raw);
+    } catch (_) {
+      return '';
     }
-    if (/\/v1(beta)?$/i.test(clean)) {
-      return `${clean}/models/${encodeURIComponent(m)}:generateContent`;
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return '';
     }
-    return `${clean}/v1beta/models/${encodeURIComponent(m)}:generateContent`;
+    const pathname = parsed.pathname.replace(/\/+$/, '');
+    if (/:(?:stream)?generateContent$/i.test(pathname)) {
+      parsed.pathname = pathname;
+      return parsed.toString();
+    }
+    const m = String(model ?? '').trim().replace(/^models\//i, '');
+    if (!m) return '';
+    if (/\/v1(?:alpha|beta)?\/models$/i.test(pathname)) {
+      parsed.pathname = `${pathname}/${encodeURIComponent(m)}:generateContent`;
+    } else if (/\/v1(?:alpha|beta)?$/i.test(pathname)) {
+      parsed.pathname = `${pathname}/models/${encodeURIComponent(m)}:generateContent`;
+    } else {
+      parsed.pathname = `${pathname}/v1beta/models/${encodeURIComponent(m)}:generateContent`;
+    }
+    return parsed.toString();
   }
 
   function isAzureOpenAIEndpoint(baseUrl) {
@@ -590,16 +625,29 @@
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
       return '';
     }
-    const clean = parsed.toString().replace(/\/+$/, '');
-    if (clean.endsWith('/v1/messages')) return clean;
-    if (clean.endsWith('/v1')) return `${clean}/messages`;
-    return `${clean}/v1/messages`;
+    const pathname = parsed.pathname.replace(/\/+$/, '');
+    if (/\/v1\/messages$/i.test(pathname)) {
+      parsed.pathname = pathname;
+    } else if (/\/v1$/i.test(pathname)) {
+      parsed.pathname = `${pathname}/messages`;
+    } else {
+      parsed.pathname = `${pathname}/v1/messages`;
+    }
+    return parsed.toString();
   }
 
   function buildProviderAuthHeaders(settings, cleanKey) {
     const headers = { 'Content-Type': 'application/json' };
     const protocol = settings?.protocol || 'openai';
-    const key = String(cleanKey || '').trim();
+    const check = validateApiKey(cleanKey);
+    if (!check.ok) {
+      const err = new Error(check.error);
+      err.errorCode = 'INVALID_API_KEY_CHARS';
+      err.noRetry = true;
+      err.noSplit = true;
+      throw err;
+    }
+    const key = check.cleanKey;
 
     if (protocol === 'gemini') {
       if (key) headers['x-goog-api-key'] = key;
@@ -787,45 +835,53 @@
 
     try {
       if (protocol === 'gemini') {
-        let base = (rawBase || 'https://generativelanguage.googleapis.com/v1beta')
+        const parsed = new URL(rawBase || 'https://generativelanguage.googleapis.com/v1beta');
+        if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return '';
+        let pathname = parsed.pathname
           .replace(/\/+$/, '')
           .replace(/\/models\/[^/?#]+$/i, '')
           .replace(/\/models$/i, '')
           .replace(/\/+$/, '');
-        if (!/\/v1(beta)?$/i.test(base)) {
-          base = `${base}/v1beta`;
+        if (!/\/v1(?:alpha|beta)?$/i.test(pathname)) {
+          pathname = `${pathname}/v1beta`;
         }
-        const u = new URL(`${base}/models`);
-        if (u.protocol !== 'https:' && u.protocol !== 'http:') return '';
-        u.searchParams.set('pageSize', '1000');
+        parsed.pathname = `${pathname}/models`;
+        parsed.searchParams.set('pageSize', '1000');
         if (pageToken) {
-          u.searchParams.set('pageToken', String(pageToken));
+          parsed.searchParams.set('pageToken', String(pageToken));
         }
-        return u.toString();
+        return parsed.toString();
       }
 
       if (protocol === 'anthropic') {
-        const base = rawBase || 'https://api.anthropic.com/v1';
-        const parsed = new URL(base);
+        const parsed = new URL(rawBase || 'https://api.anthropic.com/v1');
         if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return '';
-        const u = new URL(`${parsed.origin}/v1/models`);
-        u.searchParams.set('limit', '1000');
+        const pathname = parsed.pathname
+          .replace(/\/+$/, '')
+          .replace(/\/messages$/i, '')
+          .replace(/\/models$/i, '')
+          .replace(/\/+$/, '');
+        parsed.pathname = /\/v1$/i.test(pathname) ? `${pathname}/models` : `${pathname}/v1/models`;
+        parsed.searchParams.set('limit', '1000');
         if (pageToken) {
-          u.searchParams.set('after_id', String(pageToken));
+          parsed.searchParams.set('after_id', String(pageToken));
         }
-        return u.toString();
+        return parsed.toString();
       }
 
       if (protocol === 'openai') {
         if (!rawBase) return '';
-        const base = rawBase
+        const parsed = new URL(rawBase);
+        if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return '';
+        const pathname = parsed.pathname
           .replace(/\/+$/, '')
           .replace(/\/chat\/completions$/i, '')
+          .replace(/\/models$/i, '')
           .replace(/\/+$/, '');
-        if (!base) return '';
-        const u = new URL(`${base}/models`);
-        if (u.protocol !== 'https:' && u.protocol !== 'http:') return '';
-        return u.toString();
+        parsed.pathname = /\/(v\d+|openai|compatible-mode\/v1|api\/paas\/v\d+|openai\/deployments\/[^/]+)$/i.test(pathname) || (isAzureOpenAIEndpoint(rawBase) && pathname && pathname !== '/')
+          ? `${pathname}/models`
+          : `${pathname}/v1/models`;
+        return parsed.toString();
       }
     } catch {
       return '';
@@ -994,14 +1050,16 @@
       return false;
     }
     const host = parsed.hostname.toLowerCase();
+    const pathname = (parsed.pathname || '').toLowerCase();
     if (host === 'chromewebstore.google.com') return false;
-    if (host === 'chrome.google.com' && parsed.pathname.startsWith('/webstore')) return false;
-    if (host === 'microsoftedge.microsoft.com' && parsed.pathname.startsWith('/addons')) return false;
+    if (host === 'addons.mozilla.org') return false;
+    if (host === 'chrome.google.com' && pathname.startsWith('/webstore')) return false;
+    if (host === 'microsoftedge.microsoft.com' && pathname.startsWith('/addons')) return false;
     return true;
   }
 
   function isLocalEndpoint(baseUrl) {
-    return /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?(\/|$)/i.test(String(baseUrl || '').trim());
+    return /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d+)?(\/|$)/i.test(String(baseUrl || '').trim());
   }
 
   const EXTENSIONLESS_PDF_HOSTS = new Set([
@@ -1054,6 +1112,7 @@
     }
     if (/\.pdf$/i.test(pathname)) return true;
     if (EXTENSIONLESS_PDF_HOSTS.has(host) && /^\/pdf\/[^/]+/i.test(pathname)) return true;
+    if (host === 'openreview.net' && /^\/pdf\/?$/i.test(pathname) && parsed.searchParams.has('id')) return true;
     for (const [k, v] of parsed.searchParams.entries()) {
       if (k.toLowerCase() === 'format' && v.toLowerCase() === 'pdf') return true;
     }
@@ -1093,17 +1152,17 @@
 
   async function getSettings() {
     if (!chrome?.runtime?.id) {
-      return { ...DEFAULT_SETTINGS, autoTranslateHosts: [] };
+      return { ...DEFAULT_SETTINGS, autoTranslateHosts: [], providerProfiles: {} };
     }
     let data;
     try {
       data = await chrome.storage.local.get(SETTINGS_KEY);
     } catch (_) {
-      return { ...DEFAULT_SETTINGS, autoTranslateHosts: [] };
+      return { ...DEFAULT_SETTINGS, autoTranslateHosts: [], providerProfiles: {} };
     }
     const raw = data[SETTINGS_KEY];
     if (!raw) {
-      return { ...DEFAULT_SETTINGS, autoTranslateHosts: [] };
+      return { ...DEFAULT_SETTINGS, autoTranslateHosts: [], providerProfiles: {} };
     }
     const ver = raw.settingsSchemaVersion || 1;
     if (ver < CURRENT_SCHEMA_VERSION) {
@@ -1119,7 +1178,11 @@
             : raw.customGlossary
         };
       }
-      migrated.autoTranslate = false;
+      if (ver < 5) {
+        migrated.autoTranslate = false;
+      } else {
+        migrated.autoTranslate = Boolean(raw.autoTranslate);
+      }
       migrated.autoTranslateHosts = Array.isArray(raw.autoTranslateHosts)
         ? raw.autoTranslateHosts.map(normalizeHostname).filter(Boolean)
         : [];
@@ -1127,12 +1190,18 @@
       migrated.streamTranslation = raw.streamTranslation ?? true;
       migrated.thinkingEffort = raw.thinkingEffort || 'fastest';
       migrated.typographyMatch = raw.typographyMatch || 'native';
-      migrated.batchSize = (!raw.batchSize || raw.batchSize === 8 || raw.batchSize === 16 || raw.batchSize === 24)
-        ? 20
-        : raw.batchSize;
-      migrated.maxBatchChars = (!raw.maxBatchChars || raw.maxBatchChars === 1800 || raw.maxBatchChars === 4500 || raw.maxBatchChars === 6500)
-        ? 5500
-        : raw.maxBatchChars;
+      if (ver < 4) {
+        migrated.batchSize = (!raw.batchSize || raw.batchSize === 8 || raw.batchSize === 16 || raw.batchSize === 24)
+          ? 20
+          : raw.batchSize;
+        migrated.maxBatchChars = (!raw.maxBatchChars || raw.maxBatchChars === 1800 || raw.maxBatchChars === 4500 || raw.maxBatchChars === 6500)
+          ? 5500
+          : raw.maxBatchChars;
+      }
+      migrated.apiKey = sanitizeApiKey(migrated.apiKey);
+      migrated.providerProfiles = normalizeProviderProfiles(raw.providerProfiles, migrated);
+      const rawFb = String(raw.fallbackProviderId || '').trim();
+      migrated.fallbackProviderId = rawFb === migrated.providerId ? '' : rawFb;
       migrated.settingsSchemaVersion = CURRENT_SCHEMA_VERSION;
       try {
         await chrome.storage.local.set({ [SETTINGS_KEY]: migrated });
@@ -1141,31 +1210,57 @@
       }
       return migrated;
     }
-    return {
+    const normalized = {
       ...DEFAULT_SETTINGS,
       ...raw,
+      apiKey: sanitizeApiKey(raw.apiKey),
       autoTranslateHosts: Array.isArray(raw.autoTranslateHosts)
         ? raw.autoTranslateHosts.map(normalizeHostname).filter(Boolean)
-        : []
+        : [],
+      fallbackProviderId: String(raw.fallbackProviderId || '').trim()
     };
+    if (normalized.fallbackProviderId === normalized.providerId) {
+      normalized.fallbackProviderId = '';
+    }
+    normalized.providerProfiles = normalizeProviderProfiles(raw.providerProfiles, normalized);
+    return normalized;
   }
 
-  async function saveSettings(partial) {
-    const current = await getSettings();
-    const next = {
-      ...current,
-      ...partial,
-      settingsSchemaVersion: CURRENT_SCHEMA_VERSION
-    };
-    if (Array.isArray(next.autoTranslateHosts)) {
-      next.autoTranslateHosts = Array.from(
-        new Set(next.autoTranslateHosts.map(normalizeHostname).filter(Boolean))
-      );
-    } else {
-      next.autoTranslateHosts = [];
-    }
-    await chrome.storage.local.set({ [SETTINGS_KEY]: next });
-    return next;
+  let settingsSaveChain = Promise.resolve();
+
+  function saveSettings(partial) {
+    const run = settingsSaveChain.then(async () => {
+      const current = await getSettings();
+      const hasExplicitProfiles =
+        Boolean(partial) &&
+        typeof partial.providerProfiles === 'object' &&
+        partial.providerProfiles !== null &&
+        !Array.isArray(partial.providerProfiles);
+      const baseProfiles = hasExplicitProfiles ? partial.providerProfiles : current.providerProfiles;
+      const next = {
+        ...current,
+        ...(partial && typeof partial === 'object' ? partial : {}),
+        providerProfiles: baseProfiles,
+        settingsSchemaVersion: CURRENT_SCHEMA_VERSION
+      };
+      next.apiKey = sanitizeApiKey(next.apiKey);
+      if (Array.isArray(next.autoTranslateHosts)) {
+        next.autoTranslateHosts = Array.from(
+          new Set(next.autoTranslateHosts.map(normalizeHostname).filter(Boolean))
+        );
+      } else {
+        next.autoTranslateHosts = [];
+      }
+      next.fallbackProviderId = String(next.fallbackProviderId || '').trim();
+      if (next.fallbackProviderId === next.providerId) {
+        next.fallbackProviderId = '';
+      }
+      next.providerProfiles = normalizeProviderProfiles(next.providerProfiles, next);
+      await chrome.storage.local.set({ [SETTINGS_KEY]: next });
+      return next;
+    });
+    settingsSaveChain = run.catch(() => {});
+    return run;
   }
 
   function hashText(str) {
@@ -1184,9 +1279,356 @@
 
   function sanitizeApiKey(rawKey) {
     return String(rawKey || '')
+      .replace(/[\u200B-\u200D\uFEFF\r\n\t]+/g, '')
       .trim()
       .replace(/^Bearer\s+/i, '')
       .trim();
+  }
+
+  function validateApiKey(rawKey) {
+    const cleanKey = sanitizeApiKey(rawKey);
+    if (!cleanKey) return { ok: true, cleanKey: '', error: '' };
+    if (!/^[\x21-\x7E]+$/.test(cleanKey)) {
+      return {
+        ok: false,
+        cleanKey,
+        error: 'API Key 格式錯誤：包含空白、不可見字元或非 ASCII 字元，請重新複製純金鑰。'
+      };
+    }
+    return { ok: true, cleanKey, error: '' };
+  }
+
+  function normalizeProviderProfiles(rawProfiles, activeSettings = null) {
+    const out = {};
+    if (rawProfiles && typeof rawProfiles === 'object' && !Array.isArray(rawProfiles)) {
+      for (const [id, entry] of Object.entries(rawProfiles)) {
+        const pid = String(id || '').trim();
+        if (!pid || !entry || typeof entry !== 'object') continue;
+        const preset = PROVIDER_PRESETS[pid] || null;
+        const cleanEntry = {
+          protocol: String(entry.protocol || preset?.protocol || 'openai').trim(),
+          baseUrl: String(entry.baseUrl ?? preset?.baseUrl ?? '').trim(),
+          apiKey: sanitizeApiKey(entry.apiKey),
+          model: String(entry.model ?? preset?.defaultModel ?? '').trim(),
+          thinkingEffort: String(entry.thinkingEffort || 'fastest').trim()
+        };
+        if (isProfileSaved(pid, cleanEntry)) {
+          out[pid] = cleanEntry;
+        }
+      }
+    }
+    const activeId = String(activeSettings?.providerId || '').trim();
+    if (activeId) {
+      const preset = PROVIDER_PRESETS[activeId] || null;
+      const cleanKey = sanitizeApiKey(activeSettings.apiKey);
+      const activeUrl = String(activeSettings.baseUrl ?? preset?.baseUrl ?? '').trim();
+      const activeModel = String(activeSettings.model ?? preset?.defaultModel ?? out[activeId]?.model ?? '').trim();
+      const candidate = {
+        protocol: String(activeSettings.protocol || preset?.protocol || out[activeId]?.protocol || 'openai').trim(),
+        baseUrl: activeUrl,
+        apiKey: cleanKey,
+        model: activeModel,
+        thinkingEffort: String(activeSettings.thinkingEffort || out[activeId]?.thinkingEffort || 'fastest').trim()
+      };
+      if (isProfileSaved(activeId, candidate) || Object.prototype.hasOwnProperty.call(out, activeId)) {
+        out[activeId] = candidate;
+      }
+    }
+    return out;
+  }
+
+  function isProfileSaved(providerId, profile) {
+    if (!profile || typeof profile !== 'object') return false;
+    if (sanitizeApiKey(profile.apiKey)) return true;
+    const rawUrl = profile.baseUrl !== undefined ? profile.baseUrl : (PROVIDER_PRESETS[providerId]?.baseUrl || '');
+    const url = String(rawUrl || '').trim();
+    const model = String(profile.model || '').trim();
+    if (isLocalEndpoint(url) && model) return true;
+    if (providerId === 'custom' && url && model) return true;
+    return false;
+  }
+
+  function isProfileReady(providerId, profile) {
+    if (!isProfileSaved(providerId, profile)) return false;
+    const rawUrl = profile.baseUrl !== undefined ? profile.baseUrl : (PROVIDER_PRESETS[providerId]?.baseUrl || '');
+    const url = String(rawUrl || '').trim();
+    const model = String(profile?.model || PROVIDER_PRESETS[providerId]?.defaultModel || '').trim();
+    const hasKey = Boolean(sanitizeApiKey(profile?.apiKey));
+    return Boolean(model) && (hasKey || isLocalEndpoint(url));
+  }
+
+  function listSavedProviders(settings) {
+    const profiles = normalizeProviderProfiles(settings?.providerProfiles, settings);
+    const activeId = String(settings?.providerId || '').trim();
+    const fallbackId = String(settings?.fallbackProviderId || '').trim();
+    const seen = new Set();
+    const orderedIds = [];
+    if (activeId) {
+      orderedIds.push(activeId);
+      seen.add(activeId);
+    }
+    for (const presetId of Object.keys(PROVIDER_PRESETS)) {
+      if (!seen.has(presetId) && profiles[presetId] && isProfileSaved(presetId, profiles[presetId])) {
+        orderedIds.push(presetId);
+        seen.add(presetId);
+      }
+    }
+    for (const pid of Object.keys(profiles)) {
+      if (!seen.has(pid) && isProfileSaved(pid, profiles[pid])) {
+        orderedIds.push(pid);
+        seen.add(pid);
+      }
+    }
+    return orderedIds.map((pid) => {
+      const preset = PROVIDER_PRESETS[pid] || null;
+      const prof = (pid === activeId)
+        ? {
+            protocol: settings?.protocol || preset?.protocol || 'openai',
+            baseUrl: settings?.baseUrl ?? preset?.baseUrl ?? '',
+            apiKey: sanitizeApiKey(settings?.apiKey),
+            model: settings?.model ?? preset?.defaultModel ?? '',
+            thinkingEffort: settings?.thinkingEffort || 'fastest'
+          }
+        : (profiles[pid] || {});
+      const rawUrl = prof.baseUrl !== undefined ? prof.baseUrl : (preset?.baseUrl || '');
+      const url = String(rawUrl || '').trim();
+      const hasKey = Boolean(sanitizeApiKey(prof.apiKey));
+      const local = isLocalEndpoint(url);
+      const model = String(prof.model || '').trim();
+      const isReady = isProfileReady(pid, { ...prof, baseUrl: url, model });
+      return {
+        providerId: pid,
+        label: preset?.label || pid,
+        model,
+        protocol: prof.protocol || preset?.protocol || 'openai',
+        baseUrl: url,
+        hasKey,
+        isLocal: local,
+        isReady,
+        isActive: pid === activeId,
+        isFallback: Boolean(fallbackId && pid === fallbackId && pid !== activeId)
+      };
+    });
+  }
+
+  function switchActiveProviderSettings(settings, targetProviderId) {
+    const cur = settings && typeof settings === 'object' ? settings : { ...DEFAULT_SETTINGS };
+    const targetId = String(targetProviderId || '').trim();
+    if (!targetId) return { ...cur };
+    const targetPreset = PROVIDER_PRESETS[targetId] || null;
+    const nextProfiles = normalizeProviderProfiles(cur.providerProfiles, null);
+    const curId = String(cur.providerId || '').trim();
+    if (curId) {
+      const curPreset = PROVIDER_PRESETS[curId] || null;
+      const curKey = sanitizeApiKey(cur.apiKey);
+      const curUrl = String(cur.baseUrl ?? curPreset?.baseUrl ?? '').trim();
+      const curModel = String(cur.model || '').trim();
+      const isNonDefaultModel = Boolean(curModel && curModel !== (curPreset?.defaultModel || ''));
+      if (curKey || (isLocalEndpoint(curUrl) && curModel) || isNonDefaultModel || Object.prototype.hasOwnProperty.call(nextProfiles, curId)) {
+        nextProfiles[curId] = {
+          protocol: String(cur.protocol || curPreset?.protocol || 'openai').trim(),
+          baseUrl: curUrl,
+          apiKey: curKey,
+          model: curModel,
+          thinkingEffort: String(cur.thinkingEffort || 'fastest').trim()
+        };
+      }
+    }
+    const savedTarget = nextProfiles[targetId] || null;
+    return {
+      ...cur,
+      providerId: targetId,
+      protocol: savedTarget?.protocol || targetPreset?.protocol || cur.protocol || 'openai',
+      baseUrl: savedTarget?.baseUrl || targetPreset?.baseUrl || '',
+      apiKey: savedTarget ? sanitizeApiKey(savedTarget.apiKey) : '',
+      model: savedTarget?.model || targetPreset?.defaultModel || '',
+      thinkingEffort: savedTarget?.thinkingEffort || cur.thinkingEffort || 'fastest',
+      providerProfiles: nextProfiles,
+      fallbackProviderId: cur.fallbackProviderId === targetId ? '' : String(cur.fallbackProviderId || '')
+    };
+  }
+
+  function removeProviderProfile(settings, providerId) {
+    const cur = settings && typeof settings === 'object' ? settings : { ...DEFAULT_SETTINGS };
+    const targetId = String(providerId || '').trim();
+    const curId = String(cur.providerId || '').trim();
+    const nextProfiles = normalizeProviderProfiles(cur.providerProfiles, cur);
+    if (!targetId || targetId === curId) {
+      return {
+        ...cur,
+        providerProfiles: nextProfiles
+      };
+    }
+    delete nextProfiles[targetId];
+    return {
+      ...cur,
+      providerProfiles: nextProfiles,
+      fallbackProviderId: cur.fallbackProviderId === targetId ? '' : String(cur.fallbackProviderId || '')
+    };
+  }
+
+  function resolveFallbackSettings(settings) {
+    const fbId = String(settings?.fallbackProviderId || '').trim();
+    const curId = String(settings?.providerId || '').trim();
+    if (!fbId || fbId === curId) return null;
+    const prof = settings?.providerProfiles?.[fbId];
+    if (!isProfileReady(fbId, prof)) return null;
+    const preset = PROVIDER_PRESETS[fbId] || null;
+    return {
+      ...settings,
+      providerId: fbId,
+      protocol: String(prof.protocol || preset?.protocol || 'openai').trim(),
+      baseUrl: String(prof.baseUrl || preset?.baseUrl || '').trim(),
+      apiKey: sanitizeApiKey(prof.apiKey),
+      model: String(prof.model || preset?.defaultModel || '').trim(),
+      thinkingEffort: String(prof.thinkingEffort || settings?.thinkingEffort || 'fastest').trim(),
+      fallbackProviderId: ''
+    };
+  }
+
+  function formatApiError(errOrMsg, httpStatus = 0, errorCode = '') {
+    const rawMsg = (
+      typeof errOrMsg === 'string'
+        ? errOrMsg
+        : (errOrMsg?.message || String(errOrMsg || ''))
+    ).replace(/\s+/g, ' ').trim();
+    let status = Number(httpStatus || (typeof errOrMsg === 'object' && errOrMsg?.httpStatus) || 0);
+    if (!status && rawMsg) {
+      const m = rawMsg.match(/\bHTTP(?:_|\s+)(\d{3})\b/i);
+      if (m) status = Number(m[1]);
+    }
+    const code = String(errorCode || (typeof errOrMsg === 'object' && errOrMsg?.errorCode) || '').trim();
+
+    if (code === 'INVALID_API_KEY_CHARS' || /API Key 格式錯誤|non ISO-8859-1|Invalid header value/i.test(rawMsg)) {
+      return {
+        shortMsg: 'API Key 格式有誤',
+        detailMsg: 'API Key 含有不可見字元或非英文 ASCII 符號，請重新複製純金鑰並儲存',
+        rawMsg,
+        retryable: false,
+        suggestSwitch: true
+      };
+    }
+
+    if (code === 'NO_API_KEY' || /尚未設定.*API Key/i.test(rawMsg)) {
+      return {
+        shortMsg: '尚未設定 API Key',
+        detailMsg: '尚未設定 API Key，請先填寫金鑰或切換其他已設定的供應商',
+        rawMsg,
+        retryable: false,
+        suggestSwitch: true
+      };
+    }
+
+    if (code === 'NO_MODEL' || /尚未選擇模型/i.test(rawMsg)) {
+      return {
+        shortMsg: '尚未選擇模型',
+        detailMsg: rawMsg || '尚未選擇模型，請先至設定頁選擇模型',
+        rawMsg,
+        retryable: false,
+        suggestSwitch: false
+      };
+    }
+
+    if (status === 401 || status === 403 || code === 'AUTH_ERROR' || code === 'HTTP_401' || code === 'HTTP_403') {
+      const displayStatus = status || (code === 'HTTP_403' ? 403 : 401);
+      return {
+        shortMsg: 'API Key 驗證失敗',
+        detailMsg: `API Key 無效或無存取權限（HTTP ${displayStatus}），請檢查金鑰設定`,
+        rawMsg,
+        retryable: false,
+        suggestSwitch: true
+      };
+    }
+
+    if (status === 404 || code === 'HTTP_404') {
+      return {
+        shortMsg: '模型不存在 (404)',
+        detailMsg: '找不到指定模型（HTTP 404），請至設定重新取得模型清單',
+        rawMsg,
+        retryable: false,
+        suggestSwitch: true
+      };
+    }
+
+    if (
+      status === 429 ||
+      code === 'QUOTA_EXCEEDED' ||
+      code === 'RATE_LIMITED' ||
+      code === 'RATE_LIMIT' ||
+      /rate limit|PerDay|RequestsPerDay|GenerateRequestsPerDay/i.test(rawMsg)
+    ) {
+      if (
+        code === 'QUOTA_EXCEEDED' ||
+        /PerDay|RequestsPerDay|GenerateRequestsPerDay|每日.*額度|配額上限|額度已用盡|配額為 0|quota/i.test(rawMsg)
+      ) {
+        return {
+          shortMsg: '每日額度已用盡 (429)',
+          detailMsg: '已達此供應商配額上限（HTTP 429），建議切換其他供應商或模型',
+          rawMsg,
+          retryable: false,
+          suggestSwitch: true
+        };
+      }
+      return {
+        shortMsg: '請求過頻 (429)',
+        detailMsg: 'API 請求頻率達上限（HTTP 429），請稍候重試或切換供應商',
+        rawMsg,
+        retryable: true,
+        suggestSwitch: true
+      };
+    }
+
+    const noExplicitStatusOrOverload = !status || status === 503 || status === 529;
+    if (
+      status === 503 ||
+      status === 529 ||
+      code === 'OVERLOADED' ||
+      (noExplicitStatusOrOverload && /high demand|overloaded|UNAVAILABLE|capacity|temporarily unavailable/i.test(rawMsg))
+    ) {
+      const displayStatus = status === 529 ? 529 : 503;
+      return {
+        shortMsg: `模型尖峰過載 (${displayStatus})`,
+        detailMsg: `目前模型流量過載（HTTP ${displayStatus}），可重試或立即切換其他供應商`,
+        rawMsg,
+        retryable: true,
+        suggestSwitch: true
+      };
+    }
+
+    if (status === 500 || status === 502 || status === 504 || code === 'SERVER_ERROR') {
+      const displayStatus = status || 500;
+      return {
+        shortMsg: `服務暫時異常 (${displayStatus})`,
+        detailMsg: `AI 服務端暫時異常（HTTP ${displayStatus}），可重試或切換供應商`,
+        rawMsg,
+        retryable: true,
+        suggestSwitch: true
+      };
+    }
+
+    if (code === 'TIMEOUT' || code === 'NETWORK_ERROR' || /timeout|timed out|逾時|failed to fetch|networkerror|load failed/i.test(rawMsg)) {
+      return {
+        shortMsg: '連線逾時或網路異常',
+        detailMsg: rawMsg || '請求逾時或網路連線失敗，可重試或切換其他供應商',
+        rawMsg,
+        retryable: true,
+        suggestSwitch: true
+      };
+    }
+
+    const fallbackShort = rawMsg
+      ? (rawMsg.length > 22 ? `${rawMsg.slice(0, 21)}…` : rawMsg)
+      : '翻譯失敗';
+    const fallbackDetail = rawMsg
+      ? (rawMsg.length > 90 ? `${rawMsg.slice(0, 89)}…` : rawMsg)
+      : '翻譯失敗，請稍後重試或切換供應商';
+    return {
+      shortMsg: fallbackShort,
+      detailMsg: fallbackDetail,
+      rawMsg,
+      retryable: true,
+      suggestSwitch: true
+    };
   }
 
   globalThis.KCTConfig = {
@@ -1223,6 +1665,15 @@
     extractAnthropicStreamDelta,
     isLocalEndpoint,
     sanitizeApiKey,
+    validateApiKey,
+    normalizeProviderProfiles,
+    isProfileSaved,
+    isProfileReady,
+    listSavedProviders,
+    switchActiveProviderSettings,
+    removeProviderProfile,
+    resolveFallbackSettings,
+    formatApiError,
     getSettings,
     saveSettings,
     hashText

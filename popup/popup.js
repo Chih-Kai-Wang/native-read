@@ -1,11 +1,19 @@
 const {
+  SETTINGS_KEY,
+  PROVIDER_PRESETS,
   TARGET_LANGUAGES,
   getSettings,
   saveSettings,
   isHostWhitelisted,
   toggleHostWhitelist,
   isInjectableUrl,
-  isPdfUrl
+  isPdfUrl,
+  isLocalEndpoint,
+  validateApiKey,
+  resolveFallbackSettings,
+  listSavedProviders,
+  switchActiveProviderSettings,
+  formatApiError
 } = globalThis.KCTConfig;
 
 // Shortcut label shown in the UI: the shortcut actually configured in the browser
@@ -73,11 +81,175 @@ function extractHostname(url) {
   }
 }
 
-function setStatusText(text) {
+function setStatusText(text, title = '') {
   const statusEl = document.getElementById('status-text');
   if (!statusEl) return;
   statusEl.textContent = text;
-  statusEl.title = text;
+  statusEl.title = title || text;
+}
+
+function shortProviderLabel(providerId) {
+  const raw = PROVIDER_PRESETS?.[providerId]?.label || providerId || '';
+  return String(raw).split(/[（(]/)[0].trim() || providerId;
+}
+
+function clearErrorBanner() {
+  const banner = document.getElementById('error-banner');
+  if (!banner) return;
+  banner.replaceChildren();
+  banner.classList.add('hidden');
+}
+
+let activePollToken = 0;
+let activePollTimer = null;
+
+function cancelActivePoll() {
+  activePollToken += 1;
+  if (activePollTimer) {
+    clearTimeout(activePollTimer);
+    activePollTimer = null;
+  }
+}
+
+window.addEventListener('pagehide', cancelActivePoll);
+
+function renderErrorBanner(rawErrorMsg, settings, errorCode = '') {
+  const banner = document.getElementById('error-banner');
+  const fmt = typeof formatApiError === 'function'
+    ? formatApiError(rawErrorMsg)
+    : { shortMsg: '翻譯失敗', detailMsg: String(rawErrorMsg || '翻譯失敗'), rawMsg: String(rawErrorMsg || ''), retryable: true, suggestSwitch: true };
+
+  if (!banner) return fmt;
+  banner.replaceChildren();
+
+  const msgEl = document.createElement('div');
+  msgEl.className = 'error-banner-msg';
+  msgEl.textContent = fmt.detailMsg;
+  if (fmt.rawMsg) msgEl.title = fmt.rawMsg;
+  banner.appendChild(msgEl);
+
+  const actionsEl = document.createElement('div');
+  actionsEl.className = 'error-banner-actions';
+  const isNonProviderError = errorCode === 'UNSUPPORTED_URL' || errorCode === 'PAGE_ERROR';
+
+  if (fmt.retryable && activeTabInjectable && !activeTabIsPdf && errorCode !== 'UNSUPPORTED_URL') {
+    const retryBtn = document.createElement('button');
+    retryBtn.type = 'button';
+    retryBtn.className = 'mini-action-btn primary-mini';
+    retryBtn.textContent = '重試未譯段落';
+    retryBtn.addEventListener('click', () => {
+      clearErrorBanner();
+      void sendCommandToActiveTab('TRANSLATE_NOW');
+    });
+    actionsEl.appendChild(retryBtn);
+  }
+
+  if (!isNonProviderError) {
+    const saved = typeof listSavedProviders === 'function' ? listSavedProviders(settings || currentSettings) : [];
+    const readyCount = saved.filter((p) => p.isReady).length;
+    const alt = saved.find((p) => !p.isActive && p.isReady);
+    if (alt && fmt.suggestSwitch) {
+      const switchBtn = document.createElement('button');
+      switchBtn.type = 'button';
+      switchBtn.className = 'mini-action-btn';
+      switchBtn.textContent = `改用 ${shortProviderLabel(alt.providerId)}`;
+      switchBtn.addEventListener('click', () => {
+        void switchProviderFromPopup(alt.providerId);
+      });
+      actionsEl.appendChild(switchBtn);
+    }
+
+    const manageBtn = document.createElement('button');
+    manageBtn.type = 'button';
+    manageBtn.className = 'mini-action-btn';
+    manageBtn.textContent = readyCount > 2 ? '其他供應商' : '設定供應商';
+    manageBtn.addEventListener('click', () => {
+      if (readyCount > 2) {
+        const sel = document.getElementById('provider-quick-select');
+        if (sel) {
+          try {
+            if (typeof sel.showPicker === 'function') {
+              sel.showPicker();
+            } else {
+              sel.focus();
+            }
+          } catch (_) {
+            sel.focus();
+          }
+          return;
+        }
+      }
+      void chrome.runtime.openOptionsPage();
+    });
+    actionsEl.appendChild(manageBtn);
+  }
+
+  if (actionsEl.childElementCount > 0) {
+    banner.appendChild(actionsEl);
+  }
+  banner.classList.remove('hidden');
+  return fmt;
+}
+
+function renderProviderQuickSelect(settings) {
+  const sel = document.getElementById('provider-quick-select');
+  if (!sel || typeof listSavedProviders !== 'function') return;
+  const items = listSavedProviders(settings);
+  sel.replaceChildren();
+  for (const item of items) {
+    const opt = document.createElement('option');
+    opt.value = item.providerId;
+    const baseName = shortProviderLabel(item.providerId);
+    const modelPart = item.model || '未選模型';
+    const tag = item.isFallback ? ' [備援]' : (!item.isReady ? ' [待設定]' : '');
+    opt.textContent = `${baseName} · ${modelPart}${tag}`;
+    sel.appendChild(opt);
+  }
+  const manageOpt = document.createElement('option');
+  manageOpt.value = '__manage__';
+  manageOpt.textContent = '＋ 新增或管理供應商...';
+  sel.appendChild(manageOpt);
+  sel.value = settings?.providerId || (items[0]?.providerId || 'gemini');
+}
+
+async function switchProviderFromPopup(targetProviderId) {
+  if (!targetProviderId || typeof switchActiveProviderSettings !== 'function') return;
+  const hadErrorBanner = !document.getElementById('error-banner')?.classList.contains('hidden');
+  let didSwitch = false;
+  const next = await enqueueSave(async () => {
+    const fresh = typeof getSettings === 'function' ? await getSettings() : currentSettings;
+    if (!fresh || targetProviderId === fresh.providerId) {
+      if (fresh) {
+        currentSettings = fresh;
+        renderUI(fresh);
+      }
+      return fresh;
+    }
+    const switched = switchActiveProviderSettings(fresh, targetProviderId);
+    const saved = await saveSettings({
+      providerId: switched.providerId,
+      protocol: switched.protocol,
+      baseUrl: switched.baseUrl,
+      apiKey: switched.apiKey,
+      model: switched.model,
+      thinkingEffort: switched.thinkingEffort,
+      providerProfiles: switched.providerProfiles,
+      fallbackProviderId: switched.fallbackProviderId,
+    });
+    currentSettings = saved;
+    renderUI(saved);
+    didSwitch = true;
+    return saved;
+  });
+  if (!didSwitch || !next) return;
+  clearErrorBanner();
+  setStatusText(`已切換至 ${shortProviderLabel(next.providerId)} (${next.model || '預設'})`);
+  const hasReadyCreds = Boolean(next.apiKey) || Boolean(window.KCTConfig?.isLocalEndpoint?.(next.baseUrl));
+  if (hadErrorBanner && activeTabInjectable && !activeTabIsPdf && hasReadyCreds) {
+    setTimeout(() => {
+      void queryActiveTabStatus();
+    }, 650);
+  }
 }
 
 function setActionButtonsDisabled(disabled) {
@@ -167,13 +339,24 @@ function renderUI(settings) {
     customInput.classList.toggle('hidden', langSel?.value !== 'custom');
   }
 
-  const isLocal = typeof globalThis.KCTConfig?.isLocalEndpoint === 'function'
-    ? globalThis.KCTConfig.isLocalEndpoint(settings.baseUrl)
-    : /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?(\/|$)/i.test(settings.baseUrl || '');
+  const isLocal = typeof isLocalEndpoint === 'function'
+    ? isLocalEndpoint(settings.baseUrl)
+    : false;
   const hasKey = Boolean(settings.apiKey?.trim()) || isLocal;
   document.getElementById('api-alert')?.classList.toggle('hidden', hasKey);
   const modelBadge = document.getElementById('model-badge');
-  if (modelBadge) modelBadge.textContent = `${settings.model || '未選擇模型'}`;
+  if (modelBadge) {
+    const modelName = settings.model || '未選擇模型';
+    const fbSettings = typeof resolveFallbackSettings === 'function'
+      ? resolveFallbackSettings(settings)
+      : null;
+    modelBadge.textContent = fbSettings
+      ? `${modelName} · 備援: ${shortProviderLabel(fbSettings.providerId)}`
+      : modelName;
+    modelBadge.title = modelBadge.textContent;
+  }
+
+  renderProviderQuickSelect(settings);
 
   for (const btn of document.querySelectorAll('#mode-group button')) {
     const active = btn.dataset.mode === settings.displayMode;
@@ -207,14 +390,19 @@ async function queryActiveTabStatus() {
     }
     lastKnownTranslated = Number(res.totalTranslated) || 0;
     if (res.lastErrorMsg) {
-      setStatusText(res.lastErrorMsg);
+      const fmt = renderErrorBanner(res.lastErrorMsg, currentSettings);
+      setStatusText(fmt.shortMsg, fmt.rawMsg || fmt.detailMsg);
     } else if (res.isBusy) {
+      clearErrorBanner();
       setStatusText(`翻譯中 ${res.totalTranslated}/${res.totalDetected}`);
     } else if (!currentSettings?.enabled) {
+      clearErrorBanner();
       setStatusText('已暫停，點擊上方按鈕即可翻譯');
     } else if (res.totalTranslated > 0) {
+      clearErrorBanner();
       setStatusText(`已譯 ${res.totalTranslated} 項`);
     } else {
+      clearErrorBanner();
       setStatusText(idleStatusText());
     }
     return res;
@@ -274,6 +462,7 @@ async function sendCommandToActiveTab(action) {
     });
   }
 
+  cancelActivePoll();
   if (action === 'CLEAR_PAGE') {
     setStatusText('正在還原原文...');
   } else {
@@ -288,9 +477,13 @@ async function sendCommandToActiveTab(action) {
     });
 
     if (!res?.ok) {
-      setStatusText(res?.error || '無法執行翻譯指令');
+      const errMsg = res?.error || '無法執行翻譯指令';
+      const fmt = renderErrorBanner(errMsg, currentSettings, res?.errorCode || 'PAGE_ERROR');
+      setStatusText(fmt.shortMsg, errMsg);
       return;
     }
+
+    clearErrorBanner();
 
     if (res.openedPdfViewer) {
       setStatusText(PDF_OPENED_STATUS_TEXT);
@@ -306,21 +499,24 @@ async function sendCommandToActiveTab(action) {
 
     setStatusText('已啟動翻譯，掃描中...');
 
-    const pollStatus = async (isSecondPoll) => {
+    const pollToken = ++activePollToken;
+    const pollStatus = async (attempt = 0) => {
+      if (pollToken !== activePollToken) return;
       try {
         const st = await chrome.tabs.sendMessage(
           tab.id,
           { type: 'KCT_GET_STATUS' },
           { frameId: 0 }
         );
-        if (!st?.ok) return;
+        if (pollToken !== activePollToken || !st?.ok) return;
         lastKnownTranslated = Number(st.totalTranslated) || 0;
         if (st.lastErrorMsg) {
-          setStatusText(st.lastErrorMsg);
+          const fmt = renderErrorBanner(st.lastErrorMsg, currentSettings);
+          setStatusText(fmt.shortMsg, fmt.rawMsg || fmt.detailMsg);
         } else if (st.isBusy) {
           setStatusText(`翻譯中 ${st.totalTranslated}/${st.totalDetected}`);
-          if (!isSecondPoll) {
-            setTimeout(() => { pollStatus(true); }, 900);
+          if (attempt < 40) {
+            activePollTimer = setTimeout(() => { void pollStatus(attempt + 1); }, 850);
           }
         } else if (st.totalTranslated > 0) {
           setStatusText(`已譯 ${st.totalTranslated} 項`);
@@ -332,7 +528,7 @@ async function sendCommandToActiveTab(action) {
       } catch (_) {}
     };
 
-    setTimeout(() => { pollStatus(false); }, 320);
+    activePollTimer = setTimeout(() => { void pollStatus(0); }, 320);
   } catch (err) {
     setStatusText(err?.message || '無法連線背景服務，請重試');
   }
@@ -415,9 +611,11 @@ async function checkForExtensionUpdate(settings) {
       });
     } catch {
       await chrome.storage.local.set({
-        [UPDATE_CACHE_KEY]: { checkedAt: Date.now(), latest: prevLatest }
+        [UPDATE_CACHE_KEY]: {
+          checkedAt: Date.now() - UPDATE_CHECK_INTERVAL_MS + 60 * 60 * 1000,
+          latest: prevLatest
+        }
       }).catch(() => {});
-      return;
     } finally {
       clearTimeout(timer);
     }
@@ -454,6 +652,17 @@ document.addEventListener('DOMContentLoaded', async () => {
   renderUI(settings);
   updateActionButtonsForTab();
 
+  const updateSavedSettings = (next) => {
+    settings = next;
+    currentSettings = next;
+    renderUI(next);
+  };
+  const settingsKey = SETTINGS_KEY || 'kct_settings_v1';
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName !== 'local' || !changes[settingsKey]?.newValue) return;
+    updateSavedSettings(changes[settingsKey].newValue);
+  });
+
   if (activeTabIsPdf) {
     setStatusText(PDF_READY_STATUS_TEXT);
   } else if (!activeTabInjectable) {
@@ -461,12 +670,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   } else {
     await queryActiveTabStatus();
   }
-
-  const updateSavedSettings = (next) => {
-    settings = next;
-    currentSettings = next;
-    renderUI(next);
-  };
 
   const customLangEl = document.getElementById('custom-lang-input');
   const flushCustomLang = async () => {
@@ -513,6 +716,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     } else {
       setStatusText('已移出白名單');
     }
+  });
+
+  document.getElementById('provider-quick-select')?.addEventListener('change', async (e) => {
+    const val = e.target.value;
+    if (val === '__manage__') {
+      e.target.value = currentSettings?.providerId || 'gemini';
+      await chrome.runtime.openOptionsPage();
+      return;
+    }
+    await switchProviderFromPopup(val);
   });
 
   langSel?.addEventListener('change', async (e) => {
@@ -602,6 +815,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   };
   document.getElementById('btn-open-options')?.addEventListener('click', openOptions);
   document.getElementById('btn-go-config')?.addEventListener('click', openOptions);
+
   // Fire-and-forget: at most one GitHub Pages check per day, only while the popup is open
   checkForExtensionUpdate(settings).catch(() => {});
 });

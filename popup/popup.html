@@ -18,6 +18,11 @@
     </div>
   </header>
 
+  <div class="provider-bar" title="一鍵切換已設定的 AI 供應商（切換不遺失金鑰）">
+    <span class="provider-tag">AI</span>
+    <select id="provider-quick-select" class="provider-select" aria-label="快速切換 AI 供應商"></select>
+  </div>
+
   <div id="site-bar" class="site-bar">
     <div class="site-info">
       <span id="site-dot" class="site-dot" aria-hidden="true"></span>
@@ -35,6 +40,8 @@
   </div>
 
   <div id="update-banner" class="update-banner hidden" role="status"></div>
+
+  <div id="error-banner" class="error-banner hidden" role="alert"></div>
 
   <section class="actions">
     <button id="btn-translate-now" class="btn primary" type="button">立即翻譯此頁面 (Alt+T)</button>

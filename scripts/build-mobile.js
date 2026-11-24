@@ -68,6 +68,8 @@ function buildUserscriptHeader(version) {
     '// @match        *://*/*',
     '// @grant        GM_getValue',
     '// @grant        GM_setValue',
+    '// @grant        GM.getValue',
+    '// @grant        GM.setValue',
     '// @grant        GM_xmlhttpRequest',
     '// @grant        GM.xmlHttpRequest',
     '// @connect      *',
@@ -157,7 +159,13 @@ function buildUserscript(version) {
     resolveThinkingConfig,
     normalizeHostname,
     isHostWhitelisted,
+    isLocalEndpoint,
     sanitizeApiKey,
+    validateApiKey,
+    normalizeProviderProfiles,
+    switchActiveProviderSettings,
+    resolveFallbackSettings,
+    formatApiError,
     hashText
   } = globalThis.KCTConfig;
 
@@ -168,66 +176,142 @@ function buildUserscript(version) {
   const PAGE_STYLE_CSS = ${JSON.stringify(contentCss)};
 
   // ============================================================
-  // 1. Storage Adapter (GM_getValue / GM_setValue + localStorage)
+  // 1. Storage Adapter (GM_getValue / GM.getValue ONLY on untrusted origins;
+  //    localStorage fallback strictly restricted to trusted PWA origin)
   // ============================================================
-  function readStoredSettings() {
+  function hasGmGet() {
+    return typeof GM_getValue === 'function' || (typeof GM !== 'undefined' && typeof GM.getValue === 'function');
+  }
+
+  function hasGmSet() {
+    return typeof GM_setValue === 'function' || (typeof GM !== 'undefined' && typeof GM.setValue === 'function');
+  }
+
+  function isTrustedOriginForFallback() {
+    try {
+      const host = String(location.hostname || '').toLowerCase();
+      const pathname = String(location.pathname || '');
+      if (host === 'chih-kai-wang.github.io' && pathname.startsWith('/native-read')) return true;
+      if (host === 'localhost' || host === '127.0.0.1') return true;
+    } catch (_) {}
+    return false;
+  }
+
+  function buildDefaultUserscriptSettings() {
+    return {
+      ...DEFAULT_SETTINGS,
+      providerId: 'gemini',
+      protocol: 'gemini',
+      baseUrl: PROVIDER_PRESETS.gemini.baseUrl,
+      model: PROVIDER_PRESETS.gemini.defaultModel,
+      providerProfiles: {},
+      autoTranslateHosts: []
+    };
+  }
+
+  function parseStoredRawSettings(raw) {
+    const base = buildDefaultUserscriptSettings();
+    if (!raw) return base;
+    try {
+      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      const merged = {
+        ...base,
+        ...parsed,
+        apiKey: sanitizeApiKey(parsed?.apiKey),
+        autoTranslateHosts: Array.isArray(parsed?.autoTranslateHosts)
+          ? Array.from(new Set(parsed.autoTranslateHosts.map(normalizeHostname).filter(Boolean)))
+          : []
+      };
+      merged.providerProfiles = normalizeProviderProfiles(parsed?.providerProfiles, merged);
+      return merged;
+    } catch (_) {
+      return base;
+    }
+  }
+
+  let cachedSettings = buildDefaultUserscriptSettings();
+
+  async function initStoredSettings() {
     let raw = null;
     try {
       if (typeof GM_getValue === 'function') {
-        raw = GM_getValue(SETTINGS_KEY, null);
+        raw = await Promise.resolve(GM_getValue(SETTINGS_KEY, null));
+      } else if (typeof GM !== 'undefined' && typeof GM.getValue === 'function') {
+        raw = await GM.getValue(SETTINGS_KEY, null);
       }
     } catch (_) {}
-    if (!raw) {
+
+    if (!raw && !hasGmGet() && isTrustedOriginForFallback()) {
       try {
         raw = localStorage.getItem(SETTINGS_KEY);
       } catch (_) {}
     }
-    if (!raw) {
-      return { ...DEFAULT_SETTINGS, providerId: 'gemini', protocol: 'gemini', baseUrl: PROVIDER_PRESETS.gemini.baseUrl, model: PROVIDER_PRESETS.gemini.defaultModel, autoTranslateHosts: [] };
-    }
+    cachedSettings = parseStoredRawSettings(raw);
+    return cachedSettings;
+  }
+
+  function readStoredSettings() {
+    return cachedSettings;
+  }
+
+  async function persistStoredSettings(next) {
+    const serialized = JSON.stringify(next);
+    let wroteGm = false;
     try {
-      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-      return {
-        ...DEFAULT_SETTINGS,
-        ...parsed,
-        autoTranslateHosts: Array.isArray(parsed?.autoTranslateHosts)
-          ? parsed.autoTranslateHosts.map(normalizeHostname).filter(Boolean)
-          : []
-      };
-    } catch (_) {
-      return { ...DEFAULT_SETTINGS, autoTranslateHosts: [] };
+      if (typeof GM_setValue === 'function') {
+        await Promise.resolve(GM_setValue(SETTINGS_KEY, serialized));
+        wroteGm = true;
+      } else if (typeof GM !== 'undefined' && typeof GM.setValue === 'function') {
+        await GM.setValue(SETTINGS_KEY, serialized);
+        wroteGm = true;
+      }
+    } catch (_) {}
+    if (!wroteGm && !hasGmSet() && isTrustedOriginForFallback()) {
+      try {
+        localStorage.setItem(SETTINGS_KEY, serialized);
+      } catch (_) {}
     }
+    return next;
   }
 
   function writeStoredSettings(partial) {
     const current = readStoredSettings();
+    const hasExplicitProfiles = Boolean(
+      partial &&
+      typeof partial.providerProfiles === 'object' &&
+      partial.providerProfiles !== null &&
+      !Array.isArray(partial.providerProfiles)
+    );
     const next = {
       ...current,
-      ...partial
+      ...(partial && typeof partial === 'object' ? partial : {})
     };
+    next.apiKey = sanitizeApiKey(next.apiKey);
     if (Array.isArray(next.autoTranslateHosts)) {
       next.autoTranslateHosts = Array.from(new Set(next.autoTranslateHosts.map(normalizeHostname).filter(Boolean)));
     } else {
       next.autoTranslateHosts = [];
     }
-    const serialized = JSON.stringify(next);
-    try {
-      if (typeof GM_setValue === 'function') {
-        GM_setValue(SETTINGS_KEY, serialized);
-      }
-    } catch (_) {}
-    try {
-      localStorage.setItem(SETTINGS_KEY, serialized);
-    } catch (_) {}
+    const baseProfiles = hasExplicitProfiles ? partial.providerProfiles : current.providerProfiles;
+    next.providerProfiles = normalizeProviderProfiles(baseProfiles, next);
+    if (next.fallbackProviderId === next.providerId) {
+      next.fallbackProviderId = '';
+    }
+    cachedSettings = next;
+    void persistStoredSettings(next);
     return next;
   }
 
   // Override KCTConfig.getSettings / saveSettings so shared modules work seamlessly
   globalThis.KCTConfig.getSettings = async () => readStoredSettings();
-  globalThis.KCTConfig.saveSettings = async (partial) => writeStoredSettings(partial);
+  globalThis.KCTConfig.saveSettings = async (partial) => {
+    const next = writeStoredSettings(partial);
+    await persistStoredSettings(next);
+    return next;
+  };
 
   // ============================================================
-  // 2. #nr_sync Zero-Typing Sync Decoder
+  // 2. #nr_sync Zero-Typing Sync Decoder (Trusted Origin Only)
   // ============================================================
   function decodeBase64UrlJson(b64url) {
     const base64 = String(b64url || '').trim().replace(/-/g, '+').replace(/_/g, '/');
@@ -240,72 +324,145 @@ function buildUserscript(version) {
     return JSON.parse(new TextDecoder().decode(bytes));
   }
 
-  function checkAndApplyNrSyncHash() {
+  async function checkAndApplyNrSyncHash() {
+    if (!isTrustedOriginForFallback()) return false;
     const hash = String(window.location.hash || '');
     if (!hash.includes('nr_sync=')) return false;
     const match = hash.match(/(?:^|[#&])nr_sync=([^&]+)/);
-    if (!match || !match[1]) return false;
+    const scrubHash = () => {
+      try {
+        history.replaceState(null, '', window.location.pathname + window.location.search);
+      } catch (_) {}
+    };
+    if (!match || !match[1]) {
+      scrubHash();
+      return false;
+    }
 
     try {
       const payload = decodeBase64UrlJson(decodeURIComponent(match[1]));
-      if (!payload || typeof payload !== 'object') return false;
-      const providerId = payload.providerId || payload.p || 'gemini';
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
+      const rawPid = String(payload.providerId || payload.p || 'gemini').trim();
+      const providerId = PROVIDER_PRESETS[rawPid] ? rawPid : 'custom';
       const preset = PROVIDER_PRESETS[providerId] || PROVIDER_PRESETS.gemini;
-      const protocol = payload.protocol || payload.r || preset.protocol || 'gemini';
-      const baseUrl = payload.baseUrl || payload.u || preset.baseUrl;
-      const apiKey = sanitizeApiKey(payload.apiKey ?? payload.k ?? '');
-      const model = payload.model || payload.m || preset.defaultModel;
-      const targetLang = payload.targetLang || payload.l || 'zh-TW';
-      const customTargetLang = payload.customTargetLang ?? payload.c ?? '';
-      const thinkingEffort = payload.thinkingEffort || payload.e || 'fastest';
-      const typographyMatch = payload.typographyMatch || payload.t || 'native';
+      const protocol = String(payload.protocol || payload.r || preset.protocol || 'gemini').trim().toLowerCase();
+      if (!['openai', 'gemini', 'anthropic'].includes(protocol)) return false;
+      const baseUrl = String(payload.baseUrl || payload.u || preset.baseUrl || '').trim();
+      try {
+        const parsed = new URL(baseUrl);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+      } catch (_) {
+        return false;
+      }
+      const keyCheck = validateApiKey(payload.apiKey ?? payload.k ?? '');
+      if (!keyCheck.ok) return false;
+      const apiKey = keyCheck.cleanKey;
+      const model = String(payload.model || payload.m || preset.defaultModel || '').trim();
+      const rawLang = String(payload.targetLang || payload.l || 'zh-TW').trim();
+      const targetLang = TARGET_LANGUAGES[rawLang] ? rawLang : 'zh-TW';
+      const customTargetLang = String(payload.customTargetLang ?? payload.c ?? '').trim();
+      const rawEffort = String(payload.thinkingEffort || payload.e || 'fastest').trim();
+      const thinkingEffort = ['fastest', 'balanced', 'deep'].includes(rawEffort) ? rawEffort : 'fastest';
+      const rawTypo = String(payload.typographyMatch || payload.t || 'native').trim();
+      const typographyMatch = ['native', 'system', 'preserve'].includes(rawTypo) ? rawTypo : 'native';
 
-      writeStoredSettings({
+      const current = readStoredSettings();
+      const mergedProfiles = normalizeProviderProfiles(current.providerProfiles, {
+        providerId,
+        protocol,
+        baseUrl,
+        apiKey,
+        model
+      });
+      const next = writeStoredSettings({
         providerId,
         protocol,
         baseUrl,
         apiKey,
         model,
+        providerProfiles: mergedProfiles,
         targetLang,
         customTargetLang,
         thinkingEffort,
         typographyMatch
       });
-      history.replaceState(null, '', window.location.pathname + window.location.search);
+      await persistStoredSettings(next);
       return true;
     } catch (_) {
       return false;
+    } finally {
+      scrubHash();
     }
   }
 
   // ============================================================
-  // 3. Persistent Cache (IndexedDB + GM memory fallback)
+  // 3. Persistent Cache (IndexedDB with 'ts' index/LRU + memory fallback)
   // ============================================================
   const DB_NAME = 'kct_cache_db_v2';
   const STORE_NAME = 'entries';
+  const MAX_CACHE_ENTRIES = 10000;
+  const IDB_OPEN_TIMEOUT_MS = 3000;
   let dbPromise = null;
   const memCache = new Map();
 
   function openCacheDB() {
     if (typeof indexedDB === 'undefined') return Promise.reject(new Error('No IDB'));
     if (dbPromise) return dbPromise;
-    dbPromise = new Promise((resolve, reject) => {
+    const currentPromise = new Promise((resolve, reject) => {
+      let settled = false;
+      let req = null;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        if (dbPromise === currentPromise) dbPromise = null;
+        reject(new Error('IndexedDB open timeout'));
+      }, IDB_OPEN_TIMEOUT_MS);
+
+      const finishOk = (db) => {
+        if (settled) {
+          try { db.close(); } catch (_) {}
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        db.onversionchange = () => {
+          try { db.close(); } catch (_) {}
+          if (dbPromise === currentPromise) dbPromise = null;
+        };
+        db.onclose = () => {
+          if (dbPromise === currentPromise) dbPromise = null;
+        };
+        resolve(db);
+      };
+
+      const finishErr = (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (dbPromise === currentPromise) dbPromise = null;
+        reject(err);
+      };
+
       try {
-        const req = indexedDB.open(DB_NAME, 1);
+        req = indexedDB.open(DB_NAME, 1);
         req.onupgradeneeded = () => {
           const db = req.result;
-          if (!db.objectStoreNames.contains(STORE_NAME)) {
-            db.createObjectStore(STORE_NAME, { keyPath: 'key' });
+          const store = db.objectStoreNames.contains(STORE_NAME)
+            ? req.transaction.objectStore(STORE_NAME)
+            : db.createObjectStore(STORE_NAME, { keyPath: 'key' });
+          if (!store.indexNames.contains('ts')) {
+            store.createIndex('ts', 'ts', { unique: false });
           }
         };
-        req.onsuccess = () => resolve(req.result);
-        req.onerror = () => { dbPromise = null; reject(req.error); };
+        req.onsuccess = () => finishOk(req.result);
+        req.onerror = () => finishErr(req.error || new Error('IDB open error'));
+        req.onblocked = () => finishErr(new Error('IDB open blocked'));
       } catch (e) {
-        dbPromise = null;
-        reject(e);
+        finishErr(e);
       }
     });
-    return dbPromise;
+    dbPromise = currentPromise;
+    return currentPromise;
   }
 
   async function cacheGetMany(keys) {
@@ -316,7 +473,14 @@ function buildUserscript(version) {
     try {
       const db = await openCacheDB();
       await new Promise((resolve) => {
-        const tx = db.transaction(STORE_NAME, 'readonly');
+        let tx;
+        try {
+          tx = db.transaction(STORE_NAME, 'readonly');
+        } catch (err) {
+          if (err?.name === 'InvalidStateError') dbPromise = null;
+          resolve();
+          return;
+        }
         const store = tx.objectStore(STORE_NAME);
         for (const k of keys) {
           if (out.has(k)) continue;
@@ -330,27 +494,118 @@ function buildUserscript(version) {
         }
         tx.oncomplete = () => resolve();
         tx.onerror = () => resolve();
+        tx.onabort = () => resolve();
       });
     } catch (_) {}
     return out;
   }
 
+  function deleteOldestUserscriptCacheKeys(store, source, count) {
+    if (!store || !source || !Number.isFinite(count) || count <= 0) return;
+    if (typeof source.getAllKeys === 'function') {
+      const keysReq = source.getAllKeys(null, count);
+      keysReq.onsuccess = () => {
+        try {
+          const keys = Array.isArray(keysReq.result) ? keysReq.result : [];
+          for (const pk of keys) {
+            const delReq = store.delete(pk);
+            if (delReq && typeof delReq === 'object') {
+              delReq.onerror = (e) => {
+                try { e?.preventDefault?.(); e?.stopPropagation?.(); } catch (_) {}
+              };
+            }
+          }
+        } catch (_) {}
+      };
+      keysReq.onerror = (e) => {
+        try { e?.preventDefault?.(); e?.stopPropagation?.(); } catch (_) {}
+      };
+      return;
+    }
+
+    let remaining = count;
+    const curReq = source.openCursor(null, 'next');
+    curReq.onsuccess = () => {
+      const cursor = curReq.result;
+      if (cursor && remaining > 0) {
+        cursor.delete();
+        remaining -= 1;
+        if (remaining > 0) cursor.continue();
+      }
+    };
+  }
+
+  async function evictOldestUserscriptCacheFraction(db, fraction = 0.2) {
+    await new Promise((resolve) => {
+      let tx;
+      try {
+        tx = db.transaction(STORE_NAME, 'readwrite');
+      } catch (_) {
+        resolve();
+        return;
+      }
+      const store = tx.objectStore(STORE_NAME);
+      const countReq = store.count();
+      countReq.onsuccess = () => {
+        const toDelete = Math.max(1, Math.ceil((countReq.result || 0) * fraction));
+        const cursorSource = store.indexNames.contains('ts') ? store.index('ts') : store;
+        deleteOldestUserscriptCacheKeys(store, cursorSource, toDelete);
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+      tx.onabort = () => resolve();
+    });
+  }
+
+  async function writeUserscriptCacheOnce(db, entries) {
+    const now = Date.now();
+    return new Promise((resolve, reject) => {
+      let tx;
+      try {
+        tx = db.transaction(STORE_NAME, 'readwrite');
+      } catch (err) {
+        if (err?.name === 'InvalidStateError') dbPromise = null;
+        reject(err);
+        return;
+      }
+      const store = tx.objectStore(STORE_NAME);
+      entries.forEach((e, idx) => {
+        if (e?.key && e?.zh) store.put({ key: e.key, zh: e.zh, ts: now + idx });
+      });
+      const countReq = store.count();
+      countReq.onsuccess = () => {
+        const overflow = (countReq.result || 0) - MAX_CACHE_ENTRIES;
+        if (overflow > 0) {
+          const cursorSource = store.indexNames.contains('ts') ? store.index('ts') : store;
+          deleteOldestUserscriptCacheKeys(store, cursorSource, overflow);
+        }
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error || new Error('IDB put failed'));
+      tx.onabort = () => reject(tx.error || new Error('IDB put aborted'));
+    });
+  }
+
   async function cachePutMany(entries) {
     for (const e of entries) {
-      if (e?.key && e?.zh) memCache.set(e.key, e.zh);
+      if (e?.key && e?.zh) {
+        memCache.set(e.key, e.zh);
+        if (memCache.size > MAX_CACHE_ENTRIES) {
+          const oldestKey = memCache.keys().next().value;
+          if (oldestKey !== undefined) memCache.delete(oldestKey);
+        }
+      }
     }
     try {
       const db = await openCacheDB();
-      const now = Date.now();
-      await new Promise((resolve) => {
-        const tx = db.transaction(STORE_NAME, 'readwrite');
-        const store = tx.objectStore(STORE_NAME);
-        entries.forEach((e, idx) => {
-          if (e?.key && e?.zh) store.put({ key: e.key, zh: e.zh, ts: now + idx });
-        });
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => resolve();
-      });
+      try {
+        await writeUserscriptCacheOnce(db, entries);
+      } catch (err) {
+        if (err?.name === 'QuotaExceededError') {
+          await evictOldestUserscriptCacheFraction(db, 0.2);
+          await writeUserscriptCacheOnce(db, entries).catch(() => {});
+        }
+      }
     } catch (_) {}
   }
 
@@ -470,11 +725,115 @@ function buildUserscript(version) {
     return c?.delta?.content || c?.message?.content || '';
   }
 
+  function redactAllUserscriptKeys(msg, settings = null) {
+    let out = String(msg || '');
+    const keys = new Set();
+    const s = settings || readStoredSettings();
+    const mainKey = sanitizeApiKey(s?.apiKey);
+    if (mainKey) keys.add(mainKey);
+    if (s?.providerProfiles && typeof s.providerProfiles === 'object') {
+      for (const p of Object.values(s.providerProfiles)) {
+        const pk = sanitizeApiKey(p?.apiKey);
+        if (pk) keys.add(pk);
+      }
+    }
+    for (const k of keys) {
+      if (k && k.length >= 6) {
+        out = out.split(k).join('[REDACTED_KEY]');
+      }
+    }
+    return out;
+  }
+
+  function isHardQuota429Userscript(status, bodyText) {
+    if (status !== 429) return false;
+    return /quota exceeded|exceeded your current quota|daily limit|insufficient_quota|billing|配額上限|額度已用盡/i.test(
+      String(bodyText || '')
+    );
+  }
+
+  function buildUserscriptHttpError(status, statusText, rawBodyText, settings = null) {
+    const safeBody = redactAllUserscriptKeys(String(rawBodyText || '').slice(0, 260), settings);
+    const msg = \`HTTP \${status}: \${safeBody || statusText || 'Request failed'}\`;
+    const err = new Error(msg);
+    err.isHttpError = true;
+    err.httpStatus = status;
+    if (status === 401 || status === 403) {
+      err.errorCode = 'AUTH_ERROR';
+      err.retryable = false;
+    } else if (status === 404) {
+      err.errorCode = 'HTTP_404';
+      err.retryable = false;
+    } else if (status === 429) {
+      err.errorCode = 'RATE_LIMIT';
+      err.retryable = !isHardQuota429Userscript(status, rawBodyText);
+    } else if (status === 503 || status === 529) {
+      err.errorCode = 'OVERLOADED';
+      err.retryable = true;
+    } else if (status >= 500) {
+      err.errorCode = 'SERVER_ERROR';
+      err.retryable = true;
+    } else {
+      err.errorCode = \`HTTP_\${status}\`;
+      err.retryable = false;
+    }
+    return err;
+  }
+
+  function computeUserscriptBackoffMs(status, attempt, retryAfterMs = 0) {
+    if (retryAfterMs > 0) {
+      return Math.min(30000, retryAfterMs + Math.round(Math.random() * 400));
+    }
+    if (status === 429) {
+      return Math.round(Math.min(12000, 3000 * (2 ** Math.max(0, attempt - 1))) * (0.85 + Math.random() * 0.3));
+    }
+    if (status === 503 || status === 529) {
+      return Math.round(Math.min(8000, 1500 * (2 ** Math.max(0, attempt - 1))) * (0.85 + Math.random() * 0.3));
+    }
+    return Math.round(Math.min(5000, 900 * attempt) + Math.random() * 350);
+  }
+
+  function sleepUserscriptWithAbort(ms, signal) {
+    if (signal?.aborted) {
+      return Promise.reject(new DOMException('The operation was aborted.', 'AbortError'));
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (signal && onAbort) signal.removeEventListener('abort', onAbort);
+        resolve();
+      }, ms);
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(new DOMException('The operation was aborted.', 'AbortError'));
+      };
+      if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
+  function parseUserscriptRetryAfterMs(val) {
+    if (!val) return 0;
+    const n = Number(val);
+    if (Number.isFinite(n) && n > 0) return Math.min(30000, Math.round(n * 1000));
+    const ts = Date.parse(val);
+    if (Number.isFinite(ts) && ts > Date.now()) return Math.min(30000, ts - Date.now());
+    return 0;
+  }
+
+  function isUserscriptEcho(orig, trans, targetLangId) {
+    const cleanOrig = String(orig || '').replace(/\\[\\[[A-Z]+\\d+\\]\\]|\\[\\[\\/[A-Z]+\\d+\\]\\]/g, '').replace(/[\\s\\p{P}\\p{S}]+/gu, '').toLowerCase();
+    const cleanTrans = String(trans || '').replace(/\\[\\[[A-Z]+\\d+\\]\\]|\\[\\[\\/[A-Z]+\\d+\\]\\]/g, '').replace(/[\\s\\p{P}\\p{S}]+/gu, '').toLowerCase();
+    if (!cleanTrans || cleanOrig.length < 18) return false;
+    const isAsian = targetLangId === 'zh-TW' || targetLangId === 'zh-CN' || targetLangId === 'ja' || targetLangId === 'ko';
+    if (isAsian && !/[\\u4e00-\\u9fff\\u3040-\\u30ff\\uac00-\\ud7af]/.test(cleanTrans) && cleanTrans === cleanOrig) {
+      return true;
+    }
+    return cleanTrans === cleanOrig;
+  }
+
   function buildRequestPayload(settings, messages, stream) {
     const cleanKey = sanitizeApiKey(settings.apiKey);
-    const headers = { 'Content-Type': 'application/json' };
+    const headers = buildProviderAuthHeaders(settings, cleanKey);
     if (settings.protocol === 'gemini') {
-      if (cleanKey) headers['x-goog-api-key'] = cleanKey;
       const sys = messages.find((m) => m.role === 'system');
       const usr = messages.filter((m) => m.role !== 'system');
       const normModel = String(settings.model || '').replace(/^models\\//i, '').trim().toLowerCase();
@@ -484,7 +843,7 @@ function buildUserscript(version) {
       const tc = resolveThinkingConfig(settings.model, settings.thinkingEffort || 'fastest');
       if (tc) generationConfig.thinkingConfig = tc;
       const body = {
-        contents: usr.map((m) => ({ role: 'user', parts: [{ text: m.content }] })),
+        contents: usr.map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })),
         generationConfig
       };
       if (sys) body.systemInstruction = { parts: [{ text: sys.content }] };
@@ -494,16 +853,13 @@ function buildUserscript(version) {
         body: JSON.stringify(body)
       };
     } else if (settings.protocol === 'anthropic') {
-      // Claude Messages API (no temperature / thinking fields; JSON is requested in the prompt)
       const body = buildAnthropicMessagesBody(settings, messages, { stream: Boolean(stream), maxTokens: 32000 });
       return {
         url: resolveEndpoint(settings),
-        headers: buildProviderAuthHeaders(settings, cleanKey),
+        headers,
         body: JSON.stringify(body)
       };
     } else {
-      // OpenAI-compatible; Azure OpenAI endpoints get the api-key header
-      Object.assign(headers, buildProviderAuthHeaders(settings, cleanKey));
       const model = String(settings.model || '').trim();
       const body = { model, messages, stream: Boolean(stream) };
       if (!/^o[134](?:-|$)|deepseek-reasoner|^r1\\b/i.test(model)) {
@@ -517,43 +873,95 @@ function buildUserscript(version) {
     }
   }
 
-  function callViaGmXhr(reqConfig) {
+  function callViaGmXhr(reqConfig, signal, settings = null) {
     const gmXhr = typeof GM_xmlhttpRequest === 'function'
       ? GM_xmlhttpRequest
       : (typeof GM !== 'undefined' && typeof GM.xmlHttpRequest === 'function' ? GM.xmlHttpRequest : null);
     if (!gmXhr) {
-      return Promise.reject(new Error('此頁面 CSP 阻擋了直接連線，請在 Tampermonkey / Stay Userscript 環境執行'));
+      const netErr = new Error('此頁面 CSP 阻擋了直接連線，請在 Tampermonkey / Stay Userscript 環境執行');
+      netErr.errorCode = 'NETWORK_ERROR';
+      return Promise.reject(netErr);
+    }
+    if (signal?.aborted) {
+      return Promise.reject(new DOMException('The operation was aborted.', 'AbortError'));
     }
     return new Promise((resolve, reject) => {
-      gmXhr({
+      let settled = false;
+      let handle = null;
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        try { handle?.abort?.(); } catch (_) {}
+        reject(new DOMException('The operation was aborted.', 'AbortError'));
+      };
+      if (signal) signal.addEventListener('abort', onAbort, { once: true });
+      const cleanup = () => {
+        if (signal) signal.removeEventListener('abort', onAbort);
+      };
+      handle = gmXhr({
         method: 'POST',
         url: reqConfig.url,
         headers: reqConfig.headers,
         data: reqConfig.body,
-        timeout: 35000,
+        timeout: 30000,
         onload(res) {
+          if (settled) return;
+          settled = true;
+          cleanup();
           if (res.status >= 200 && res.status < 300) {
             resolve(res.responseText || '');
           } else {
-            reject(new Error(\`HTTP \${res.status}: \${String(res.responseText || '').slice(0, 180)}\`));
+            reject(buildUserscriptHttpError(res.status, res.statusText || '', res.responseText || '', settings));
           }
         },
         onerror() {
-          reject(new Error('GM_xmlhttpRequest 網路請求失敗'));
+          if (settled) return;
+          settled = true;
+          cleanup();
+          const netErr = new Error('GM_xmlhttpRequest 網路請求失敗');
+          netErr.errorCode = 'NETWORK_ERROR';
+          netErr.retryable = true;
+          reject(netErr);
         },
         ontimeout() {
-          reject(new Error('GM_xmlhttpRequest 請求逾時'));
+          if (settled) return;
+          settled = true;
+          cleanup();
+          const tErr = new Error('GM_xmlhttpRequest 請求逾時');
+          tErr.errorCode = 'TIMEOUT';
+          tErr.retryable = true;
+          reject(tErr);
         }
       });
     });
   }
 
-  async function translateBatchItems(settings, items, pageContext, onItem) {
+  function isUserscriptFallbackEligible(err, signal) {
+    if (signal?.aborted) return false;
+    if (err?.name === 'AbortError' && err?.errorCode !== 'TIMEOUT') return false;
+    const code = String(err?.errorCode || '');
+    const status = Number(err?.httpStatus || 0);
+    if (code === 'NO_API_KEY' || code === 'INVALID_API_KEY_CHARS' || code === 'NO_MODEL' || code === 'AUTH_ERROR') return false;
+    if (status === 400 || status === 401 || status === 403 || status === 404) return false;
+    if (status === 429 || status === 503 || status === 529 || status >= 500) return true;
+    return code === 'OVERLOADED' || code === 'RATE_LIMIT' || code === 'SERVER_ERROR' || code === 'TIMEOUT' || code === 'NETWORK_ERROR' || Boolean(err?.retryable);
+  }
+
+  const USERSCRIPT_CONNECT_TIMEOUT_MS = 25000;
+  const USERSCRIPT_CHUNK_TIMEOUT_MS = 28000;
+
+  async function translateBatchItems(settings, items, pageContext, onItem, signal = null, { allowFallback = true } = {}) {
     if (!items || items.length === 0) return;
     const cleanKey = sanitizeApiKey(settings.apiKey);
-    if (!cleanKey && !/^https?:\\/\\/(localhost|127\\.0\\.0\\.1)/i.test(settings.baseUrl || '')) {
+    if (!cleanKey && !isLocalEndpoint(settings.baseUrl || '')) {
       const err = new Error('請先點擊 ⚙ 設定 API Key');
       err.errorCode = 'NO_API_KEY';
+      throw err;
+    }
+    const keyCheck = validateApiKey(cleanKey);
+    if (!keyCheck.ok) {
+      const err = new Error(keyCheck.error);
+      err.errorCode = 'INVALID_API_KEY_CHARS';
       throw err;
     }
     if (!String(settings.model || '').trim()) {
@@ -562,6 +970,7 @@ function buildUserscript(version) {
       throw err;
     }
 
+    const langInfo = resolveTargetLanguage(settings);
     const sig = buildCacheSignature(settings);
     const cacheKeys = items.map((it) => \`\${sig}::\${it.key}\`);
     const hits = await cacheGetMany(cacheKeys);
@@ -569,7 +978,7 @@ function buildUserscript(version) {
 
     for (let i = 0; i < items.length; i++) {
       const hit = hits.get(cacheKeys[i]);
-      if (hit) {
+      if (hit && !isUserscriptEcho(items[i].text, hit, langInfo.id)) {
         onItem(items[i], hit, true);
       } else {
         uncached.push(items[i]);
@@ -593,78 +1002,185 @@ function buildUserscript(version) {
           emitted.add(entry.idx);
           const item = uncached[entry.idx];
           onItem(item, entry.text, false);
-          toCache.push({ key: \`\${sig}::\${item.key}\`, zh: entry.text });
+          if (!isUserscriptEcho(item.text, entry.text, langInfo.id)) {
+            toCache.push({ key: \`\${sig}::\${item.key}\`, zh: entry.text });
+          }
         }
       }
     };
 
-    try {
-      const reqConfig = buildRequestPayload(settings, messages, true);
-      const response = await fetch(reqConfig.url, {
-        method: 'POST',
-        headers: reqConfig.headers,
-        body: reqConfig.body
-      });
-      if (!response.ok) {
-        const errText = await response.text().catch(() => '');
-        throw new Error(\`HTTP \${response.status}: \${errText.slice(0, 180)}\`);
-      }
+    const reqConfig = buildRequestPayload(settings, messages, true);
+    const nonStreamConfig = buildRequestPayload(settings, messages, false);
+    const maxAttempts = 4;
+    let lastAttemptErr = null;
+    let succeeded = false;
 
-      if (response.body) {
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let sseBuf = '';
-        let ndjsonBuf = '';
-        const processSse = (raw) => {
-          const line = raw.trim();
-          if (!line.startsWith('data:')) return;
-          const d = line.slice(5).trim();
-          if (!d || d === '[DONE]') return;
-          try {
-            const delta = extractDelta(settings.protocol, JSON.parse(d));
-            if (delta) {
-              ndjsonBuf += delta;
+    try {
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        if (signal?.aborted) {
+          throw new DOMException('The operation was aborted.', 'AbortError');
+        }
+        const ctrl = new AbortController();
+        let timedOut = false;
+        const onAbort = () => { try { ctrl.abort(); } catch (_) {} };
+        if (signal) {
+          if (signal.aborted) ctrl.abort();
+          else signal.addEventListener('abort', onAbort, { once: true });
+        }
+        let connectTimer = setTimeout(() => {
+          timedOut = true;
+          try { ctrl.abort(); } catch (_) {}
+        }, USERSCRIPT_CONNECT_TIMEOUT_MS);
+        let chunkTimer = null;
+        let retryAfterMs = 0;
+
+        try {
+          const response = await fetch(reqConfig.url, {
+            method: 'POST',
+            headers: reqConfig.headers,
+            body: reqConfig.body,
+            signal: ctrl.signal
+          });
+          clearTimeout(connectTimer);
+          connectTimer = null;
+
+          if (!response.ok) {
+            retryAfterMs = parseUserscriptRetryAfterMs(response.headers?.get?.('retry-after'));
+            const errText = await response.text().catch(() => '');
+            throw buildUserscriptHttpError(response.status, response.statusText || '', errText, settings);
+          }
+
+          if (response.body) {
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let sseBuf = '';
+            let ndjsonBuf = '';
+            const processSse = (raw) => {
+              const line = raw.trim();
+              if (!line.startsWith('data:')) return;
+              const d = line.slice(5).trim();
+              if (!d || d === '[DONE]') return;
+              let chunkObj;
+              try {
+                chunkObj = JSON.parse(d);
+              } catch (_) {
+                return;
+              }
+              if (settings.protocol === 'anthropic') {
+                const ant = extractAnthropicStreamDelta(chunkObj);
+                if (ant.error) {
+                  const sErr = new Error(redactAllUserscriptKeys(ant.error, settings));
+                  sErr.errorCode = 'SERVER_ERROR';
+                  sErr.retryable = true;
+                  throw sErr;
+                }
+              }
+              if (chunkObj?.error) {
+                const msg = typeof chunkObj.error === 'string'
+                  ? chunkObj.error
+                  : (chunkObj.error.message || JSON.stringify(chunkObj.error));
+                const sErr = new Error(redactAllUserscriptKeys(msg, settings));
+                sErr.httpStatus = Number(chunkObj.error?.code || 0) || 0;
+                throw sErr;
+              }
+              const delta = extractDelta(settings.protocol, chunkObj);
+              if (delta) {
+                ndjsonBuf += delta;
+                let nl;
+                while ((nl = ndjsonBuf.indexOf('\\n')) !== -1) {
+                  const l = ndjsonBuf.slice(0, nl);
+                  ndjsonBuf = ndjsonBuf.slice(nl + 1);
+                  handleLine(l);
+                }
+              }
+            };
+            while (true) {
+              if (chunkTimer) clearTimeout(chunkTimer);
+              timedOut = false;
+              chunkTimer = setTimeout(() => {
+                timedOut = true;
+                try { ctrl.abort(); } catch (_) {}
+              }, USERSCRIPT_CHUNK_TIMEOUT_MS);
+              const { value, done } = await reader.read();
+              if (done) break;
+              sseBuf += decoder.decode(value, { stream: true });
               let nl;
-              while ((nl = ndjsonBuf.indexOf('\\n')) !== -1) {
-                const l = ndjsonBuf.slice(0, nl);
-                ndjsonBuf = ndjsonBuf.slice(nl + 1);
-                handleLine(l);
+              while ((nl = sseBuf.indexOf('\\n')) !== -1) {
+                const l = sseBuf.slice(0, nl);
+                sseBuf = sseBuf.slice(nl + 1);
+                processSse(l);
               }
             }
-          } catch (_) {}
-        };
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          sseBuf += decoder.decode(value, { stream: true });
-          let nl;
-          while ((nl = sseBuf.indexOf('\\n')) !== -1) {
-            const l = sseBuf.slice(0, nl);
-            sseBuf = sseBuf.slice(nl + 1);
-            processSse(l);
+            if (chunkTimer) { clearTimeout(chunkTimer); chunkTimer = null; }
+            if (sseBuf.trim()) processSse(sseBuf);
+            if (ndjsonBuf.trim()) handleLine(ndjsonBuf);
+          } else {
+            const rawText = await response.text();
+            for (const l of rawText.split('\\n')) handleLine(l);
           }
+          succeeded = true;
+          lastAttemptErr = null;
+          break;
+        } catch (err) {
+          if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
+          if (chunkTimer) { clearTimeout(chunkTimer); chunkTimer = null; }
+          if (signal?.aborted) {
+            throw err;
+          }
+          let attemptErr = err;
+          if (timedOut) {
+            const tErr = new Error('請求逾時，模型長時間無回應');
+            tErr.errorCode = 'TIMEOUT';
+            tErr.retryable = true;
+            attemptErr = tErr;
+          } else if (!err?.isHttpError && err?.name !== 'AbortError') {
+            // Transport / CSP connect-src error ONLY: fall back to GM_xmlhttpRequest!
+            try {
+              const rawResp = await callViaGmXhr(nonStreamConfig, signal, settings);
+              try {
+                const parsed = JSON.parse(rawResp);
+                const fullText = extractDelta(settings.protocol, parsed);
+                for (const l of String(fullText || '').split('\\n')) handleLine(l);
+              } catch (_) {
+                for (const l of String(rawResp || '').split('\\n')) handleLine(l);
+              }
+              succeeded = true;
+              lastAttemptErr = null;
+              break;
+            } catch (gmErr) {
+              if (signal?.aborted) throw gmErr;
+              attemptErr = gmErr;
+            }
+          }
+          lastAttemptErr = attemptErr;
+          const status = Number(attemptErr?.httpStatus || 0);
+          const canRetry = Boolean(attemptErr?.retryable) && attempt < maxAttempts;
+          if (!canRetry) {
+            break;
+          }
+          const waitMs = computeUserscriptBackoffMs(status, attempt, retryAfterMs);
+          await sleepUserscriptWithAbort(waitMs, signal);
+        } finally {
+          if (connectTimer) clearTimeout(connectTimer);
+          if (chunkTimer) clearTimeout(chunkTimer);
+          if (signal) signal.removeEventListener('abort', onAbort);
         }
-        if (sseBuf.trim()) processSse(sseBuf);
-        if (ndjsonBuf.trim()) handleLine(ndjsonBuf);
-      } else {
-        const rawText = await response.text();
-        for (const l of rawText.split('\\n')) handleLine(l);
       }
-    } catch (fetchErr) {
-      // Automatic fallback to GM_xmlhttpRequest if page CSP blocks connect-src!
-      const nonStreamConfig = buildRequestPayload(settings, messages, false);
-      const rawResp = await callViaGmXhr(nonStreamConfig);
-      try {
-        const parsed = JSON.parse(rawResp);
-        const fullText = extractDelta(settings.protocol, parsed);
-        for (const l of String(fullText || '').split('\\n')) handleLine(l);
-      } catch (_) {
-        for (const l of String(rawResp || '').split('\\n')) handleLine(l);
+    } finally {
+      if (toCache.length > 0) {
+        await cachePutMany(toCache);
       }
     }
 
-    if (toCache.length > 0) {
-      await cachePutMany(toCache);
+    if (!succeeded) {
+      if (allowFallback && isUserscriptFallbackEligible(lastAttemptErr, signal)) {
+        const fbSettings = resolveFallbackSettings(settings);
+        if (fbSettings) {
+          await translateBatchItems(fbSettings, uncached, pageContext, onItem, signal, { allowFallback: false });
+          return;
+        }
+      }
+      throw lastAttemptErr || new Error('翻譯失敗');
     }
   }
 
@@ -672,9 +1188,10 @@ function buildUserscript(version) {
   // 5. Page Translation Orchestrator + Lazy IntersectionObserver
   // ============================================================
   const state = {
-    settings: readStoredSettings(),
+    settings: buildDefaultUserscriptSettings(),
     isPageActive: false,
     isTranslating: false,
+    haltedByError: false,
     translationEpoch: 0,
     elementState: new WeakMap(),
     pendingItems: [],
@@ -682,7 +1199,10 @@ function buildUserscript(version) {
     totalTranslated: 0,
     lastErrorMsg: '',
     viewportObserver: null,
-    flushTimer: null
+    flushTimer: null,
+    activeController: null,
+    spaHooked: false,
+    lastHrefPath: location.pathname + location.search
   };
 
   function ensurePageStyleInjected() {
@@ -693,7 +1213,39 @@ function buildUserscript(version) {
     (document.head || document.documentElement).appendChild(style);
   }
 
+  function releasePendingUserscriptItems() {
+    const released = state.pendingItems.splice(0);
+    for (const item of released) {
+      if (item?.el && state.elementState.get(item.el) === 'queued') {
+        state.elementState.delete(item.el);
+      }
+    }
+  }
+
+  function isCircuitBreakingUserscriptError(err) {
+    const code = String(err?.errorCode || '');
+    const status = Number(err?.httpStatus || 0);
+    if (
+      code === 'NO_API_KEY' ||
+      code === 'INVALID_API_KEY_CHARS' ||
+      code === 'NO_MODEL' ||
+      code === 'AUTH_ERROR' ||
+      code === 'OVERLOADED' ||
+      code === 'RATE_LIMIT' ||
+      code === 'SERVER_ERROR' ||
+      code === 'TIMEOUT' ||
+      code === 'NETWORK_ERROR'
+    ) {
+      return true;
+    }
+    return status >= 400;
+  }
+
   function enqueueItemForTranslation(item) {
+    if (state.haltedByError) {
+      if (item?.el) state.elementState.delete(item.el);
+      return;
+    }
     state.pendingItems.push(item);
     if (!state.flushTimer) {
       state.flushTimer = setTimeout(() => {
@@ -704,16 +1256,28 @@ function buildUserscript(version) {
   }
 
   async function flushTranslationQueue() {
-    if (state.isTranslating || state.pendingItems.length === 0) return;
+    if (state.isTranslating || state.haltedByError || state.pendingItems.length === 0) return;
     state.isTranslating = true;
     const epoch = state.translationEpoch;
+    const controller = new AbortController();
+    state.activeController = controller;
     const pageContext = KCTSiteAnalyzer.classifyPage();
     updatePillStatus();
 
     try {
-      while (state.pendingItems.length > 0 && epoch === state.translationEpoch) {
+      while (state.pendingItems.length > 0 && epoch === state.translationEpoch && !state.haltedByError) {
         const batchSize = Math.max(1, Number(state.settings.batchSize || 16));
-        const batch = state.pendingItems.splice(0, batchSize);
+        const maxBatchChars = Math.max(800, Number(state.settings.maxBatchChars || 5500));
+        const batch = [];
+        let batchChars = 0;
+        while (state.pendingItems.length > 0 && batch.length < batchSize) {
+          const next = state.pendingItems[0];
+          const nextLen = String(next?.text || '').length;
+          if (batch.length > 0 && batchChars + nextLen > maxBatchChars) break;
+          batch.push(state.pendingItems.shift());
+          batchChars += nextLen;
+        }
+        if (batch.length === 0) break;
 
         await translateBatchItems(state.settings, batch, pageContext, (item, zh) => {
           if (epoch !== state.translationEpoch) return;
@@ -724,14 +1288,24 @@ function buildUserscript(version) {
           }
           state.totalTranslated += 1;
           updatePillStatus();
-        });
+        }, controller.signal);
       }
     } catch (err) {
-      state.lastErrorMsg = err?.message || '翻譯失敗';
-      if (err?.errorCode === 'NO_API_KEY') {
+      if (controller.signal.aborted || err?.name === 'AbortError') return;
+      const fmt = formatApiError(err, err?.httpStatus, err?.errorCode);
+      state.lastErrorMsg = fmt.shortMsg || err?.message || '翻譯失敗';
+      if (isCircuitBreakingUserscriptError(err)) {
+        state.haltedByError = true;
+        releasePendingUserscriptItems();
+        if (state.viewportObserver) state.viewportObserver.disconnect();
+      }
+      if (err?.errorCode === 'NO_API_KEY' || err?.errorCode === 'INVALID_API_KEY_CHARS') {
         openSettingsModal();
       }
     } finally {
+      if (state.activeController === controller) {
+        state.activeController = null;
+      }
       state.isTranslating = false;
       updatePillStatus();
     }
@@ -756,15 +1330,47 @@ function buildUserscript(version) {
     };
   }
 
+  function hookSpaNavigation() {
+    if (state.spaHooked) return;
+    state.spaHooked = true;
+    const handleUrlChange = () => {
+      const nextHrefPath = location.pathname + location.search;
+      if (nextHrefPath === state.lastHrefPath) return;
+      state.lastHrefPath = nextHrefPath;
+      const wasActive = state.isPageActive;
+      revertPageTranslation();
+      if (wasActive || isHostWhitelisted(location.hostname, state.settings)) {
+        setTimeout(() => {
+          if (!state.isPageActive) startPageTranslation();
+        }, 350);
+      }
+    };
+    const wrapHistoryMethod = (methodName) => {
+      const orig = history[methodName];
+      if (typeof orig !== 'function') return;
+      history[methodName] = function wrappedHistoryMethod(...args) {
+        const res = orig.apply(this, args);
+        setTimeout(handleUrlChange, 0);
+        return res;
+      };
+    };
+    wrapHistoryMethod('pushState');
+    wrapHistoryMethod('replaceState');
+    window.addEventListener('popstate', () => setTimeout(handleUrlChange, 0));
+  }
+
   function startPageTranslation() {
     ensurePageStyleInjected();
+    hookSpaNavigation();
     state.isPageActive = true;
+    state.haltedByError = false;
     state.lastErrorMsg = '';
     KCTRenderer.applyDisplayModeClass({ ...state.settings, enabled: true });
 
     if (!state.viewportObserver) {
       state.viewportObserver = new IntersectionObserver(
         (entries) => {
+          if (!state.isPageActive || state.haltedByError) return;
           for (const entry of entries) {
             if (!entry.isIntersecting) continue;
             const el = entry.target;
@@ -811,7 +1417,7 @@ function buildUserscript(version) {
     if (!state.domMutationObserver && document.body) {
       let mutTimer = null;
       state.domMutationObserver = new MutationObserver((mutations) => {
-        if (!state.isPageActive) return;
+        if (!state.isPageActive || state.haltedByError) return;
         let hasNew = false;
         for (const m of mutations) {
           if (m.target?.closest?.('[data-kct-ui]')) continue;
@@ -828,7 +1434,7 @@ function buildUserscript(version) {
         if (hasNew) {
           if (mutTimer) clearTimeout(mutTimer);
           mutTimer = setTimeout(() => {
-            if (state.isPageActive) startPageTranslation();
+            if (state.isPageActive && !state.haltedByError) startPageTranslation();
           }, 320);
         }
       });
@@ -839,6 +1445,18 @@ function buildUserscript(version) {
   }
 
   function revertPageTranslation() {
+    state.translationEpoch += 1;
+    if (state.activeController) {
+      try { state.activeController.abort(); } catch (_) {}
+      state.activeController = null;
+    }
+    if (state.flushTimer) {
+      clearTimeout(state.flushTimer);
+      state.flushTimer = null;
+    }
+    releasePendingUserscriptItems();
+    state.haltedByError = false;
+    state.lastErrorMsg = '';
     if (state.viewportObserver) {
       state.viewportObserver.disconnect();
     }
@@ -1108,6 +1726,18 @@ function buildUserscript(version) {
       providerSelect.appendChild(opt);
     }
 
+    const protocolSelect = document.createElement('select');
+    for (const [val, lbl] of [['openai', 'OpenAI 相容'], ['gemini', 'Google Gemini'], ['anthropic', 'Anthropic Claude']]) {
+      const opt = document.createElement('option');
+      opt.value = val;
+      opt.textContent = lbl;
+      protocolSelect.appendChild(opt);
+    }
+
+    const baseUrlInput = document.createElement('input');
+    baseUrlInput.type = 'url';
+    baseUrlInput.placeholder = 'https://...';
+
     const apiKeyInput = document.createElement('input');
     apiKeyInput.type = 'password';
     apiKeyInput.placeholder = '填入 API Key...';
@@ -1128,8 +1758,13 @@ function buildUserscript(version) {
     }
 
     providerSelect.addEventListener('change', () => {
-      const preset = PROVIDER_PRESETS[providerSelect.value] || PROVIDER_PRESETS.gemini;
-      modelInput.value = preset.defaultModel || '';
+      const pid = providerSelect.value;
+      const preset = PROVIDER_PRESETS[pid] || PROVIDER_PRESETS.gemini;
+      const prof = state.settings?.providerProfiles?.[pid];
+      protocolSelect.value = prof?.protocol || preset.protocol || 'openai';
+      baseUrlInput.value = prof?.baseUrl || preset.baseUrl || '';
+      modelInput.value = prof?.model || preset.defaultModel || '';
+      apiKeyInput.value = prof?.apiKey || '';
     });
 
     const modalActions = document.createElement('div');
@@ -1149,6 +1784,8 @@ function buildUserscript(version) {
     modal.append(
       modalTitle,
       makeField('AI 服務商', providerSelect),
+      makeField('API 協定', protocolSelect),
+      makeField('API Base URL', baseUrlInput),
       makeField('API Key 金鑰', apiKeyInput),
       makeField('模型 ID', modelInput),
       makeField('目標語言', langSelect),
@@ -1177,6 +1814,8 @@ function buildUserscript(version) {
       closeBtn,
       modalBackdrop,
       providerSelect,
+      protocolSelect,
+      baseUrlInput,
       apiKeyInput,
       modelInput,
       langSelect,
@@ -1262,12 +1901,38 @@ function buildUserscript(version) {
     saveModalBtn.addEventListener('click', () => {
       const pid = providerSelect.value;
       const preset = PROVIDER_PRESETS[pid] || PROVIDER_PRESETS.gemini;
+      const nextUrl = String(baseUrlInput.value || preset.baseUrl || '').trim();
+      try {
+        const parsed = new URL(nextUrl);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+          showToast('⚠️ Base URL 必須為 http:// 或 https://');
+          return;
+        }
+      } catch (_) {
+        showToast('⚠️ 請輸入有效的 API Base URL');
+        return;
+      }
+      const keyCheck = validateApiKey(apiKeyInput.value);
+      if (!keyCheck.ok) {
+        showToast(\`⚠️ \${keyCheck.error}\`);
+        return;
+      }
+      const nextProtocol = protocolSelect.value || preset.protocol || 'openai';
+      const nextModel = modelInput.value.trim() || preset.defaultModel || '';
+      const mergedProfiles = normalizeProviderProfiles(state.settings?.providerProfiles, {
+        providerId: pid,
+        protocol: nextProtocol,
+        baseUrl: nextUrl,
+        apiKey: keyCheck.cleanKey,
+        model: nextModel
+      });
       state.settings = writeStoredSettings({
         providerId: pid,
-        protocol: preset.protocol,
-        baseUrl: preset.baseUrl,
-        apiKey: sanitizeApiKey(apiKeyInput.value),
-        model: modelInput.value.trim() || preset.defaultModel,
+        protocol: nextProtocol,
+        baseUrl: nextUrl,
+        apiKey: keyCheck.cleanKey,
+        model: nextModel,
+        providerProfiles: mergedProfiles,
         targetLang: langSelect.value
       });
       modalBackdrop.hidden = true;
@@ -1290,7 +1955,11 @@ function buildUserscript(version) {
     if (!uiRefs) return;
     uiRefs.edgeTab.hidden = true;
     uiRefs.pill.hidden = false;
-    uiRefs.providerSelect.value = PROVIDER_PRESETS[state.settings.providerId] ? state.settings.providerId : 'gemini';
+    const pid = PROVIDER_PRESETS[state.settings.providerId] ? state.settings.providerId : 'custom';
+    const preset = PROVIDER_PRESETS[pid] || PROVIDER_PRESETS.gemini;
+    uiRefs.providerSelect.value = pid;
+    if (uiRefs.protocolSelect) uiRefs.protocolSelect.value = state.settings.protocol || preset.protocol || 'openai';
+    if (uiRefs.baseUrlInput) uiRefs.baseUrlInput.value = state.settings.baseUrl || preset.baseUrl || '';
     uiRefs.apiKeyInput.value = state.settings.apiKey || '';
     uiRefs.modelInput.value = state.settings.model || '';
     uiRefs.langSelect.value = state.settings.targetLang || 'zh-TW';
@@ -1329,9 +1998,10 @@ function buildUserscript(version) {
   // ============================================================
   // 7. Boot
   // ============================================================
-  function boot() {
+  async function boot() {
     if (!KCTSiteAnalyzer.isTopFrame()) return;
-    const synced = checkAndApplyNrSyncHash();
+    await initStoredSettings();
+    const synced = await checkAndApplyNrSyncHash();
     state.settings = readStoredSettings();
     buildShadowUI();
     if (synced) {
@@ -1343,9 +2013,9 @@ function buildUserscript(version) {
   }
 
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', boot, { once: true });
+    document.addEventListener('DOMContentLoaded', () => { void boot(); }, { once: true });
   } else {
-    boot();
+    void boot();
   }
 })();
 `;
