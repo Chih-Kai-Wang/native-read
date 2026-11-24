@@ -28,7 +28,7 @@
       <img src="./icons/icon-48.png" alt="NativeRead" width="28" height="28" class="nr-brand-logo">
       <div class="nr-brand-titles">
         <span class="nr-brand-title">NativeRead</span>
-        <span class="nr-brand-tag">v2.8.1 Mobile &amp; PWA</span>
+        <span class="nr-brand-tag">v2.8.2 Mobile &amp; PWA</span>
       </div>
     </div>
 
@@ -193,6 +193,21 @@
         </p>
       </div>
 
+      <!-- Sync Readiness & Post-Install Bridge Card -->
+      <div id="installSyncStatusCard" class="nr-card nr-sync-status-card" data-ready="false">
+        <div class="nr-sync-status-header">
+          <span id="installSyncStatusBadge" class="nr-sync-status-badge">尚未偵測到設定</span>
+          <h3 id="installSyncStatusTitle" class="nr-install-title">等待同步電腦端 API 金鑰與模型</h3>
+        </div>
+        <p id="installSyncStatusDesc" class="nr-card-desc">
+          安裝下方瀏覽器外掛或擴充包後，請回到本頁點擊「立即同步設定」，外掛即可自動帶入金鑰與模型，無需重複手動填寫。
+        </p>
+        <div class="nr-install-actions">
+          <button id="btnInstallApplySync" type="button" class="nr-primary-btn">🔄 我已裝好外掛，立即同步設定</button>
+          <button id="btnInstallCopySync" type="button" class="nr-secondary-btn">📋 複製同步連結（跨瀏覽器／主畫面用）</button>
+        </div>
+      </div>
+
       <!-- Card 1: Universal Userscript -->
       <div class="nr-card nr-install-card">
         <div class="nr-install-header">
@@ -257,6 +272,24 @@
         <p class="nr-card-desc">
           支援從電腦版 NativeRead 點擊「📱 手機同步」掃描 QR Code 一秒免打字匯入設定。
         </p>
+
+        <div id="pwaSyncBridgeBox" class="nr-sync-bridge-box">
+          <label for="pwaSyncImportInput" class="nr-label">快速同步橋接（支援 iOS 主畫面獨立 App / 跨瀏覽器轉移）</label>
+          <div class="nr-input-row">
+            <input
+              id="pwaSyncImportInput"
+              type="text"
+              class="nr-text-input"
+              placeholder="貼上電腦端同步連結（https://...#nr_sync=...）"
+              autocomplete="off"
+            >
+            <button id="pwaSyncImportBtn" type="button" class="nr-primary-btn">一鍵匯入</button>
+          </div>
+          <div class="nr-install-actions">
+            <button id="pwaSyncCopyBtn" type="button" class="nr-secondary-btn">📋 複製目前設定同步連結</button>
+          </div>
+          <p id="pwaSyncImportStatus" class="nr-field-hint" hidden></p>
+        </div>
 
         <form id="settingsForm" class="nr-settings-form" autocomplete="off">
           <div class="nr-field">

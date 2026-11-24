@@ -9,7 +9,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, '..');
 
-function loadServiceWorker({ initialSettings = {}, fetchImpl, tabsById = {}, executeScriptImpl } = {}) {
+function loadServiceWorker({ initialSettings = {}, fetchImpl, tabsById = {}, tabsList = null, executeScriptImpl } = {}) {
   const configCode = fs.readFileSync(path.join(REPO_ROOT, 'shared/config.js'), 'utf8');
   const swCode = fs.readFileSync(path.join(REPO_ROOT, 'background/service-worker.js'), 'utf8');
   const store = { ...initialSettings };
@@ -65,6 +65,9 @@ function loadServiceWorker({ initialSettings = {}, fetchImpl, tabsById = {}, exe
         async get(id) {
           if (!(id in tabsById)) throw new Error('Tab not found');
           return tabsById[id];
+        },
+        async query() {
+          return Array.isArray(tabsList) ? tabsList : Object.values(tabsById);
         },
         async create(props) {
           createdTabs.push(props);
@@ -393,4 +396,101 @@ test('OPEN_PDF_VIEWER prefers explicit message.tabId over sender.tab for detectF
     createdTabs[0].url,
     'chrome-extension://native-read-test-ext/viewer/pdf-viewer.html?src=https%3A%2F%2Fpaper.example%2Fprotected.pdf&tabId=77'
   );
+});
+
+test('trySyncFromOpenTrustedPwaTabs bridges valid PWA settings while ignoring untrusted origins, localhost & stale data', async () => {
+  const evilPayload = JSON.stringify({
+    providerId: 'openai',
+    protocol: 'openai',
+    baseUrl: 'https://api.openai.com/v1',
+    apiKey: 'sk-evil-pwa-tab',
+    model: 'gpt-4o-mini',
+    syncedAt: 9999999999999
+  });
+  const localPayload = JSON.stringify({
+    providerId: 'ollama',
+    protocol: 'openai',
+    baseUrl: 'http://localhost:11434/v1',
+    apiKey: 'ollama-dummy',
+    model: 'qwen2.5',
+    syncedAt: 9999999999999
+  });
+  const trustedPayload = JSON.stringify({
+    providerId: 'gemini',
+    protocol: 'gemini',
+    baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+    apiKey: 'AIza-trusted-open-tab-77',
+    model: 'gemini-3.5-flash-lite',
+    targetLang: 'zh-TW',
+    syncedAt: 1700000500000
+  });
+
+  let execCalls = 0;
+  const { context, store } = loadServiceWorker({
+    tabsList: [
+      { id: 100, url: 'https://evil.example/native-read/' },
+      { id: 101, url: 'https://chih-kai-wang.github.io/native-read/' }
+    ],
+    executeScriptImpl: ({ target }) => {
+      execCalls += 1;
+      if (target.tabId === 100) return [{ result: evilPayload }];
+      if (target.tabId === 101) return [{ result: execCalls === 1 ? trustedPayload : localPayload }];
+      return [];
+    }
+  });
+
+  const imported = await context.trySyncFromOpenTrustedPwaTabs();
+  assert.equal(imported, true);
+  assert.equal(execCalls, 1, 'Never executes script on untrusted tab 100');
+  assert.equal(store.kct_settings_v1.apiKey, 'AIza-trusted-open-tab-77');
+  assert.equal(store.kct_settings_v1.syncedAt, 1700000500000);
+
+  // Stale timestamp (<= stored syncedAt) does not overwrite
+  const staleRes = await context.tryImportFromTrustedPwaTab(101, 'https://chih-kai-wang.github.io/native-read/');
+  assert.equal(staleRes, false);
+
+  // Localhost baseUrl in trusted PWA is ignored for extension auto-sync
+  const freshLocalEnv = loadServiceWorker({
+    tabsList: [{ id: 102, url: 'https://chih-kai-wang.github.io/native-read/' }],
+    executeScriptImpl: () => [{ result: localPayload }]
+  });
+  const localImported = await freshLocalEnv.context.trySyncFromOpenTrustedPwaTabs();
+  assert.equal(localImported, false);
+  assert.equal(freshLocalEnv.store.kct_settings_v1, undefined);
+});
+
+test('IMPORT_SYNC_PAYLOAD accepts valid sync URL from extension sender, rejects partial payload without key, and blocks untrusted senders', async () => {
+  const { sendMessage, store } = loadServiceWorker();
+  const validToken = Buffer.from(JSON.stringify({
+    p: 'deepseek',
+    r: 'openai',
+    k: 'sk-ds-imported-sync-88',
+    m: 'deepseek-chat',
+    l: 'zh-CN'
+  })).toString('base64url');
+
+  const okRes = await sendMessage({
+    type: 'IMPORT_SYNC_PAYLOAD',
+    raw: `https://chih-kai-wang.github.io/native-read/#nr_sync=${validToken}`
+  });
+  assert.equal(okRes.ok, true);
+  assert.equal(store.kct_settings_v1.providerId, 'deepseek');
+  assert.equal(store.kct_settings_v1.apiKey, 'sk-ds-imported-sync-88');
+
+  const partialToken = Buffer.from(JSON.stringify({
+    u: 'https://attacker.example/v1',
+    m: 'hijacked-model'
+  })).toString('base64url');
+  const badRes = await sendMessage({
+    type: 'IMPORT_SYNC_PAYLOAD',
+    raw: `#nr_sync=${partialToken}`
+  });
+  assert.equal(badRes.ok, false);
+  assert.equal(store.kct_settings_v1.apiKey, 'sk-ds-imported-sync-88');
+
+  const untrustedRes = await sendMessage(
+    { type: 'IMPORT_SYNC_PAYLOAD', raw: `#nr_sync=${validToken}` },
+    { url: 'https://untrusted.example/page.html', tab: { id: 55 } }
+  );
+  assert.equal(untrustedRes.ok, false);
 });

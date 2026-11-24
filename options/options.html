@@ -243,7 +243,20 @@
             <input id="mobile-sync-url" type="text" readonly placeholder="尚未產生同步連結">
             <button id="btn-copy-mobile-sync" type="button" class="btn secondary" disabled>複製</button>
           </div>
+          <p class="hint sync-guide-note">
+            1. 請直接用欲使用的手機瀏覽器（Safari／狐猴／Kiwi／Chrome）掃描 QR Code 即可於 PWA 立即翻譯。<br>
+            2. 若安裝 Userscript 或 Android 擴充包後尚未帶入金鑰，回原網頁點「立即同步設定」或將同步連結貼於下方「一鍵匯入」即可。
+          </p>
         </div>
+      </div>
+
+      <div class="field sync-import-field">
+        <label for="import-sync-input">或貼上電腦端同步連結匯入（手機擴充包適用）</label>
+        <div class="input-with-btn">
+          <input id="import-sync-input" type="text" placeholder="https://chih-kai-wang.github.io/native-read/#nr_sync=..." autocomplete="off">
+          <button id="btn-import-mobile-sync" type="button" class="btn secondary">一鍵匯入設定</button>
+        </div>
+        <span id="import-sync-status" class="inline-status" aria-live="polite"></span>
       </div>
     </section>
 

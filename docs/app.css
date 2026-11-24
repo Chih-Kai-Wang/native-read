@@ -1373,3 +1373,71 @@ body {
 #pdfErrorDetail {
   white-space: pre-line;
 }
+
+/* ============================================================
+   Sync Readiness & Fast Import Bridge
+   ============================================================ */
+.nr-sync-status-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border-color: var(--nr-border-strong);
+}
+
+.nr-sync-status-card[data-ready="true"] {
+  border-color: rgba(22, 163, 74, 0.35);
+  background: linear-gradient(180deg, var(--nr-ok-soft) 0%, var(--nr-surface) 44%);
+}
+
+.nr-sync-status-header {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.nr-sync-status-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--nr-warn);
+  background: rgba(217, 119, 6, 0.14);
+}
+
+.nr-sync-status-card[data-ready="true"] .nr-sync-status-badge {
+  color: var(--nr-ok);
+  background: var(--nr-ok-soft);
+}
+
+.nr-sync-bridge-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+  margin-bottom: 14px;
+  padding: 12px;
+  border-radius: 12px;
+  background: var(--nr-bg-subtle);
+  border: 1px solid var(--nr-border);
+  min-width: 0;
+}
+
+.nr-sync-bridge-box .nr-input-row {
+  min-width: 0;
+}
+
+.nr-sync-bridge-box .nr-text-input {
+  min-width: 0;
+}
+
+.nr-sync-bridge-box .nr-primary-btn,
+.nr-sync-bridge-box .nr-secondary-btn,
+.nr-sync-status-card .nr-primary-btn,
+.nr-sync-status-card .nr-secondary-btn {
+  max-width: 100%;
+  white-space: normal;
+  text-align: center;
+}

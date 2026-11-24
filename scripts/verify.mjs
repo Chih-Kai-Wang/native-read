@@ -110,6 +110,7 @@ function runContractTests() {
     'tests/content-queue.test.mjs',
     'tests/userscript-runtime.test.mjs',
     'tests/pwa-sw.test.mjs',
+    'tests/pwa-sync.test.mjs',
     'tests/workflow-integrity.test.mjs'
   ];
   execFileSync(process.execPath, ['--test', ...suites.map((s) => path.join(ROOT, s))], {

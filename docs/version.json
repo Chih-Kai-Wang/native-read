@@ -1,5 +1,5 @@
 {
-  "version": "2.8.1",
+  "version": "2.8.2",
   "userscript": "https://chih-kai-wang.github.io/native-read/nativeread.user.js",
   "androidZip": "https://chih-kai-wang.github.io/native-read/nativeread-android-extension.zip",
   "pwa": "https://chih-kai-wang.github.io/native-read/"

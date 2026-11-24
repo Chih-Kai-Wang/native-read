@@ -583,6 +583,17 @@ a:focus-visible {
   margin-bottom: 6px;
 }
 
+.sync-guide-note {
+  margin: 8px 0 0;
+  line-height: 1.55;
+}
+
+.sync-import-field {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
 .save-bar {
   position: static;
   display: flex;

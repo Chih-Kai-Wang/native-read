@@ -889,6 +889,45 @@ function saveSettings(partial) {
   return next;
 }
 
+function encodeBase64UrlUtf8(str) {
+  const bytes = new TextEncoder().encode(String(str || ''));
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function buildMobileSyncUrlFromSettings(settings) {
+  if (!settings || typeof settings !== 'object') return '';
+  const pid = PROVIDER_PRESETS[settings.providerId] ? settings.providerId : 'custom';
+  const preset = PROVIDER_PRESETS[pid] || null;
+  const baseUrl = String(settings.baseUrl || preset?.baseUrl || '').trim();
+  if (!baseUrl || isLocalEndpoint(baseUrl)) return '';
+  const keyCheck = validateApiKey(settings.apiKey || '');
+  if (!keyCheck.ok || !keyCheck.cleanKey) return '';
+  const model = String(settings.model || preset?.defaultModel || '').trim();
+  if (!model) return '';
+
+  const payload = {
+    p: pid,
+    r: settings.protocol || preset?.protocol || 'openai',
+    k: keyCheck.cleanKey,
+    m: model,
+    l: settings.targetLang || 'zh-TW',
+    e: settings.thinkingEffort || 'fastest',
+    t: settings.typographyMatch || 'native'
+  };
+  if (!preset || baseUrl !== preset.baseUrl) {
+    payload.u = baseUrl;
+  }
+  if (payload.l === 'custom' && settings.customTargetLang) {
+    payload.c = String(settings.customTargetLang).trim();
+  }
+  const encoded = encodeBase64UrlUtf8(JSON.stringify(payload));
+  return `https://chih-kai-wang.github.io/native-read/#nr_sync=${encoded}`;
+}
+
 function decodeBase64UrlJson(b64url) {
   const base64 = String(b64url || '')
     .trim()
@@ -904,28 +943,66 @@ function decodeBase64UrlJson(b64url) {
   return JSON.parse(jsonStr);
 }
 
+function extractNrSyncTokenFromInput(rawInput) {
+  const text = String(rawInput || '').trim();
+  if (!text) return '';
+  const hashMatch = text.match(/(?:^|[#&])nr_sync=([A-Za-z0-9_%-]+)/);
+  if (hashMatch && hashMatch[1]) return hashMatch[1];
+  try {
+    const parsed = new URL(text);
+    const urlMatch = String(parsed.hash || '').match(/(?:^|[#&])nr_sync=([A-Za-z0-9_%-]+)/);
+    if (urlMatch && urlMatch[1]) return urlMatch[1];
+  } catch (_) {}
+  if (/^[A-Za-z0-9_-]{12,}={0,2}$/.test(text)) {
+    return text;
+  }
+  return '';
+}
+
+function dispatchPwaSyncEvent(syncedAt) {
+  try {
+    window.dispatchEvent(new CustomEvent('nativeread:pwa-settings-synced', { detail: { syncedAt } }));
+  } catch (_) {}
+}
+
 function scrubNrSyncHashFromUrl() {
   try {
+    if (!String(window.location.hash || '').includes('nr_sync=')) return;
     history.replaceState(null, '', window.location.pathname + window.location.search);
   } catch (_) {}
 }
 
-function checkAndApplyNrSyncHash() {
-  const hash = String(window.location.hash || '');
-  if (!hash.includes('nr_sync=')) return false;
-
-  const match = hash.match(/(?:^|[#&])nr_sync=([^&]+)/);
-  if (!match || !match[1]) {
-    scrubNrSyncHashFromUrl();
-    return false;
+function scheduleScrubNrSyncHash() {
+  if (!String(window.location.hash || '').includes('nr_sync=')) return;
+  const runScrub = () => {
+    setTimeout(() => {
+      scrubNrSyncHashFromUrl();
+    }, 400);
+  };
+  if (document.readyState === 'complete') {
+    runScrub();
+  } else {
+    window.addEventListener('load', runScrub, { once: true });
   }
+}
 
+function applyNrSyncToken(rawToken) {
+  if (!rawToken) return false;
   try {
-    const payload = decodeBase64UrlJson(decodeURIComponent(match[1]));
+    const payload = decodeBase64UrlJson(decodeURIComponent(rawToken));
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
 
-    const rawProviderId = String(payload.providerId || payload.p || 'gemini').trim();
-    const providerId = PROVIDER_PRESETS[rawProviderId] ? rawProviderId : 'custom';
+    const rawProviderId = String(payload.providerId || payload.p || '').trim();
+    const hasEndpointFields = Boolean(
+      rawProviderId || payload.protocol || payload.r || payload.baseUrl || payload.u
+    );
+    const rawKey = payload.apiKey ?? payload.k;
+    const hasExplicitKey = typeof rawKey === 'string';
+    if (!hasExplicitKey && hasEndpointFields) return false;
+
+    const providerId = rawProviderId
+      ? (PROVIDER_PRESETS[rawProviderId] ? rawProviderId : 'custom')
+      : 'gemini';
     const preset = PROVIDER_PRESETS[providerId] || PROVIDER_PRESETS.gemini;
     const rawProtocol = String(payload.protocol || payload.r || preset.protocol || 'gemini').trim().toLowerCase();
     if (!['openai', 'gemini', 'anthropic'].includes(rawProtocol)) return false;
@@ -938,7 +1015,7 @@ function checkAndApplyNrSyncHash() {
       return false;
     }
 
-    const keyCheck = validateApiKey(payload.apiKey ?? payload.k ?? '');
+    const keyCheck = validateApiKey(rawKey ?? '');
     if (!keyCheck.ok) return false;
     const apiKey = keyCheck.cleanKey;
 
@@ -950,6 +1027,7 @@ function checkAndApplyNrSyncHash() {
     const thinkingEffort = ['fastest', 'balanced', 'deep'].includes(rawEffort) ? rawEffort : 'fastest';
     const rawTypo = String(payload.typographyMatch || payload.t || 'native').trim();
     const typographyMatch = ['native', 'system', 'preserve'].includes(rawTypo) ? rawTypo : 'native';
+    const syncedAt = Date.now();
 
     const current = loadSettings();
     const mergedProfiles = normalizeProviderProfiles(current.providerProfiles, {
@@ -970,15 +1048,33 @@ function checkAndApplyNrSyncHash() {
       targetLang,
       customTargetLang,
       thinkingEffort,
-      typographyMatch
+      typographyMatch,
+      syncedAt
     });
+    dispatchPwaSyncEvent(syncedAt);
 
     return true;
   } catch (err) {
     console.warn('[NativeRead] Failed to decode #nr_sync payload:', err);
     return false;
+  }
+}
+
+function checkAndApplyNrSyncHash() {
+  const hash = String(window.location.hash || '');
+  if (!hash.includes('nr_sync=')) return false;
+
+  const token = extractNrSyncTokenFromInput(hash);
+  if (!token) {
+    scheduleScrubNrSyncHash();
+    return false;
+  }
+
+  try {
+    return applyNrSyncToken(token);
   } finally {
-    scrubNrSyncHashFromUrl();
+    // Allow @run-at document-idle Userscript to read #nr_sync before scrubbing the hash
+    scheduleScrubNrSyncHash();
   }
 }
 
@@ -2013,10 +2109,21 @@ const dom = {
   webArticleBody: document.getElementById('webArticleBody'),
 
   // Install Tab
+  installSyncStatusCard: document.getElementById('installSyncStatusCard'),
+  installSyncStatusBadge: document.getElementById('installSyncStatusBadge'),
+  installSyncStatusTitle: document.getElementById('installSyncStatusTitle'),
+  installSyncStatusDesc: document.getElementById('installSyncStatusDesc'),
+  btnInstallApplySync: document.getElementById('btnInstallApplySync'),
+  btnInstallCopySync: document.getElementById('btnInstallCopySync'),
   bookmarkletCodeBox: document.getElementById('bookmarkletCodeBox'),
   copyBookmarkletBtn: document.getElementById('copyBookmarkletBtn'),
 
   // Settings Tab
+  pwaSyncBridgeBox: document.getElementById('pwaSyncBridgeBox'),
+  pwaSyncImportInput: document.getElementById('pwaSyncImportInput'),
+  pwaSyncImportBtn: document.getElementById('pwaSyncImportBtn'),
+  pwaSyncCopyBtn: document.getElementById('pwaSyncCopyBtn'),
+  pwaSyncImportStatus: document.getElementById('pwaSyncImportStatus'),
   settingsForm: document.getElementById('settingsForm'),
   setProvider: document.getElementById('setProvider'),
   setProtocol: document.getElementById('setProtocol'),
@@ -3635,6 +3742,7 @@ function renderSavedProvidersRow() {
         renderGlobalProviderSelect();
         renderSavedProvidersRow();
         renderFallbackProviderSelect();
+        renderInstallSyncCard();
       });
       chip.appendChild(rmBtn);
     }
@@ -3685,6 +3793,7 @@ function switchActiveProviderFromUi(targetProviderId) {
   populateSettingsForm();
   renderGlobalProviderSelect();
   const label = PROVIDER_PRESETS[state.settings.providerId]?.label || state.settings.providerId;
+  renderInstallSyncCard();
   showSyncBanner(`✓ 已切換供應商為 ${label}${state.settings.model ? ` (${state.settings.model})` : ''}`);
 
   if (state.pdfDoc) {
@@ -3779,6 +3888,57 @@ function updateProviderPresetUI(providerId, overwriteFields = true) {
   }
   renderSavedProvidersRow();
   renderFallbackProviderSelect();
+}
+
+function renderInstallSyncCard() {
+  if (!dom.installSyncStatusCard) return;
+  const s = state.settings || {};
+  const pid = PROVIDER_PRESETS[s.providerId] ? s.providerId : 'custom';
+  const preset = PROVIDER_PRESETS[pid] || null;
+  const label = preset?.label || pid;
+  const hasCreds = isProfileReady(pid, {
+    protocol: s.protocol || preset?.protocol || 'openai',
+    baseUrl: s.baseUrl || preset?.baseUrl || '',
+    apiKey: s.apiKey || '',
+    model: s.model || preset?.defaultModel || ''
+  });
+  const syncUrl = buildMobileSyncUrlFromSettings(s);
+
+  dom.installSyncStatusCard.dataset.ready = hasCreds ? 'true' : 'false';
+  if (hasCreds) {
+    const modelLabel = s.model || preset?.defaultModel || '已設定模型';
+    if (dom.installSyncStatusBadge) dom.installSyncStatusBadge.textContent = '✓ 已備妥電腦端設定';
+    if (dom.installSyncStatusTitle) dom.installSyncStatusTitle.textContent = `${label} · ${modelLabel}`;
+    if (dom.installSyncStatusDesc) {
+      dom.installSyncStatusDesc.textContent =
+        '裝好 Userscript 或 Android 擴充包後，按下「我已裝好外掛，立即同步設定」或直接重新整理本頁，設定會自動套用；若在另一個瀏覽器使用，可點右側複製同步連結。';
+    }
+  } else {
+    if (dom.installSyncStatusBadge) dom.installSyncStatusBadge.textContent = '尚未偵測到設定';
+    if (dom.installSyncStatusTitle) dom.installSyncStatusTitle.textContent = '等待同步電腦端 API 金鑰與模型';
+    if (dom.installSyncStatusDesc) {
+      dom.installSyncStatusDesc.textContent =
+        '請用目標手機瀏覽器掃描電腦端的同步 QR Code，或先到下方「模型設定」分頁貼上同步連結／填寫 API 金鑰。';
+    }
+  }
+  if (dom.btnInstallApplySync) {
+    dom.btnInstallApplySync.disabled = !hasCreds;
+  }
+  if (dom.btnInstallCopySync) {
+    dom.btnInstallCopySync.disabled = !syncUrl;
+  }
+  if (dom.pwaSyncCopyBtn) {
+    dom.pwaSyncCopyBtn.disabled = !syncUrl;
+  }
+}
+
+function refreshAllPwaSettingsViews() {
+  state.settings = loadSettings();
+  populateLanguageDropdowns();
+  renderGlobalProviderSelect();
+  populateSettingsForm();
+  applyRootLanguageFonts(state.settings);
+  renderInstallSyncCard();
 }
 
 async function updateCacheCountUI() {
@@ -3983,7 +4143,63 @@ function bindEvents() {
     dom.webRawInput.value = '';
   });
 
-  // Install Tab bookmarklet
+  // Install Tab sync bridge & bookmarklet
+  dom.btnInstallApplySync?.addEventListener('click', () => {
+    const next = saveSettings({ syncedAt: Date.now() });
+    state.settings = next;
+    dispatchPwaSyncEvent(next.syncedAt);
+    renderInstallSyncCard();
+    try {
+      sessionStorage.setItem('nr_post_install_sync', '1');
+    } catch (_) {}
+    window.location.reload();
+  });
+
+  const copyCurrentSyncLink = async (btn, statusEl = null) => {
+    const url = buildMobileSyncUrlFromSettings(state.settings);
+    if (!url) {
+      if (statusEl) {
+        statusEl.hidden = false;
+        statusEl.textContent = '請先設定非 localhost 的有效供應商、API Key 與模型名稱，再複製同步連結。';
+      } else {
+        showSyncBanner('⚠️ 請先在「模型設定」填寫 API Key 與模型名稱。');
+      }
+      return;
+    }
+    await copyFeedback(btn, url);
+    showSyncBanner('✅ 已複製同步連結！可在其他瀏覽器、iOS 主畫面 App 或外掛設定中一鍵貼上匯入。');
+  };
+
+  dom.btnInstallCopySync?.addEventListener('click', () => {
+    void copyCurrentSyncLink(dom.btnInstallCopySync);
+  });
+
+  dom.pwaSyncCopyBtn?.addEventListener('click', () => {
+    void copyCurrentSyncLink(dom.pwaSyncCopyBtn, dom.pwaSyncImportStatus);
+  });
+
+  dom.pwaSyncImportBtn?.addEventListener('click', () => {
+    const raw = dom.pwaSyncImportInput?.value.trim() || '';
+    const token = extractNrSyncTokenFromInput(raw);
+    const statusEl = dom.pwaSyncImportStatus;
+    if (!token || !applyNrSyncToken(token)) {
+      if (statusEl) {
+        statusEl.hidden = false;
+        statusEl.textContent = '無法辨識同步連結，請確認已完整複製包含 #nr_sync=... 與金鑰的電腦端同步網址。';
+      }
+      return;
+    }
+    if (dom.pwaSyncImportInput) dom.pwaSyncImportInput.value = '';
+    if (statusEl) {
+      statusEl.hidden = false;
+      statusEl.textContent = '✅ 已成功匯入電腦端設定並同步至本機。';
+    }
+    refreshAllPwaSettingsViews();
+    const pid = PROVIDER_PRESETS[state.settings.providerId] ? state.settings.providerId : 'custom';
+    const label = PROVIDER_PRESETS[pid]?.label || pid;
+    showSyncBanner(`✅ 已匯入 ${label}${state.settings.model ? ` · ${state.settings.model}` : ''}，現在即可直接使用！`);
+  });
+
   dom.bookmarkletCodeBox.textContent = BOOKMARKLET_SNIPPET;
   dom.copyBookmarkletBtn.addEventListener('click', () => {
     copyFeedback(dom.copyBookmarkletBtn, BOOKMARKLET_SNIPPET);
@@ -4132,13 +4348,15 @@ function bindEvents() {
     }
     const prev = state.settings;
     const hadPdfError = Boolean(state.lastError);
-    state.settings = saveSettings(collected);
+    state.settings = saveSettings({ ...collected, syncedAt: Date.now() });
+    dispatchPwaSyncEvent(state.settings.syncedAt);
     draftProfiles = normalizeProviderProfiles(state.settings.providerProfiles, state.settings);
     populateLanguageDropdowns();
     renderGlobalProviderSelect();
     renderSavedProvidersRow();
     renderFallbackProviderSelect(state.settings.fallbackProviderId || '');
     applyRootLanguageFonts(state.settings);
+    renderInstallSyncCard();
     showSyncBanner('✅ 設定已儲存至本機！');
     if (state.pdfDoc && prev) {
       const langChanged =
@@ -4214,10 +4432,26 @@ async function init() {
   populateSettingsForm();
   applyRootLanguageFonts(state.settings);
   bindEvents();
+  renderInstallSyncCard();
   updateCacheCountUI();
 
+  let postInstallSynced = false;
+  try {
+    if (sessionStorage.getItem('nr_post_install_sync') === '1') {
+      sessionStorage.removeItem('nr_post_install_sync');
+      postInstallSynced = true;
+    }
+  } catch (_) {}
+
   if (syncedFromDesktop) {
-    showSyncBanner('✅ 已從電腦端同步 API Key 與偏好設定！');
+    const pid = PROVIDER_PRESETS[state.settings.providerId] ? state.settings.providerId : 'custom';
+    const label = PROVIDER_PRESETS[pid]?.label || pid;
+    showSyncBanner(
+      `✅ 已匯入電腦端設定（${label} · ${state.settings.model || '請確認模型'}），現在即可直接翻譯！若要安裝手機瀏覽器外掛請點下方「瀏覽器外掛」。`
+    );
+  } else if (postInstallSynced) {
+    switchTab('install');
+    showSyncBanner('✅ 已重新載入並廣播電腦端設定！安裝好外掛後，前往任意外文網頁即可直接使用。');
   }
 
   // Register PWA Service Worker

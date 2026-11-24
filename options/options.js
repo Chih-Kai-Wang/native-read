@@ -1031,50 +1031,55 @@ document.addEventListener('DOMContentLoaded', async () => {
     providerGroups.get(groupLabel).appendChild(opt);
   }
 
+  const applyLoadedSettingsToForm = (loaded) => {
+    langSelect.value = loaded.targetLang || 'zh-TW';
+    document.getElementById('custom-lang-input').value = loaded.customTargetLang || '';
+    document.getElementById('mode-select').value = loaded.displayMode || 'replace';
+    document.getElementById('translate-code-comments').checked = loaded.translateCodeComments !== false;
+    document.getElementById('show-output-btn').checked = loaded.showOutputTranslateBtn !== false;
+    document.getElementById('check-for-updates').checked = loaded.checkForUpdates !== false;
+    document.getElementById('typography-match').value = loaded.typographyMatch || 'native';
+    document.getElementById('thinking-effort').value = loaded.thinkingEffort || 'fastest';
+    document.getElementById('lazy-viewport').checked = loaded.lazyViewport !== false;
+    document.getElementById('stream-translation').checked = loaded.streamTranslation !== false;
+    document.getElementById('global-auto-translate').checked = Boolean(loaded.autoTranslate);
+    whitelistHosts = Array.isArray(loaded.autoTranslateHosts)
+      ? [...new Set(loaded.autoTranslateHosts.map((h) => normalizeHostInput(h)).filter(Boolean))]
+      : [];
+    renderWhitelist();
+    updateCustomLangVisibility();
+
+    persistedActiveProviderId = loaded.providerId || 'gemini';
+    currentProviderId = persistedActiveProviderId;
+    selectedFallbackProviderId = loaded.fallbackProviderId || '';
+    draftProfiles = normalizeProviderProfiles(loaded.providerProfiles, loaded);
+    isProviderFormDirty = false;
+    providerSelect.value = currentProviderId;
+    document.getElementById('protocol-select').value = loaded.protocol || 'openai';
+    document.getElementById('baseurl-input').value = loaded.baseUrl || '';
+    document.getElementById('apikey-input').value = loaded.apiKey || '';
+    document.getElementById('model-input').value = loaded.model || '';
+    document.getElementById('batch-size').value = loaded.batchSize ?? 20;
+    const maxCharsEl = document.getElementById('max-batch-chars');
+    if (maxCharsEl) {
+      maxCharsEl.value = loaded.maxBatchChars ?? 5500;
+    }
+    document.getElementById('temperature-input').value = loaded.temperature ?? 0.2;
+    document.getElementById('glossary-input').value = loaded.customGlossary ?? DEFAULT_GLOSSARY;
+
+    const activePreset = PROVIDER_PRESETS[providerSelect.value];
+    if (activePreset) {
+      document.getElementById('provider-hint').textContent = activePreset.hint;
+      document.getElementById('apikey-input').placeholder = activePreset.placeholderKey;
+      updateModelSuggestions(activePreset);
+    }
+    renderFallbackSelect(selectedFallbackProviderId);
+    renderSavedProviders();
+    updateEndpointPreview();
+  };
+
   const settings = await getSettings();
-  langSelect.value = settings.targetLang || 'zh-TW';
-  document.getElementById('custom-lang-input').value = settings.customTargetLang || '';
-  document.getElementById('mode-select').value = settings.displayMode || 'replace';
-  document.getElementById('translate-code-comments').checked = settings.translateCodeComments !== false;
-  document.getElementById('show-output-btn').checked = settings.showOutputTranslateBtn !== false;
-  document.getElementById('check-for-updates').checked = settings.checkForUpdates !== false;
-  document.getElementById('typography-match').value = settings.typographyMatch || 'native';
-  document.getElementById('thinking-effort').value = settings.thinkingEffort || 'fastest';
-  document.getElementById('lazy-viewport').checked = settings.lazyViewport !== false;
-  document.getElementById('stream-translation').checked = settings.streamTranslation !== false;
-  document.getElementById('global-auto-translate').checked = Boolean(settings.autoTranslate);
-  whitelistHosts = Array.isArray(settings.autoTranslateHosts)
-    ? [...new Set(settings.autoTranslateHosts.map((h) => normalizeHostInput(h)).filter(Boolean))]
-    : [];
-  renderWhitelist();
-  updateCustomLangVisibility();
-
-  persistedActiveProviderId = settings.providerId || 'gemini';
-  currentProviderId = persistedActiveProviderId;
-  selectedFallbackProviderId = settings.fallbackProviderId || '';
-  draftProfiles = normalizeProviderProfiles(settings.providerProfiles, settings);
-  providerSelect.value = currentProviderId;
-  document.getElementById('protocol-select').value = settings.protocol || 'openai';
-  document.getElementById('baseurl-input').value = settings.baseUrl || '';
-  document.getElementById('apikey-input').value = settings.apiKey || '';
-  document.getElementById('model-input').value = settings.model || '';
-  document.getElementById('batch-size').value = settings.batchSize ?? 20;
-  const maxCharsEl = document.getElementById('max-batch-chars');
-  if (maxCharsEl) {
-    maxCharsEl.value = settings.maxBatchChars ?? 5500;
-  }
-  document.getElementById('temperature-input').value = settings.temperature ?? 0.2;
-  document.getElementById('glossary-input').value = settings.customGlossary ?? DEFAULT_GLOSSARY;
-
-  const activePreset = PROVIDER_PRESETS[providerSelect.value];
-  if (activePreset) {
-    document.getElementById('provider-hint').textContent = activePreset.hint;
-    document.getElementById('apikey-input').placeholder = activePreset.placeholderKey;
-    updateModelSuggestions(activePreset);
-  }
-  renderFallbackSelect(selectedFallbackProviderId);
-  renderSavedProviders();
-  updateEndpointPreview();
+  applyLoadedSettingsToForm(settings);
 
   const btnGenSync = document.getElementById('btn-generate-mobile-sync');
   const btnCopySync = document.getElementById('btn-copy-mobile-sync');
@@ -1401,7 +1406,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         return;
       }
-      const validationErr = validateProviderForm(form, { requireCredentials: true, requireModel: false });
+      const validationErr = validateProviderForm(form, { requireCredentials: true, requireModel: true });
       if (validationErr) {
         invalidateMobileSync();
         if (syncStatus) {
@@ -1469,6 +1474,52 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
       } catch (_) {
         syncUrlInput?.select();
+      }
+    });
+  }
+
+  const importSyncInput = document.getElementById('import-sync-input');
+  const btnImportSync = document.getElementById('btn-import-mobile-sync');
+  const importSyncStatus = document.getElementById('import-sync-status');
+  if (btnImportSync && importSyncInput) {
+    btnImportSync.addEventListener('click', async () => {
+      const raw = String(importSyncInput.value || '').trim();
+      if (!raw) {
+        if (importSyncStatus) {
+          importSyncStatus.className = 'inline-status err';
+          importSyncStatus.textContent = '請先貼上包含 #nr_sync= 的電腦端同步連結';
+        }
+        return;
+      }
+      btnImportSync.disabled = true;
+      if (importSyncStatus) {
+        importSyncStatus.className = 'inline-status';
+        importSyncStatus.textContent = '正在驗證並匯入設定...';
+      }
+      try {
+        const res = await chrome.runtime.sendMessage({ type: 'IMPORT_SYNC_PAYLOAD', raw });
+        if (!res?.ok || !res.settings) {
+          if (importSyncStatus) {
+            importSyncStatus.className = 'inline-status err';
+            importSyncStatus.textContent = res?.error || '同步連結格式無效或金鑰不合法';
+          }
+          return;
+        }
+        applyLoadedSettingsToForm(res.settings);
+        invalidateMobileSync();
+        importSyncInput.value = '';
+        await ensureHostPermissions([res.settings.baseUrl]);
+        if (importSyncStatus) {
+          importSyncStatus.className = 'inline-status ok';
+          importSyncStatus.textContent = '✓ 已從同步連結匯入設定！';
+        }
+      } catch (err) {
+        if (importSyncStatus) {
+          importSyncStatus.className = 'inline-status err';
+          importSyncStatus.textContent = err?.message || '匯入設定失敗';
+        }
+      } finally {
+        btnImportSync.disabled = false;
       }
     });
   }

@@ -2,7 +2,7 @@
 
 [English](README.md) · [繁體中文](README.zh-TW.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · [Español](README.es.md) · [Français](README.fr.md) · **Deutsch**
 
-**NativeRead (v2.8.1)** ist eine Manifest-V3-Browser-Erweiterung und mobile PWA, die Webseiten, PDFs, Codekommentare und eingebettete Infografiken übersetzt und dabei die ursprüngliche Typografie und das Seitenlayout beibehält. Sie bleibt standardmäßig inaktiv, läuft bei Bedarf mit Ihrem eigenen LLM-API-Schlüssel und streamt Übersetzungen Absatz für Absatz, ohne den Lesefluss zu unterbrechen.
+**NativeRead (v2.8.2)** ist eine Manifest-V3-Browser-Erweiterung und mobile PWA, die Webseiten, PDFs, Codekommentare und eingebettete Infografiken übersetzt und dabei die ursprüngliche Typografie und das Seitenlayout beibehält. Sie bleibt standardmäßig inaktiv, läuft bei Bedarf mit Ihrem eigenen LLM-API-Schlüssel und streamt Übersetzungen Absatz für Absatz, ohne den Lesefluss zu unterbrechen.
 
 ---
 

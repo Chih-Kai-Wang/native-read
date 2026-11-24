@@ -311,7 +311,7 @@ function buildUserscript(version) {
   };
 
   // ============================================================
-  // 2. #nr_sync Zero-Typing Sync Decoder (Trusted Origin Only)
+  // 2. #nr_sync Zero-Typing Sync Decoder & Trusted PWA Bridge
   // ============================================================
   function decodeBase64UrlJson(b64url) {
     const base64 = String(b64url || '').trim().replace(/-/g, '+').replace(/_/g, '/');
@@ -324,74 +324,167 @@ function buildUserscript(version) {
     return JSON.parse(new TextDecoder().decode(bytes));
   }
 
+  function extractNrSyncToken(rawInput) {
+    const text = String(rawInput || '').trim();
+    if (!text) return '';
+    const hashMatch = text.match(/(?:^|[#&])nr_sync=([A-Za-z0-9_%-]+)/);
+    if (hashMatch && hashMatch[1]) return hashMatch[1];
+    try {
+      const parsed = new URL(text);
+      const urlMatch = String(parsed.hash || '').match(/(?:^|[#&])nr_sync=([A-Za-z0-9_%-]+)/);
+      if (urlMatch && urlMatch[1]) return urlMatch[1];
+    } catch (_) {}
+    if (/^[A-Za-z0-9_-]{12,}={0,2}$/.test(text)) {
+      return text;
+    }
+    return '';
+  }
+
+  async function applyNrSyncPayloadObject(payload, syncedAtOverride = null) {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
+
+    const rawPid = String(payload.providerId || payload.p || '').trim();
+    const rawProtoField = String(payload.protocol || payload.r || '').trim().toLowerCase();
+    const rawBaseField = String(payload.baseUrl || payload.u || '').trim();
+    const hasEndpointFields = Boolean(rawPid || rawProtoField || rawBaseField);
+    const rawKey = Object.prototype.hasOwnProperty.call(payload, 'apiKey')
+      ? payload.apiKey
+      : (Object.prototype.hasOwnProperty.call(payload, 'k') ? payload.k : undefined);
+    const hasExplicitKey = typeof rawKey === 'string';
+    if (!hasExplicitKey && hasEndpointFields) return false;
+
+    const providerId = rawPid
+      ? (PROVIDER_PRESETS[rawPid] ? rawPid : 'custom')
+      : 'gemini';
+    const preset = PROVIDER_PRESETS[providerId] || PROVIDER_PRESETS.gemini;
+    const protocol = rawProtoField || String(preset.protocol || 'gemini').toLowerCase();
+    if (!['openai', 'gemini', 'anthropic'].includes(protocol)) return false;
+
+    const baseUrl = rawBaseField || preset.baseUrl || '';
+    try {
+      const parsed = new URL(baseUrl);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+    } catch (_) {
+      return false;
+    }
+
+    const keyCheck = validateApiKey(rawKey ?? '');
+    if (!keyCheck.ok) return false;
+    const apiKey = keyCheck.cleanKey;
+    const model = String(payload.model || payload.m || preset.defaultModel || '').trim();
+    const rawLang = String(payload.targetLang || payload.l || 'zh-TW').trim();
+    const targetLang = TARGET_LANGUAGES[rawLang] ? rawLang : 'zh-TW';
+    const customTargetLang = String(payload.customTargetLang ?? payload.c ?? '').trim();
+    const rawEffort = String(payload.thinkingEffort || payload.e || 'fastest').trim();
+    const thinkingEffort = ['fastest', 'balanced', 'deep'].includes(rawEffort) ? rawEffort : 'fastest';
+    const rawTypo = String(payload.typographyMatch || payload.t || 'native').trim();
+    const typographyMatch = ['native', 'system', 'preserve'].includes(rawTypo) ? rawTypo : 'native';
+    const syncedAt = Number.isFinite(Number(syncedAtOverride)) && Number(syncedAtOverride) > 0
+      ? Number(syncedAtOverride)
+      : Date.now();
+
+    const current = readStoredSettings();
+    const baseProfiles =
+      payload.providerProfiles && typeof payload.providerProfiles === 'object' && !Array.isArray(payload.providerProfiles)
+        ? { ...(current.providerProfiles || {}), ...payload.providerProfiles }
+        : current.providerProfiles;
+    const mergedProfiles = normalizeProviderProfiles(baseProfiles, {
+      providerId,
+      protocol,
+      baseUrl,
+      apiKey,
+      model
+    });
+    const nextPatch = {
+      providerId,
+      protocol,
+      baseUrl,
+      apiKey,
+      model,
+      providerProfiles: mergedProfiles,
+      targetLang,
+      customTargetLang,
+      thinkingEffort,
+      typographyMatch,
+      syncedAt
+    };
+    if (typeof payload.fallbackProviderId === 'string') {
+      nextPatch.fallbackProviderId = payload.fallbackProviderId === providerId ? '' : payload.fallbackProviderId;
+    }
+    if (typeof payload.customGlossary === 'string') {
+      nextPatch.customGlossary = payload.customGlossary;
+    }
+    const next = writeStoredSettings(nextPatch);
+    await persistStoredSettings(next);
+    return true;
+  }
+
+  async function tryImportNrSyncInput(rawInput) {
+    const token = extractNrSyncToken(rawInput);
+    if (!token) return false;
+    try {
+      const payload = decodeBase64UrlJson(decodeURIComponent(token));
+      return await applyNrSyncPayloadObject(payload, Date.now());
+    } catch (_) {
+      return false;
+    }
+  }
+
   async function checkAndApplyNrSyncHash() {
     if (!isTrustedOriginForFallback()) return false;
     const hash = String(window.location.hash || '');
     if (!hash.includes('nr_sync=')) return false;
-    const match = hash.match(/(?:^|[#&])nr_sync=([^&]+)/);
+    const token = extractNrSyncToken(hash);
     const scrubHash = () => {
       try {
         history.replaceState(null, '', window.location.pathname + window.location.search);
       } catch (_) {}
     };
-    if (!match || !match[1]) {
+    if (!token) {
       scrubHash();
       return false;
     }
 
     try {
-      const payload = decodeBase64UrlJson(decodeURIComponent(match[1]));
-      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
-      const rawPid = String(payload.providerId || payload.p || 'gemini').trim();
-      const providerId = PROVIDER_PRESETS[rawPid] ? rawPid : 'custom';
-      const preset = PROVIDER_PRESETS[providerId] || PROVIDER_PRESETS.gemini;
-      const protocol = String(payload.protocol || payload.r || preset.protocol || 'gemini').trim().toLowerCase();
-      if (!['openai', 'gemini', 'anthropic'].includes(protocol)) return false;
-      const baseUrl = String(payload.baseUrl || payload.u || preset.baseUrl || '').trim();
-      try {
-        const parsed = new URL(baseUrl);
-        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
-      } catch (_) {
-        return false;
-      }
-      const keyCheck = validateApiKey(payload.apiKey ?? payload.k ?? '');
-      if (!keyCheck.ok) return false;
-      const apiKey = keyCheck.cleanKey;
-      const model = String(payload.model || payload.m || preset.defaultModel || '').trim();
-      const rawLang = String(payload.targetLang || payload.l || 'zh-TW').trim();
-      const targetLang = TARGET_LANGUAGES[rawLang] ? rawLang : 'zh-TW';
-      const customTargetLang = String(payload.customTargetLang ?? payload.c ?? '').trim();
-      const rawEffort = String(payload.thinkingEffort || payload.e || 'fastest').trim();
-      const thinkingEffort = ['fastest', 'balanced', 'deep'].includes(rawEffort) ? rawEffort : 'fastest';
-      const rawTypo = String(payload.typographyMatch || payload.t || 'native').trim();
-      const typographyMatch = ['native', 'system', 'preserve'].includes(rawTypo) ? rawTypo : 'native';
-
-      const current = readStoredSettings();
-      const mergedProfiles = normalizeProviderProfiles(current.providerProfiles, {
-        providerId,
-        protocol,
-        baseUrl,
-        apiKey,
-        model
-      });
-      const next = writeStoredSettings({
-        providerId,
-        protocol,
-        baseUrl,
-        apiKey,
-        model,
-        providerProfiles: mergedProfiles,
-        targetLang,
-        customTargetLang,
-        thinkingEffort,
-        typographyMatch
-      });
-      await persistStoredSettings(next);
-      return true;
+      const payload = decodeBase64UrlJson(decodeURIComponent(token));
+      return await applyNrSyncPayloadObject(payload, Date.now());
     } catch (_) {
       return false;
     } finally {
       scrubHash();
+    }
+  }
+
+  // Strictly only runs on the trusted GitHub Pages PWA origin so scan-QR-then-install works seamlessly
+  async function trySyncFromTrustedPwaStorage() {
+    if (!isTrustedOriginForFallback()) return false;
+    let raw = null;
+    try {
+      raw = localStorage.getItem(SETTINGS_KEY);
+    } catch (_) {
+      return false;
+    }
+    if (!raw || typeof raw !== 'string') return false;
+    try {
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+      const incomingHasCreds =
+        Boolean(sanitizeApiKey(parsed.apiKey)) ||
+        (isLocalEndpoint(parsed.baseUrl) && Boolean(String(parsed.model || '').trim()));
+      if (!incomingHasCreds) return false;
+
+      const current = readStoredSettings();
+      const currentHasCreds =
+        Boolean(sanitizeApiKey(current.apiKey)) ||
+        (isLocalEndpoint(current.baseUrl) && Boolean(String(current.model || '').trim()));
+      const incomingTs = Number(parsed.syncedAt || 0);
+      const currentTs = Number(current.syncedAt || 0);
+      if (currentHasCreds && incomingTs <= currentTs) {
+        return false;
+      }
+      return await applyNrSyncPayloadObject(parsed, incomingTs || Date.now());
+    } catch (_) {
+      return false;
     }
   }
 
@@ -1617,6 +1710,41 @@ function buildUserscript(version) {
         gap: 8px;
         margin-top: 4px;
       }
+      .nr-sync-box {
+        padding: 9px 10px;
+        border-radius: 10px;
+        background: rgba(2, 132, 199, 0.12);
+        border: 1px solid rgba(56, 189, 248, 0.28);
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .nr-sync-row {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+      }
+      .nr-sync-row input {
+        flex: 1 1 auto;
+        min-width: 0;
+        font-family: inherit;
+        font-size: 12.5px;
+        padding: 6px 8px;
+        border-radius: 7px;
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        background: #1e293b;
+        color: #f8fafc;
+      }
+      .nr-sync-helper {
+        align-self: flex-start;
+        font-size: 11.5px;
+        color: #38bdf8;
+        background: transparent;
+        border: 0;
+        padding: 2px 0;
+        cursor: pointer;
+        text-decoration: underline;
+      }
       .nr-toast {
         position: fixed;
         top: 16px;
@@ -1709,6 +1837,32 @@ function buildUserscript(version) {
     modalTitle.className = 'nr-modal-title';
     modalTitle.textContent = '⚙ NativeRead 模型與 API Key 設定';
 
+    const syncBox = document.createElement('div');
+    syncBox.className = 'nr-sync-box';
+    const syncLabel = document.createElement('label');
+    syncLabel.style.fontSize = '11.5px';
+    syncLabel.style.fontWeight = '600';
+    syncLabel.style.color = '#e2e8f0';
+    syncLabel.textContent = '從電腦端同步連結一鍵匯入';
+    const syncRow = document.createElement('div');
+    syncRow.className = 'nr-sync-row';
+    const syncLinkInput = document.createElement('input');
+    syncLinkInput.id = 'nr-modal-sync-input';
+    syncLinkInput.type = 'text';
+    syncLinkInput.placeholder = '貼上 #nr_sync=... 同步連結';
+    const importSyncBtn = document.createElement('button');
+    importSyncBtn.id = 'nr-modal-sync-import';
+    importSyncBtn.type = 'button';
+    importSyncBtn.className = 'nr-btn is-primary';
+    importSyncBtn.textContent = '一鍵匯入';
+    syncRow.append(syncLinkInput, importSyncBtn);
+    const openSyncPageBtn = document.createElement('button');
+    openSyncPageBtn.id = 'nr-modal-sync-page';
+    openSyncPageBtn.type = 'button';
+    openSyncPageBtn.className = 'nr-sync-helper';
+    openSyncPageBtn.textContent = '開啟同步頁自動匯入 ↗';
+    syncBox.append(syncLabel, syncRow, openSyncPageBtn);
+
     const makeField = (labelText, inputEl) => {
       const wrap = document.createElement('div');
       wrap.className = 'nr-field';
@@ -1783,6 +1937,7 @@ function buildUserscript(version) {
     modalActions.append(cancelModalBtn, saveModalBtn);
     modal.append(
       modalTitle,
+      syncBox,
       makeField('AI 服務商', providerSelect),
       makeField('API 協定', protocolSelect),
       makeField('API Base URL', baseUrlInput),
@@ -1813,6 +1968,9 @@ function buildUserscript(version) {
       statusSpan,
       closeBtn,
       modalBackdrop,
+      syncLinkInput,
+      importSyncBtn,
+      openSyncPageBtn,
       providerSelect,
       protocolSelect,
       baseUrlInput,
@@ -1898,6 +2056,30 @@ function buildUserscript(version) {
     gearBtn.addEventListener('click', () => openSettingsModal());
     cancelModalBtn.addEventListener('click', () => { modalBackdrop.hidden = true; });
 
+    openSyncPageBtn.addEventListener('click', () => {
+      try {
+        window.open('https://chih-kai-wang.github.io/native-read/', '_blank', 'noopener');
+      } catch (_) {}
+    });
+
+    importSyncBtn.addEventListener('click', async () => {
+      const ok = await tryImportNrSyncInput(syncLinkInput.value);
+      if (!ok) {
+        showToast('⚠️ 同步連結格式無效或金鑰不合法');
+        return;
+      }
+      state.settings = readStoredSettings();
+      syncLinkInput.value = '';
+      openSettingsModal();
+      modalBackdrop.hidden = true;
+      updatePillStatus();
+      showToast('✅ 已匯入電腦端設定！');
+      if (state.isPageActive) {
+        revertPageTranslation();
+      }
+      startPageTranslation();
+    });
+
     saveModalBtn.addEventListener('click', () => {
       const pid = providerSelect.value;
       const preset = PROVIDER_PRESETS[pid] || PROVIDER_PRESETS.gemini;
@@ -1957,6 +2139,8 @@ function buildUserscript(version) {
     uiRefs.pill.hidden = false;
     const pid = PROVIDER_PRESETS[state.settings.providerId] ? state.settings.providerId : 'custom';
     const preset = PROVIDER_PRESETS[pid] || PROVIDER_PRESETS.gemini;
+    if (uiRefs.syncLinkInput) uiRefs.syncLinkInput.value = '';
+    if (uiRefs.openSyncPageBtn) uiRefs.openSyncPageBtn.hidden = Boolean(sanitizeApiKey(state.settings?.apiKey));
     uiRefs.providerSelect.value = pid;
     if (uiRefs.protocolSelect) uiRefs.protocolSelect.value = state.settings.protocol || preset.protocol || 'openai';
     if (uiRefs.baseUrlInput) uiRefs.baseUrlInput.value = state.settings.baseUrl || preset.baseUrl || '';
@@ -2001,11 +2185,36 @@ function buildUserscript(version) {
   async function boot() {
     if (!KCTSiteAnalyzer.isTopFrame()) return;
     await initStoredSettings();
-    const synced = await checkAndApplyNrSyncHash();
+    let synced = await checkAndApplyNrSyncHash();
+    if (!synced) {
+      synced = await trySyncFromTrustedPwaStorage();
+    }
     state.settings = readStoredSettings();
     buildShadowUI();
     if (synced) {
       showToast('✅ 已從電腦端同步 API Key 與偏好設定！');
+    }
+    if (isTrustedOriginForFallback()) {
+      window.addEventListener?.('nativeread:pwa-settings-synced', () => {
+        void (async () => {
+          const ok = await trySyncFromTrustedPwaStorage();
+          if (ok) {
+            state.settings = readStoredSettings();
+            updatePillStatus();
+            showToast('✅ 已從本頁同步 API Key 與偏好設定！');
+          }
+        })();
+      });
+      window.addEventListener?.('storage', (e) => {
+        if (e && e.key && e.key !== SETTINGS_KEY) return;
+        void (async () => {
+          const ok = await trySyncFromTrustedPwaStorage();
+          if (ok) {
+            state.settings = readStoredSettings();
+            updatePillStatus();
+          }
+        })();
+      });
     }
     if (isHostWhitelisted(location.hostname, state.settings)) {
       startPageTranslation();

@@ -2582,6 +2582,7 @@ function setupContextMenus() {
 chrome.runtime.onInstalled.addListener(() => {
   setupContextMenus();
   CacheDB.migrateFromLegacyStorage().catch(() => {});
+  trySyncFromOpenTrustedPwaTabs().catch(() => {});
 });
 
 chrome.runtime.onStartup.addListener(() => {
@@ -2701,6 +2702,21 @@ function rememberNrSyncToken(tabId, token) {
   }
 }
 
+function isTrustedPwaUrl(urlStr) {
+  if (!urlStr || typeof urlStr !== 'string') return false;
+  try {
+    const parsed = new URL(urlStr);
+    return (
+      parsed.protocol === 'https:' &&
+      parsed.origin === TRUSTED_PWA_ORIGIN &&
+      (parsed.pathname === TRUSTED_PWA_PATH_PREFIX ||
+        parsed.pathname.startsWith(`${TRUSTED_PWA_PATH_PREFIX}/`))
+    );
+  } catch (_) {
+    return false;
+  }
+}
+
 function extractTrustedNrSyncToken(urlStr) {
   if (!urlStr || typeof urlStr !== 'string' || !urlStr.includes('nr_sync=')) return null;
   let parsed;
@@ -2711,11 +2727,7 @@ function extractTrustedNrSyncToken(urlStr) {
   }
   const extOrigin = new URL(chrome.runtime.getURL('')).origin;
   const isTrustedExt = parsed.origin === extOrigin;
-  const isTrustedPwa =
-    parsed.protocol === 'https:' &&
-    parsed.origin === TRUSTED_PWA_ORIGIN &&
-    (parsed.pathname === TRUSTED_PWA_PATH_PREFIX ||
-      parsed.pathname.startsWith(`${TRUSTED_PWA_PATH_PREFIX}/`));
+  const isTrustedPwa = isTrustedPwaUrl(urlStr);
   if (!isTrustedExt && !isTrustedPwa) return null;
 
   // Strictly require nr_sync= inside URL hash fragment (#), never query params (?nr_sync=...)
@@ -2725,107 +2737,167 @@ function extractTrustedNrSyncToken(urlStr) {
   return { parsed, token: match[1], isTrustedPwa, isTrustedExt };
 }
 
+function decodeNrSyncTokenToObject(rawToken) {
+  const clean = decodeURIComponent(String(rawToken || '').trim());
+  const b64 = clean.replace(/-/g, '+').replace(/_/g, '/');
+  const pad = b64.length % 4 === 0 ? '' : '='.repeat(4 - (b64.length % 4));
+  const binary = atob(b64 + pad);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return JSON.parse(new TextDecoder().decode(bytes));
+}
+
+function validateAndBuildSyncPatch(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+
+  const hasOwnK = Object.prototype.hasOwnProperty.call(data, 'k');
+  const hasOwnApiKey = Object.prototype.hasOwnProperty.call(data, 'apiKey');
+  const rawKey = hasOwnApiKey ? data.apiKey : (hasOwnK ? data.k : undefined);
+  const hasExplicitKey = typeof rawKey === 'string';
+
+  const rawProviderId = String(data.providerId || data.p || '').trim();
+  if (rawProviderId && !PROVIDER_PRESETS?.[rawProviderId]) return null;
+  const providerId = rawProviderId;
+  const preset = providerId ? PROVIDER_PRESETS[providerId] : null;
+
+  const rawProtocol = String(data.protocol || data.r || '').trim();
+  if (rawProtocol && rawProtocol !== 'openai' && rawProtocol !== 'gemini' && rawProtocol !== 'anthropic') return null;
+
+  const rawBaseUrl = String(data.baseUrl || data.u || '').trim();
+  if (rawBaseUrl) {
+    let parsedBase;
+    try {
+      parsedBase = new URL(rawBaseUrl);
+    } catch (_) {
+      return null;
+    }
+    if (parsedBase.protocol !== 'http:' && parsedBase.protocol !== 'https:') {
+      return null;
+    }
+  }
+
+  const hasEndpointMutationField =
+    Boolean(rawBaseUrl) ||
+    Boolean(rawProtocol) ||
+    Boolean(providerId);
+
+  if (!hasExplicitKey && hasEndpointMutationField) {
+    return null;
+  }
+
+  const patch = {};
+  if (hasExplicitKey) {
+    const keyCheck = typeof KCTConfig?.validateApiKey === 'function'
+      ? KCTConfig.validateApiKey(rawKey)
+      : { ok: true, cleanKey: sanitizeApiKey(rawKey) };
+    if (!keyCheck.ok) return null;
+    patch.apiKey = keyCheck.cleanKey;
+    if (providerId) patch.providerId = providerId;
+    const protocol = rawProtocol || preset?.protocol || '';
+    if (protocol === 'openai' || protocol === 'gemini' || protocol === 'anthropic') {
+      patch.protocol = protocol;
+    }
+    const resolvedBaseUrl = rawBaseUrl || preset?.baseUrl || '';
+    if (resolvedBaseUrl) {
+      let parsedResolvedBase;
+      try {
+        parsedResolvedBase = new URL(resolvedBaseUrl);
+      } catch (_) {
+        return null;
+      }
+      if (parsedResolvedBase.protocol !== 'http:' && parsedResolvedBase.protocol !== 'https:') {
+        return null;
+      }
+      patch.baseUrl = resolvedBaseUrl;
+    }
+  }
+
+  const model = String(data.model || data.m || (hasExplicitKey ? preset?.defaultModel : '') || '').trim();
+  if (model) patch.model = model;
+
+  if (
+    hasExplicitKey &&
+    data.providerProfiles &&
+    typeof data.providerProfiles === 'object' &&
+    !Array.isArray(data.providerProfiles)
+  ) {
+    const safeProfiles = {};
+    for (const [pid, prof] of Object.entries(data.providerProfiles)) {
+      if (!PROVIDER_PRESETS?.[pid] || !prof || typeof prof !== 'object' || Array.isArray(prof)) continue;
+      const pProto = String(prof.protocol || PROVIDER_PRESETS[pid].protocol || 'openai').trim();
+      if (pProto !== 'openai' && pProto !== 'gemini' && pProto !== 'anthropic') continue;
+      const pBase = String(prof.baseUrl || PROVIDER_PRESETS[pid].baseUrl || '').trim();
+      try {
+        const u = new URL(pBase);
+        if (u.protocol !== 'http:' && u.protocol !== 'https:') continue;
+      } catch (_) {
+        continue;
+      }
+      const pk = typeof KCTConfig?.validateApiKey === 'function'
+        ? KCTConfig.validateApiKey(prof.apiKey || '')
+        : { ok: true, cleanKey: sanitizeApiKey(prof.apiKey || '') };
+      if (!pk.ok) continue;
+      safeProfiles[pid] = {
+        protocol: pProto,
+        baseUrl: pBase,
+        apiKey: pk.cleanKey,
+        model: String(prof.model || PROVIDER_PRESETS[pid].defaultModel || '').trim(),
+        ...(prof.thinkingEffort && ALLOWED_THINKING_EFFORTS.has(prof.thinkingEffort)
+          ? { thinkingEffort: prof.thinkingEffort }
+          : {})
+      };
+    }
+    if (Object.keys(safeProfiles).length > 0) {
+      patch.providerProfiles = safeProfiles;
+    }
+  }
+
+  if (
+    hasExplicitKey &&
+    typeof data.fallbackProviderId === 'string' &&
+    PROVIDER_PRESETS?.[data.fallbackProviderId] &&
+    data.fallbackProviderId !== (patch.providerId || providerId)
+  ) {
+    patch.fallbackProviderId = data.fallbackProviderId;
+  }
+
+  const targetLang = String(data.targetLang || data.l || '').trim();
+  if (targetLang && (!TARGET_LANGUAGES || TARGET_LANGUAGES[targetLang])) {
+    patch.targetLang = targetLang;
+  }
+  const customTargetLang = String(data.customTargetLang ?? data.c ?? '').trim();
+  if (customTargetLang || patch.targetLang === 'custom') {
+    patch.customTargetLang = customTargetLang;
+  }
+
+  const thinkingEffort = String(data.thinkingEffort || data.e || '').trim();
+  if (thinkingEffort && ALLOWED_THINKING_EFFORTS.has(thinkingEffort)) {
+    patch.thinkingEffort = thinkingEffort;
+  }
+
+  const typographyMatch = String(data.typographyMatch || data.t || '').trim();
+  if (typographyMatch && ALLOWED_TYPOGRAPHY_MATCHES.has(typographyMatch)) {
+    patch.typographyMatch = typographyMatch;
+  }
+
+  if (typeof data.customGlossary === 'string') {
+    patch.customGlossary = data.customGlossary;
+  }
+
+  if (Object.keys(patch).length === 0) return null;
+  return patch;
+}
+
 async function tryImportNrSyncFromUrl(urlStr) {
   const trusted = extractTrustedNrSyncToken(urlStr);
   if (!trusted) return false;
   try {
-    const rawToken = decodeURIComponent(trusted.token);
-    const b64 = rawToken.replace(/-/g, '+').replace(/_/g, '/');
-    const pad = b64.length % 4 === 0 ? '' : '='.repeat(4 - (b64.length % 4));
-    const binary = atob(b64 + pad);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    const data = JSON.parse(new TextDecoder().decode(bytes));
-    if (!data || typeof data !== 'object' || Array.isArray(data)) return false;
-
-    const hasOwnK = Object.prototype.hasOwnProperty.call(data, 'k');
-    const hasOwnApiKey = Object.prototype.hasOwnProperty.call(data, 'apiKey');
-    const rawKey = hasOwnApiKey ? data.apiKey : (hasOwnK ? data.k : undefined);
-    const hasExplicitKey = typeof rawKey === 'string';
-
-    const rawProviderId = String(data.providerId || data.p || '').trim();
-    if (rawProviderId && !PROVIDER_PRESETS?.[rawProviderId]) return false;
-    const providerId = rawProviderId;
-    const preset = providerId ? PROVIDER_PRESETS[providerId] : null;
-
-    const rawProtocol = String(data.protocol || data.r || '').trim();
-    if (rawProtocol && rawProtocol !== 'openai' && rawProtocol !== 'gemini' && rawProtocol !== 'anthropic') return false;
-
-    const rawBaseUrl = String(data.baseUrl || data.u || '').trim();
-    if (rawBaseUrl) {
-      let parsedBase;
-      try {
-        parsedBase = new URL(rawBaseUrl);
-      } catch (_) {
-        return false;
-      }
-      if (parsedBase.protocol !== 'http:' && parsedBase.protocol !== 'https:') {
-        return false;
-      }
-    }
-
-    const hasEndpointMutationField =
-      Boolean(rawBaseUrl) ||
-      Boolean(rawProtocol) ||
-      Boolean(providerId);
-
-    if (!hasExplicitKey && hasEndpointMutationField) {
-      return false;
-    }
-
-    const patch = {};
-    if (hasExplicitKey) {
-      const keyCheck = typeof KCTConfig?.validateApiKey === 'function'
-        ? KCTConfig.validateApiKey(rawKey)
-        : { ok: true, cleanKey: sanitizeApiKey(rawKey) };
-      if (!keyCheck.ok) return false;
-      patch.apiKey = keyCheck.cleanKey;
-      if (providerId) patch.providerId = providerId;
-      const protocol = rawProtocol || preset?.protocol || '';
-      if (protocol === 'openai' || protocol === 'gemini' || protocol === 'anthropic') {
-        patch.protocol = protocol;
-      }
-      const resolvedBaseUrl = rawBaseUrl || preset?.baseUrl || '';
-      if (resolvedBaseUrl) {
-        let parsedResolvedBase;
-        try {
-          parsedResolvedBase = new URL(resolvedBaseUrl);
-        } catch (_) {
-          return false;
-        }
-        if (parsedResolvedBase.protocol !== 'http:' && parsedResolvedBase.protocol !== 'https:') {
-          return false;
-        }
-        patch.baseUrl = resolvedBaseUrl;
-      }
-    }
-
-    const model = String(data.model || data.m || (hasExplicitKey ? preset?.defaultModel : '') || '').trim();
-    if (model) patch.model = model;
-
-    const targetLang = String(data.targetLang || data.l || '').trim();
-    if (targetLang && (!TARGET_LANGUAGES || TARGET_LANGUAGES[targetLang])) {
-      patch.targetLang = targetLang;
-    }
-    const customTargetLang = String(data.customTargetLang ?? data.c ?? '').trim();
-    if (customTargetLang || patch.targetLang === 'custom') {
-      patch.customTargetLang = customTargetLang;
-    }
-
-    const thinkingEffort = String(data.thinkingEffort || data.e || '').trim();
-    if (thinkingEffort && ALLOWED_THINKING_EFFORTS.has(thinkingEffort)) {
-      patch.thinkingEffort = thinkingEffort;
-    }
-
-    const typographyMatch = String(data.typographyMatch || data.t || '').trim();
-    if (typographyMatch && ALLOWED_TYPOGRAPHY_MATCHES.has(typographyMatch)) {
-      patch.typographyMatch = typographyMatch;
-    }
-
-    if (Object.keys(patch).length === 0) return false;
-
+    const data = decodeNrSyncTokenToObject(trusted.token);
+    const patch = validateAndBuildSyncPatch(data);
+    if (!patch) return false;
+    patch.syncedAt = Number(data?.syncedAt) || Date.now();
     await saveSettings(patch);
     return true;
   } catch (_) {
@@ -2833,12 +2905,97 @@ async function tryImportNrSyncFromUrl(urlStr) {
   }
 }
 
+async function tryImportNrSyncRawInput(rawInput) {
+  const text = String(rawInput || '').trim();
+  if (!text) return false;
+  let token = '';
+  const match = text.match(/(?:^|[#&])nr_sync=([A-Za-z0-9_%-]+)/);
+  if (match && match[1]) {
+    token = match[1];
+  } else {
+    try {
+      const parsed = new URL(text);
+      const urlMatch = String(parsed.hash || '').match(/(?:^|[#&])nr_sync=([A-Za-z0-9_%-]+)/);
+      if (urlMatch && urlMatch[1]) token = urlMatch[1];
+    } catch (_) {}
+  }
+  if (!token && /^[A-Za-z0-9_-]{12,}={0,2}$/.test(text)) {
+    token = text;
+  }
+  if (!token) return false;
+  try {
+    const data = decodeNrSyncTokenToObject(token);
+    const patch = validateAndBuildSyncPatch(data);
+    if (!patch || !Object.prototype.hasOwnProperty.call(patch, 'apiKey') || !patch.apiKey) {
+      return false;
+    }
+    patch.syncedAt = Number(data?.syncedAt) || Date.now();
+    await saveSettings(patch);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function tryImportFromTrustedPwaTab(tabId, tabUrl) {
+  if (typeof tabId !== 'number' || !isTrustedPwaUrl(tabUrl)) return false;
+  try {
+    const execRes = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: false },
+      func: () => {
+        try {
+          return localStorage.getItem('kct_settings_v1');
+        } catch (_) {
+          return null;
+        }
+      }
+    });
+    const raw = execRes?.[0]?.result;
+    if (!raw || typeof raw !== 'string') return false;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+    const cleanKey = sanitizeApiKey(parsed.apiKey);
+    if (!cleanKey || isLocalEndpoint(parsed.baseUrl)) return false;
+
+    const current = await getSettings();
+    const currentHasKey = Boolean(sanitizeApiKey(current.apiKey));
+    const incomingTs = Number(parsed.syncedAt || 0);
+    const currentTs = Number(current.syncedAt || 0);
+    if (currentHasKey && incomingTs <= currentTs) {
+      return false;
+    }
+
+    const patch = validateAndBuildSyncPatch(parsed);
+    if (!patch || !patch.apiKey) return false;
+    patch.syncedAt = incomingTs || Date.now();
+    await saveSettings(patch);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function trySyncFromOpenTrustedPwaTabs() {
+  try {
+    const tabs = await chrome.tabs.query({});
+    for (const t of tabs) {
+      if (typeof t?.id === 'number' && isTrustedPwaUrl(t.url)) {
+        const imported = await tryImportFromTrustedPwaTab(t.id, t.url);
+        if (imported) return true;
+      }
+    }
+  } catch (_) {}
+  return false;
+}
+
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  let importedNrSync = false;
   const candidateUrl = changeInfo?.url || tab?.url || '';
   const trustedCandidate = extractTrustedNrSyncToken(candidateUrl);
   if (trustedCandidate && RECENT_NR_SYNC_TOKENS.get(tabId) !== trustedCandidate.token) {
     const imported = await tryImportNrSyncFromUrl(candidateUrl);
     if (imported) {
+      importedNrSync = true;
       rememberNrSyncToken(tabId, trustedCandidate.token);
     }
   }
@@ -2849,6 +3006,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       if (RECENT_NR_SYNC_TOKENS.get(tabId) !== trustedComplete.token) {
         const imported = await tryImportNrSyncFromUrl(tab.url);
         if (imported) {
+          importedNrSync = true;
           rememberNrSyncToken(tabId, trustedComplete.token);
         }
       }
@@ -2862,6 +3020,8 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
           }
         }).catch(() => {});
       }
+    } else if (!importedNrSync && isTrustedPwaUrl(tab.url)) {
+      await tryImportFromTrustedPwaTab(tabId, tab.url);
     }
     const settings = await getSettings();
     if (!settings.enabled) return;
@@ -5013,6 +5173,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           }
           const viewerRes = await openPdfViewer(pdfUrl, sourceTab);
           sendResponse({ ok: true, ...viewerRes });
+          break;
+        }
+        case 'IMPORT_SYNC_PAYLOAD': {
+          if (!isExtensionSender(sender)) {
+            sendResponse({ ok: false, error: '拒絕未授權來源呼叫' });
+            break;
+          }
+          const imported = await tryImportNrSyncRawInput(message.raw);
+          if (!imported) {
+            sendResponse({ ok: false, error: '同步連結格式無效或金鑰不合法' });
+            break;
+          }
+          sendResponse({ ok: true, settings: await getSettings() });
           break;
         }
         case 'GET_CACHE_STATS': {

@@ -12,6 +12,7 @@ const REPO_ROOT = path.resolve(__dirname, '..');
 function runUserscriptInSandbox({
   pageUrl = 'https://untrusted.example.com/blog',
   initialGm = null,
+  initialLocalStorage = null,
   withGm = true,
   fetchImpl,
   gmXhrImpl
@@ -19,7 +20,7 @@ function runUserscriptInSandbox({
   const usCode = fs.readFileSync(path.join(REPO_ROOT, 'docs/nativeread.user.js'), 'utf8');
   const parsedUrl = new URL(pageUrl);
   const gmStore = initialGm ? { ...initialGm } : {};
-  const localStore = new Map();
+  const localStore = new Map(initialLocalStorage ? Object.entries(initialLocalStorage) : []);
   let localStorageWrites = 0;
   let gmXhrCalls = 0;
   let replaceStateCalls = 0;
@@ -70,6 +71,8 @@ function runUserscriptInSandbox({
       this.shadowRoot = new MockElement('shadow-root');
       return this.shadowRoot;
     }
+    get id() { return this.getAttribute('id') || ''; }
+    set id(v) { this.setAttribute('id', v); }
     setAttribute(k, v) { this.attributes.set(k, String(v)); }
     getAttribute(k) { return this.attributes.has(k) ? this.attributes.get(k) : null; }
     hasAttribute(k) { return this.attributes.has(k); }
@@ -373,4 +376,85 @@ test('HTTP 401 does NOT double-fire into GM_xmlhttpRequest, whereas CORS/network
   cspEnv.context.__NATIVEREAD_OPEN_PILL__();
   await new Promise((r) => setTimeout(r, 140));
   assert.equal(cspEnv.getGmXhrCalls(), 1, 'CSP/network TypeError fell back cleanly to GM_xmlhttpRequest');
+});
+
+test('trusted PWA origin localStorage automatically bridges into GM storage when Userscript installed after QR scan', async () => {
+  const preSyncedPwaSettings = JSON.stringify({
+    settingsSchemaVersion: 6,
+    providerId: 'gemini',
+    protocol: 'gemini',
+    baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+    apiKey: 'AIza-bridge-after-qr-001',
+    model: 'gemini-3.5-flash-lite',
+    targetLang: 'zh-TW',
+    syncedAt: 1700000123456
+  });
+
+  const env = runUserscriptInSandbox({
+    pageUrl: 'https://chih-kai-wang.github.io/native-read/',
+    withGm: true,
+    initialGm: null,
+    initialLocalStorage: { kct_settings_v1: preSyncedPwaSettings }
+  });
+  await new Promise((r) => setTimeout(r, 50));
+
+  assert.ok(env.gmStore.kct_settings_v1, 'Trusted PWA localStorage bridged automatically into GM storage');
+  const saved = JSON.parse(String(env.gmStore.kct_settings_v1));
+  assert.equal(saved.apiKey, 'AIza-bridge-after-qr-001');
+  assert.equal(saved.model, 'gemini-3.5-flash-lite');
+});
+
+test('untrusted origin seeded localStorage never bridges into GM storage and causes zero localStorage writes', async () => {
+  const evilPwaSettings = JSON.stringify({
+    providerId: 'openai',
+    protocol: 'openai',
+    baseUrl: 'https://api.openai.com/v1',
+    apiKey: 'sk-evil-page-storage-999',
+    model: 'gpt-4o-mini',
+    syncedAt: 1700000123999
+  });
+
+  const env = runUserscriptInSandbox({
+    pageUrl: 'https://untrusted.example.com/article',
+    withGm: true,
+    initialGm: null,
+    initialLocalStorage: { kct_settings_v1: evilPwaSettings }
+  });
+  await new Promise((r) => setTimeout(r, 50));
+
+  assert.equal(env.gmStore.kct_settings_v1, undefined, 'Untrusted page localStorage must NEVER bridge into GM storage');
+  assert.equal(env.getLocalStorageWrites(), 0, 'Zero writes to untrusted page localStorage');
+});
+
+test('Userscript settings modal 1-tap #nr_sync paste import saves cleanly to GM storage without leaking to page', async () => {
+  const payload = Buffer.from(JSON.stringify({
+    p: 'openai',
+    r: 'openai',
+    k: 'sk-modal-import-001',
+    m: 'gpt-4o-mini',
+    l: 'zh-TW'
+  })).toString('base64url');
+
+  const env = runUserscriptInSandbox({
+    pageUrl: 'https://untrusted.example.com/article',
+    withGm: true,
+    initialGm: null
+  });
+  await new Promise((r) => setTimeout(r, 40));
+
+  const hostEl = env.body.children.find((c) => Boolean(c.shadowRoot));
+  assert.ok(hostEl && hostEl.shadowRoot, 'Userscript Shadow UI host mounted');
+  const syncInput = hostEl.shadowRoot.querySelector('#nr-modal-sync-input');
+  const importBtn = hostEl.shadowRoot.querySelector('#nr-modal-sync-import');
+  assert.ok(syncInput && importBtn, 'Userscript modal exposes #nr-modal-sync-input and #nr-modal-sync-import');
+
+  syncInput.value = `https://chih-kai-wang.github.io/native-read/#nr_sync=${payload}`;
+  importBtn.click();
+  await new Promise((r) => setTimeout(r, 60));
+
+  assert.ok(env.gmStore.kct_settings_v1, 'Modal import persisted settings to GM storage');
+  const saved = JSON.parse(String(env.gmStore.kct_settings_v1));
+  assert.equal(saved.apiKey, 'sk-modal-import-001');
+  assert.equal(saved.model, 'gpt-4o-mini');
+  assert.equal(env.getLocalStorageWrites(), 0, 'Zero writes to untrusted page localStorage on modal import');
 });
