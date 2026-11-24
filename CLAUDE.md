@@ -1,22 +1,22 @@
-# CLAUDE.md — NativeRead Project Context & Handoff Instructions
+# CLAUDE.md — NativeRead Project Context & Agent Entry Point
 
-Please read **`HANDOFF.md`** in this directory FIRST. It contains:
-1. **Gemini 4 Neon / Carbon / Hydrogen & Thinking Effort Allocation Table (§0)**:
-   - **`Gemini 4 Neon` (`Medium`, or `High` only for complex root-cause debugging)**: Use for main orchestration, `ego-browser` live visual/geometric verification (Step 3), and authoring the master English/Traditional Chinese technical architecture READMEs (Step 1A).
-   - **`Gemini 4 Carbon` (`Medium`)**: Use for targeted single-file code edits and edge-case fixes (e.g., Step 2 `docs/app.js` remote PDF CORS timeout & Google Drive URL resolution, or any fix after live browser testing).
-   - **`Gemini 4 Hydrogen` (`Low` / `Minimal`)**: Use for high-throughput parallel translation of the remaining 6 README languages (`zh-CN`, `ja`, `ko`, `es`, `fr`, `de` in Step 1B) and fast static syntax/link/build checks (`node --check`, `node scripts/build-mobile.js`).
-2. **Completed Milestones (M1–M5, R4 On-Demand Vision Image Overlay backend + frontend, M6 core fixes)** — all 14 JS files in the repo already include these changes and pass `node --check`.
-3. **Remaining 3-Step Checklist to Finish**:
-   - **Step 1 (M7)**: Create the 8-language dual-purpose Product + Technical Architecture + Security README suite (`README.md`, `README.zh-TW.md`, `README.zh-CN.md`, `README.ja.md`, `README.ko.md`, `README.es.md`, `README.fr.md`, `README.de.md`) and re-run `node scripts/build-mobile.js`.
-   - **Step 2 (M6 polish)**: Add `resolvePdfSourceUrl` + fast timeout/CORS fallback guidance to `loadPdfFromUrl` in `docs/app.js`.
-   - **Step 3 (Final Live Verification)**: Reload extension `ckeknfhpandgmippabbfkndmndainpff` in `ego-browser` and verify Popup/Options/PWA UI, Wikipedia Infobox, arXiv PDF, Google Drive PDF (Page 1 & Page 6), and R4 Vision Image Overlay on `/Users/wangzhikai/.gemini/antigravity/brain/e95f85c3-fc73-4733-b755-4d760c6c1a3e/.user_uploaded/media_1795192856884_40c9d866.jpg`.
+Read **`AGENTS.md`** in this directory FIRST. It defines NativeRead's **5-Gate Engineering Operating System**, non-negotiable security/MV3 invariants, and standing auto-push release policy, along with the 5 role workflow skills under **`.agents/skills/`**:
 
-## Critical Invariants
-1. **Default silent (on-demand only)**: Never add static `content_scripts` to `manifest.json`; `autoTranslate` defaults to `false`.
-2. **DOM safety**: Never assign unescaped translated strings via `innerHTML`; use `document.createTextNode` / `textContent`.
-3. **Secret safety**: Never print, log, or commit raw API keys from `chrome.storage.local`.
-4. **Browser session cleanup**: Always wrap `ego-browser nodejs` scripts in `try { ... } finally { await task.finish({ keep: [] }); }`.
-5. **Rebuild mobile artifacts after any source/README change**:
+1. **`nr-product-ux-review`** — Gate 1: Commercial UX friction critique before coding
+2. **`nr-tdd-bugfix`** — Gate 2: Root-cause tracing & mandatory regression tests for every bug fix
+3. **`nr-code-security-review`** — Gate 3: Independent MV3, security, lifecycle & parity audit
+4. **`nr-browser-qa`** — Gate 4: Safe `chrome://extensions/` `#dev-reload-button` reload, live Chromium QA & E2E runbook
+5. **`nr-release-ship`** — Gate 5: Multi-surface build, verification, Conventional Commit & direct `git push origin main`
+
+## Quick Non-Negotiable Rules
+1. **Default silent (on-demand only)**: Zero static `content_scripts` and zero `web_accessible_resources` in `manifest.json`; `autoTranslate` defaults to `false`.
+2. **Zero forbidden DOM/eval sinks**: Never use `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`, `eval(`, or `new Function`.
+3. **Secret & user-data safety**: Never print, log, or commit raw API keys; never alter live user settings or IndexedDB cache without `tests/e2e/lib/settings-guard.js`.
+4. **No CAPTCHA / auth bypass**: Fail gracefully with user handoff when a site enforces login or anti-bot checks.
+5. **Browser reload & cleanup**: Reload via `chrome://extensions/` `#dev-reload-button` (never `chrome.runtime.reload()`); always call `task.finish({ keep: [] })` and close HTTP servers in `finally`.
+6. **Verify & Auto-Push**:
    ```bash
-   node scripts/build-mobile.js
+   node scripts/build-mobile.js && node scripts/verify.mjs
+   node tests/e2e/run.js --suite invariants-docs --tier 1
    ```
+   After all applicable gates pass on a clean working tree, commit and push directly to `origin/main`.

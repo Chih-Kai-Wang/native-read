@@ -1,0 +1,48 @@
+name: NativeRead Verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Run static checks & unit/contract tests
+        run: node scripts/verify.mjs
+
+      - name: Rebuild mobile/docs assets & verify text parity
+        run: |
+          node scripts/build-mobile.js
+          git diff --exit-code -- docs/providers.js docs/nativeread.user.js docs/nativeread.meta.js docs/version.json docs/sw.js docs/index.html docs/pdf-layout.mjs
+
+      - name: Verify Android extension ZIP allowlist
+        run: |
+          node -e '
+            const { execFileSync } = require("node:child_process");
+            const entries = execFileSync("unzip", ["-Z1", "docs/nativeread-android-extension.zip"], { encoding: "utf8" })
+              .split(/\r?\n/)
+              .filter(Boolean);
+            const bad = entries.filter((e) =>
+              /^(tests\/|\.agents\/|\.github\/|\.git\/|AGENTS\.md$|CLAUDE\.md$|HANDOFF\.md$)/.test(e)
+            );
+            if (bad.length > 0) {
+              console.error("Forbidden entries inside Android extension ZIP:\n" + bad.join("\n"));
+              process.exit(1);
+            }
+            console.log("[ci] Android ZIP entries verified clean (" + entries.length + " entries)");
+          '

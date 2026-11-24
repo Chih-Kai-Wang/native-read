@@ -109,7 +109,8 @@ function runContractTests() {
     'tests/service-worker-transport.test.mjs',
     'tests/content-queue.test.mjs',
     'tests/userscript-runtime.test.mjs',
-    'tests/pwa-sw.test.mjs'
+    'tests/pwa-sw.test.mjs',
+    'tests/workflow-integrity.test.mjs'
   ];
   execFileSync(process.execPath, ['--test', ...suites.map((s) => path.join(ROOT, s))], {
     stdio: 'inherit'
