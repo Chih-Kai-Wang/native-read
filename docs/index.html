@@ -28,15 +28,15 @@
       <img src="./icons/icon-48.png" alt="NativeRead" width="28" height="28" class="nr-brand-logo">
       <div class="nr-brand-titles">
         <span class="nr-brand-title">NativeRead</span>
-        <span class="nr-brand-tag">v2.8.3 Mobile &amp; PWA</span>
+        <span class="nr-brand-tag">v2.8.4 Mobile &amp; PWA</span>
       </div>
     </div>
 
     <div class="nr-header-actions">
-      <div id="globalStatusBadge" class="nr-status-pill" data-state="idle">
+      <button id="globalStatusBadge" type="button" class="nr-status-pill" data-state="idle">
         <span class="nr-status-dot"></span>
         <span id="globalStatusText" class="nr-status-label">就緒</span>
-      </div>
+      </button>
       <select id="globalProviderSelect" class="nr-header-select nr-header-provider" aria-label="快速切換 AI 供應商" title="快速切換 AI 供應商"></select>
       <select id="globalLangSelect" class="nr-header-select" aria-label="目標翻譯語言"></select>
     </div>
@@ -44,6 +44,32 @@
 
   <!-- Main Tab Views -->
   <main class="nr-app-main">
+    <!-- First-Screen Quick Sync & Setup Card (shown until an active provider is ready) -->
+    <section id="quickSetupCard" class="nr-card nr-quick-setup-card" aria-label="快速匯入設定" hidden>
+      <div class="nr-sync-status-header">
+        <span class="nr-sync-status-badge">尚未匯入 API 設定</span>
+        <h2 class="nr-install-title">一秒匯入電腦端設定即可開始翻譯</h2>
+      </div>
+      <p id="quickSetupDesc" class="nr-card-desc">
+        請用手機掃描電腦端「📱 手機同步」QR Code，或直接從剪貼簿貼上同步連結；若已加入主畫面成為獨立 App，請再次匯入一次同步連結。
+      </p>
+      <div class="nr-input-row">
+        <input
+          id="quickSyncInput"
+          type="text"
+          class="nr-text-input"
+          placeholder="貼上電腦端同步連結（https://...#nr_sync=...）"
+          autocomplete="off"
+        >
+        <button id="quickSyncImportBtn" type="button" class="nr-primary-btn">一鍵匯入</button>
+      </div>
+      <div class="nr-install-actions">
+        <button id="quickSyncPasteBtn" type="button" class="nr-secondary-btn">📋 從剪貼簿匯入</button>
+        <button id="quickOpenSettingsBtn" type="button" class="nr-outline-btn">手動填寫 API 金鑰</button>
+      </div>
+      <p id="quickSyncStatus" class="nr-field-hint" role="status" hidden></p>
+    </section>
+
     <!-- ==========================================================
          TAB 1: 📄 PDF 白皮書翻譯 (Default Active Tab)
          ========================================================== -->
@@ -208,18 +234,57 @@
         </div>
       </div>
 
+      <!-- Chrome Mobile Card (Android Chrome + iOS Chrome) -->
+      <div id="cardChromeGuide" class="nr-card nr-install-card" data-browser-card="chrome">
+        <div class="nr-install-header">
+          <span class="nr-install-badge">Chrome 專用 · Android &amp; iOS</span>
+          <h3 class="nr-install-title">手機版 Chrome（Android / iOS）快速翻譯</h3>
+        </div>
+        <p class="nr-card-desc">
+          官方手機版 Chrome 本身不開放安裝 <code>.zip</code> 擴充包，請改用下方兩種方式在 Chrome 內免打字即時翻譯（或安裝本 PWA 使用系統分享）：
+        </p>
+        <ul class="nr-guide-list">
+          <li><strong>Android Chrome（最推薦 · 系統「分享」直譯）</strong>：將本頁安裝到手機主畫面後，在 Chrome 瀏覽任何外文網頁、arXiv／PDF 或選取外文段落，點右上角 <strong>分享 → NativeRead</strong> 即可直接開始翻譯。</li>
+          <li><strong>Android &amp; iOS Chrome 通用（地址列書籤秒譯）</strong>：複製下方「零攔截書籤」存成 Chrome 書籤並將書籤命名為 <strong><code>nr</code></strong>；瀏覽任何外文網站時點一下網址列輸入 <strong><code>nr</code></strong> → 點擊星號書籤建議，即可將該頁或論文直接送入 NativeRead 翻譯。</li>
+          <li><strong>Android 若需網頁右下角常駐懸浮球</strong>：可改用支援 Chrome 擴充包的 <strong>Edge、狐猴 (Lemur)、Kiwi 或 Quetta</strong> 下載下方擴充包。</li>
+        </ul>
+        <div class="nr-install-actions">
+          <button id="btnPwaInstall" type="button" class="nr-primary-btn" hidden>📲 安裝 NativeRead 到手機主畫面</button>
+          <p id="pwaInstallStatus" class="nr-field-hint nr-install-status-text" role="status" hidden></p>
+        </div>
+      </div>
+
+      <!-- Safari Card (iOS Safari Userscript + Shortcuts) -->
+      <div id="cardSafariGuide" class="nr-card nr-install-card" data-browser-card="safari">
+        <div class="nr-install-header">
+          <span class="nr-install-badge">iOS / iPadOS Safari 完整支援</span>
+          <h3 class="nr-install-title">Safari 原網頁懸浮球與「分享」一鍵翻譯</h3>
+        </div>
+        <p class="nr-card-desc">
+          iPhone 與 iPad 上的 Safari 同時支援原網頁內嵌翻譯與系統分享表單：
+        </p>
+        <ul class="nr-guide-list">
+          <li><strong>方案 A（最推薦 · 原網頁懸浮球即點即譯）</strong>：在 App Store 安裝免費開源的 <strong>Userscripts</strong>（或 <strong>Stay 2</strong>）→ 至手機「設定 → Safari → 延伸功能」開啟並設為允許「所有網站」→ 點下方「⚡ 安裝 Userscript」→ 回到本頁點「🔄 我已裝好外掛，立即同步設定」。</li>
+          <li><strong>方案 B（免裝 App · Apple 快捷指令分享翻譯，Safari 與 iOS Chrome 皆適用）</strong>：在「捷徑」App 新增捷徑，於「ⓘ」資訊內開啟「在分享表單中顯示」（接收 URL 與 Safari 網頁）→ 加入動作「URL」填入下方的捷徑前綴再接上「捷徑輸入」→ 加入「打開 URL」，之後按 <strong>分享 → NativeRead 翻譯</strong> 即可一鍵送譯。</li>
+          <li><strong>主畫面 App 同步提醒</strong>：若在 Safari 按「加入主畫面」，獨立 App 與 Safari 資料夾分開儲存，請先點上方「📋 複製同步連結」，打開主畫面 App 後點「從剪貼簿匯入」。</li>
+        </ul>
+        <div class="nr-install-actions">
+          <button id="btnCopyShortcutPrefix" type="button" class="nr-secondary-btn">📋 複製 iOS 捷徑網址前綴</button>
+        </div>
+      </div>
+
       <!-- Card 1: Universal Userscript -->
       <div class="nr-card nr-install-card">
         <div class="nr-install-header">
-          <span class="nr-install-badge">推薦 · iOS &amp; Android 通用</span>
+          <span class="nr-install-badge">推薦 · iOS Safari &amp; Android 擴充瀏覽器</span>
           <h3 class="nr-install-title">1. 全平台 Userscript 腳本 (<code>nativeread.user.js</code>)</h3>
         </div>
         <p class="nr-card-desc">
           預設零干擾，僅在網頁右下角顯示極簡 <strong>NR</strong> 標籤；點擊即可展開翻譯膠囊、切換「譯文／原文／雙語」與管理白名單。
         </p>
         <ul class="nr-guide-list">
-          <li><strong>iOS Safari</strong>：安裝免費開源的 <strong>Stay 2</strong> 或 <strong>Userscripts</strong> App → 點擊下方按鈕即可一鍵匯入腳本。</li>
-          <li><strong>Android</strong>：支援 <strong>Tampermonkey</strong>、<strong>狐猴瀏覽器 (Lemur)</strong>、<strong>Kiwi Browser</strong>、<strong>Firefox Nightly</strong>、<strong>Via 瀏覽器</strong>。</li>
+          <li><strong>iOS Safari</strong>：安裝免費開源的 <strong>Userscripts</strong> 或 <strong>Stay 2</strong> App → 點擊下方按鈕即可一鍵匯入腳本。</li>
+          <li><strong>Android</strong>：支援 <strong>Tampermonkey</strong>、<strong>狐猴瀏覽器 (Lemur)</strong>、<strong>Kiwi Browser</strong>、<strong>Firefox Nightly</strong>、<strong>Via 瀏覽器</strong>（官方手機 Chrome 請用上方 PWA／書籤）。</li>
         </ul>
         <div class="nr-install-actions">
           <a href="./nativeread.user.js" class="nr-primary-btn nr-link-btn">⚡ 安裝 Userscript (.user.js)</a>
@@ -236,7 +301,7 @@
           包含完整 Chrome MV3 擴充功能與內建 PDF.js 原位閱讀器，適合支援載入擴充功能 ZIP 的 Android 瀏覽器。
         </p>
         <ul class="nr-guide-list">
-          <li><strong>支援瀏覽器</strong>：<strong>狐猴瀏覽器 (Lemur Browser)</strong>、<strong>Kiwi Browser</strong>、<strong>Quetta</strong>、<strong>Edge Canary</strong>。</li>
+          <li><strong>支援瀏覽器</strong>：<strong>狐猴瀏覽器 (Lemur Browser)</strong>、<strong>Kiwi Browser</strong>、<strong>Quetta</strong>、<strong>Edge Canary</strong>（官方手機 Chrome 無法載入擴充包）。</li>
           <li><strong>安裝步驟</strong>：下載下方 ZIP 檔 → 打開瀏覽器的「擴充功能 (Extensions)」頁面 → 開啟「開發人員模式」→ 點選「載入已打包的 `.zip`」選擇該檔案即可。</li>
         </ul>
         <div class="nr-install-actions">
@@ -246,14 +311,14 @@
         </div>
       </div>
 
-      <!-- Card 3: Zero-Install Bookmarklet -->
+      <!-- Card 3: Zero-CSP Jump Bookmarklet -->
       <div class="nr-card nr-install-card">
         <div class="nr-install-header">
-          <span class="nr-install-badge">免裝任何 App · 隨點隨用</span>
-          <h3 class="nr-install-title">3. 免裝外掛書籤小工具 (Bookmarklet)</h3>
+          <span class="nr-install-badge">Android Chrome · iOS Chrome · Safari 全支援</span>
+          <h3 class="nr-install-title">3. 零攔截跳轉書籤 (Zero-CSP Bookmarklet)</h3>
         </div>
         <p class="nr-card-desc">
-          不想安裝任何擴充功能？只要將下方程式碼存成手機 Chrome 或 Safari 的「書籤」，在任何外文網站點一下該書籤，就會立即注入 NativeRead 翻譯懸浮球！
+          不受網站 CSP 限制、也絕不會將 API Key 暴露給第三方網頁。將下方程式碼存成手機 Chrome 或 Safari 書籤（建議命名為 <strong><code>nr</code></strong>）；瀏覽外文或 arXiv 頁面時點書籤即可自動帶入並串流翻譯！手機 Chrome 請從網址列輸入書籤名稱 <code>nr</code> 並點擊星號建議觸發。
         </p>
         <pre id="bookmarkletCodeBox" class="nr-code-box"></pre>
         <div class="nr-install-actions">

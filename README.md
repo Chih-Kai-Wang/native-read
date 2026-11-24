@@ -2,7 +2,7 @@
 
 **English** · [繁體中文](README.zh-TW.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · [Español](README.es.md) · [Français](README.fr.md) · [Deutsch](README.de.md)
 
-**NativeRead (v2.8.3)** is a Manifest V3 browser extension and mobile PWA that translates web pages, PDFs, code comments, and embedded infographics while preserving the original page typography and layout. It stays silent by default, runs on demand with your own LLM API key, and streams translations paragraph by paragraph without breaking reading rhythm.
+**NativeRead (v2.8.4)** is a Manifest V3 browser extension and mobile PWA that translates web pages, PDFs, code comments, and embedded infographics while preserving the original page typography and layout. It stays silent by default, runs on demand with your own LLM API key, and streams translations paragraph by paragraph without breaking reading rhythm.
 
 ---
 

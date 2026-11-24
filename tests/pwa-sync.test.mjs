@@ -169,3 +169,72 @@ test('viewer/pdf-viewer exposes #providerSelect toolbar switcher and visibilityc
   assert.ok(js.includes('snapshotPdfRenderSettings'), 'pdf-viewer.js snapshots applied PDF render settings');
   assert.ok(js.includes("'visibilitychange'"), 'pdf-viewer.js defers hidden tab updates until visibilitychange');
 });
+
+test('docs/manifest.webmanifest declares stable id and share_target', () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'docs/manifest.webmanifest'), 'utf8'));
+  assert.equal(manifest.id, './index.html');
+  assert.equal(manifest.share_target?.action, './index.html');
+  assert.equal(manifest.share_target?.params?.url, 'url');
+  assert.equal(manifest.share_target?.params?.text, 'text');
+});
+
+test('docs/index.html & docs/app.js support quick setup, Chrome/Safari workflows, Web Install & zero-CSP bookmarklet', () => {
+  const html = fs.readFileSync(path.join(REPO_ROOT, 'docs/index.html'), 'utf8');
+  for (const id of [
+    'quickSetupCard',
+    'quickSyncInput',
+    'quickSyncImportBtn',
+    'quickSyncPasteBtn',
+    'quickOpenSettingsBtn',
+    'btnPwaInstall',
+    'cardChromeGuide',
+    'cardSafariGuide',
+    'btnCopyShortcutPrefix'
+  ]) {
+    assert.ok(html.includes(`id="${id}"`), `docs/index.html must expose #${id}`);
+  }
+
+  const appJs = fs.readFileSync(path.join(REPO_ROOT, 'docs/app.js'), 'utf8');
+  const snippetMatch = appJs.match(/const BOOKMARKLET_SNIPPET =\s*\n?\s*"([^"]+)";/);
+  assert.ok(snippetMatch, 'BOOKMARKLET_SNIPPET exists in docs/app.js');
+  assert.ok(
+    snippetMatch[1].includes('https://chih-kai-wang.github.io/native-read/?url=') &&
+      snippetMatch[1].includes('encodeURIComponent(location.href)'),
+    'Bookmarklet opens NativeRead PWA with ?url= instead of injecting script tags'
+  );
+  assert.equal(
+    snippetMatch[1].includes('nativeread.user.js'),
+    false,
+    'Bookmarklet must not inject nativeread.user.js directly'
+  );
+
+  assert.ok(appJs.includes('Navigator.prototype?.install'), 'docs/app.js feature-detects Web Install API');
+  assert.ok(appJs.includes("'beforeinstallprompt'"), 'docs/app.js supports beforeinstallprompt fallback');
+  assert.ok(appJs.includes("'aria-disabled'"), 'docs/app.js uses aria-disabled during install');
+
+  const detectMatch = appJs.match(/function detectMobileBrowserEnv\([\s\S]*?\n\}/);
+  assert.ok(detectMatch, 'detectMobileBrowserEnv helper exists');
+  const ctx = {};
+  vm.runInNewContext(detectMatch[0], ctx);
+
+  assert.equal(
+    ctx.detectMobileBrowserEnv('Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1', 5),
+    'ios-safari'
+  );
+  assert.equal(
+    ctx.detectMobileBrowserEnv('Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/131.0.6778.73 Mobile/15E148 Safari/604.1', 5),
+    'ios-chrome'
+  );
+  assert.equal(
+    ctx.detectMobileBrowserEnv('Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36', 5),
+    'android-chrome'
+  );
+  assert.equal(
+    ctx.detectMobileBrowserEnv('Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36 EdgA/131.0.0.0', 5),
+    'android-other'
+  );
+  assert.equal(
+    ctx.detectMobileBrowserEnv('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36', 0),
+    'desktop'
+  );
+});

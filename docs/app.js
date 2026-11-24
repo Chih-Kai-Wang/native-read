@@ -2063,6 +2063,15 @@ const dom = {
   globalProviderSelect: document.getElementById('globalProviderSelect'),
   globalLangSelect: document.getElementById('globalLangSelect'),
 
+  // First-Screen Quick Sync Card
+  quickSetupCard: document.getElementById('quickSetupCard'),
+  quickSetupDesc: document.getElementById('quickSetupDesc'),
+  quickSyncInput: document.getElementById('quickSyncInput'),
+  quickSyncImportBtn: document.getElementById('quickSyncImportBtn'),
+  quickSyncPasteBtn: document.getElementById('quickSyncPasteBtn'),
+  quickOpenSettingsBtn: document.getElementById('quickOpenSettingsBtn'),
+  quickSyncStatus: document.getElementById('quickSyncStatus'),
+
   tabPanels: {
     pdf: document.getElementById('tab-pdf'),
     web: document.getElementById('tab-web'),
@@ -2099,6 +2108,7 @@ const dom = {
   webFontSegmented: document.getElementById('webFontSegmented'),
   webUrlForm: document.getElementById('webUrlForm'),
   webUrlInput: document.getElementById('webUrlInput'),
+  webPasteDetails: document.getElementById('webPasteDetails'),
   webRawInput: document.getElementById('webRawInput'),
   webClearRawBtn: document.getElementById('webClearRawBtn'),
   webTranslateRawBtn: document.getElementById('webTranslateRawBtn'),
@@ -2115,6 +2125,11 @@ const dom = {
   installSyncStatusDesc: document.getElementById('installSyncStatusDesc'),
   btnInstallApplySync: document.getElementById('btnInstallApplySync'),
   btnInstallCopySync: document.getElementById('btnInstallCopySync'),
+  cardChromeGuide: document.getElementById('cardChromeGuide'),
+  cardSafariGuide: document.getElementById('cardSafariGuide'),
+  btnPwaInstall: document.getElementById('btnPwaInstall'),
+  pwaInstallStatus: document.getElementById('pwaInstallStatus'),
+  btnCopyShortcutPrefix: document.getElementById('btnCopyShortcutPrefix'),
   bookmarkletCodeBox: document.getElementById('bookmarkletCodeBox'),
   copyBookmarkletBtn: document.getElementById('copyBookmarkletBtn'),
 
@@ -3639,7 +3654,156 @@ async function renderAndStreamWebArticle({ title, sourceLabel, blocks }) {
 // ============================================================
 // 9. Settings Tab & Install Tab Helpers (Tabs 3 & 4)
 // ============================================================
-const BOOKMARKLET_SNIPPET = `javascript:(function(){var s=document.createElement('script');s.src='https://chih-kai-wang.github.io/native-read/nativeread.user.js?t='+Date.now();document.head.appendChild(s);})();`;
+const SHORTCUT_URL_PREFIX = 'https://chih-kai-wang.github.io/native-read/?url=';
+const BOOKMARKLET_SNIPPET =
+  "javascript:(function(){location.href='https://chih-kai-wang.github.io/native-read/?url='+encodeURIComponent(location.href);})();";
+
+function hasReadyProvider(settings = state.settings) {
+  const s = settings || {};
+  const pid = PROVIDER_PRESETS[s.providerId] ? s.providerId : 'custom';
+  const preset = PROVIDER_PRESETS[pid] || null;
+  return isProfileReady(pid, {
+    protocol: s.protocol || preset?.protocol || 'openai',
+    baseUrl: s.baseUrl || preset?.baseUrl || '',
+    apiKey: s.apiKey || '',
+    model: s.model || preset?.defaultModel || ''
+  });
+}
+
+function isStandalonePwa() {
+  try {
+    return Boolean(
+      window.matchMedia?.('(display-mode: standalone)')?.matches ||
+      window.navigator?.standalone === true
+    );
+  } catch (_) {
+    return false;
+  }
+}
+
+function detectMobileBrowserEnv(
+  ua = typeof navigator !== 'undefined' ? navigator.userAgent : '',
+  maxTouchPoints = typeof navigator !== 'undefined' ? (navigator.maxTouchPoints || 0) : 0
+) {
+  const s = String(ua || '');
+  const isIos = /iPhone|iPad|iPod/i.test(s) || (/Macintosh/i.test(s) && maxTouchPoints > 1);
+  if (isIos) {
+    if (/CriOS/i.test(s)) return 'ios-chrome';
+    if (/FxiOS|EdgiOS|OPiOS/i.test(s)) return 'ios-other';
+    if (/Safari/i.test(s)) return 'ios-safari';
+    return 'ios-other';
+  }
+  if (/Android/i.test(s)) {
+    if (/EdgA|Firefox|FxiOS|SamsungBrowser|OPR/i.test(s)) return 'android-other';
+    if (/Chrome/i.test(s)) return 'android-chrome';
+    return 'android-other';
+  }
+  return 'desktop';
+}
+
+function renderQuickSetupCard() {
+  const ready = hasReadyProvider(state.settings);
+  if (dom.quickSetupCard) {
+    dom.quickSetupCard.hidden = ready;
+    if (!ready && dom.quickSetupDesc) {
+      dom.quickSetupDesc.textContent = isStandalonePwa()
+        ? '偵測到獨立主畫面 App 尚未設定金鑰（主畫面 App 與瀏覽器的本機儲存空間彼此獨立）。請先點瀏覽器內的「複製同步連結」，再點下方「從剪貼簿匯入」或貼上即可立即使用！'
+        : '請用手機相機掃描電腦端「手機同步」QR Code，或貼上同步連結／手動填寫 API 金鑰，即可開始翻譯 PDF 與網頁。';
+    }
+  }
+  if (!ready) {
+    setGlobalStatus('warn', '未設定金鑰', '點擊前往設定或匯入同步連結');
+  } else if (dom.globalStatusBadge?.dataset.state === 'warn') {
+    setGlobalStatus('idle', '就緒');
+  }
+}
+
+function applyMobileBrowserHighlights() {
+  const env = detectMobileBrowserEnv();
+  if (dom.cardChromeGuide) {
+    dom.cardChromeGuide.classList.toggle('is-recommended', env === 'android-chrome' || env === 'ios-chrome');
+  }
+  if (dom.cardSafariGuide) {
+    dom.cardSafariGuide.classList.toggle('is-recommended', env === 'ios-safari');
+  }
+}
+
+let deferredInstallPrompt;
+
+function setupPwaInstallButton() {
+  const btn = dom.btnPwaInstall;
+  const statusEl = dom.pwaInstallStatus;
+  if (!btn) return;
+
+  const supportsWebInstall =
+    typeof Navigator !== 'undefined' &&
+    typeof Navigator.prototype?.install === 'function';
+
+  const revealIfEligible = () => {
+    btn.hidden = isStandalonePwa() || (!supportsWebInstall && !deferredInstallPrompt);
+  };
+
+  revealIfEligible();
+
+  window.addEventListener('beforeinstallprompt', (event) => {
+    event.preventDefault();
+    deferredInstallPrompt = event;
+    if (!supportsWebInstall && !isStandalonePwa()) {
+      btn.hidden = false;
+    }
+  });
+
+  window.addEventListener('appinstalled', () => {
+    deferredInstallPrompt = undefined;
+    btn.hidden = true;
+    if (statusEl) {
+      statusEl.hidden = false;
+      statusEl.textContent = '✅ 已安裝 NativeRead 至手機主畫面！';
+    }
+  });
+
+  btn.addEventListener('click', async () => {
+    if (btn.getAttribute('aria-disabled') === 'true') return;
+    // Use aria-disabled instead of disabled so activating does not drop focus
+    btn.setAttribute('aria-disabled', 'true');
+    try {
+      if (supportsWebInstall) {
+        await navigator.install();
+        if (statusEl) {
+          statusEl.hidden = false;
+          statusEl.textContent = '✅ 已安裝或開啟 NativeRead 獨立應用程式。';
+        }
+        btn.hidden = true;
+      } else if (deferredInstallPrompt) {
+        // Clear single-use prompt before awaiting user choice
+        const promptEvent = deferredInstallPrompt;
+        deferredInstallPrompt = undefined;
+        await promptEvent.prompt();
+        const { outcome } = await promptEvent.userChoice;
+        if (statusEl) {
+          statusEl.hidden = false;
+          statusEl.textContent =
+            outcome === 'accepted'
+              ? '✅ 已安裝 NativeRead！之後在 Android Chrome 點「分享 → NativeRead」即可秒譯。'
+              : '已取消安裝，您隨時可再點擊按鈕安裝。';
+        }
+        if (!deferredInstallPrompt) {
+          btn.hidden = true;
+        }
+      }
+    } catch (err) {
+      if (statusEl) {
+        statusEl.hidden = false;
+        statusEl.textContent =
+          err?.name === 'AbortError'
+            ? '已取消安裝或目前環境暫不支援自動安裝。'
+            : '無法自動啟動安裝，請改用瀏覽器選單的「加到主畫面 / 安裝應用程式」。';
+      }
+    } finally {
+      btn.removeAttribute('aria-disabled');
+    }
+  });
+}
 
 let draftProfiles = {};
 let currentSettingsProviderId = 'gemini';
@@ -3840,6 +4004,7 @@ function switchActiveProviderFromUi(targetProviderId) {
   renderGlobalProviderSelect();
   const label = PROVIDER_PRESETS[state.settings.providerId]?.label || state.settings.providerId;
   renderInstallSyncCard();
+  renderQuickSetupCard();
   showSyncBanner(`✓ 已切換供應商為 ${label}${state.settings.model ? ` (${state.settings.model})` : ''}`);
 
   if (state.pdfDoc) {
@@ -3942,12 +4107,7 @@ function renderInstallSyncCard() {
   const pid = PROVIDER_PRESETS[s.providerId] ? s.providerId : 'custom';
   const preset = PROVIDER_PRESETS[pid] || null;
   const label = preset?.label || pid;
-  const hasCreds = isProfileReady(pid, {
-    protocol: s.protocol || preset?.protocol || 'openai',
-    baseUrl: s.baseUrl || preset?.baseUrl || '',
-    apiKey: s.apiKey || '',
-    model: s.model || preset?.defaultModel || ''
-  });
+  const hasCreds = hasReadyProvider(s);
   const syncUrl = buildMobileSyncUrlFromSettings(s);
 
   dom.installSyncStatusCard.dataset.ready = hasCreds ? 'true' : 'false';
@@ -3985,6 +4145,7 @@ function refreshAllPwaSettingsViews() {
   populateSettingsForm();
   applyRootLanguageFonts(state.settings);
   renderInstallSyncCard();
+  renderQuickSetupCard();
 }
 
 async function updateCacheCountUI() {
@@ -4100,17 +4261,131 @@ function bindEvents() {
 
   // Compare Sheet events
   dom.compareCloseBtn.addEventListener('click', closeComparePopover);
+  const copyButtonState = new WeakMap();
+  const legacyCopy = (text) => {
+    const previousFocus = document.activeElement;
+    const field = Object.assign(document.createElement('textarea'), { value: text });
+    field.setAttribute('readonly', '');
+    field.style.cssText = 'position:fixed;inset-block-start:0;opacity:0';
+    document.body.append(field);
+    field.select();
+    try {
+      return document.execCommand('copy');
+    } catch (_) {
+      return false;
+    } finally {
+      field.remove();
+      try {
+        previousFocus?.focus({ preventScroll: true });
+      } catch (_) {}
+    }
+  };
   const copyFeedback = async (btn, text) => {
-    if (!text) return;
+    if (!text) return false;
+    let entry = copyButtonState.get(btn);
+    if (!entry) {
+      entry = { originalText: btn.textContent, timer: null };
+      copyButtonState.set(btn, entry);
+    }
+    if (entry.timer) clearTimeout(entry.timer);
+    btn.removeAttribute('data-copied');
+    btn.removeAttribute('data-failed');
+
+    let ok = true;
     try {
       await navigator.clipboard.writeText(text);
-      const prev = btn.textContent;
-      btn.textContent = '已複製';
-      setTimeout(() => { btn.textContent = prev; }, 1200);
-    } catch (_) {}
+    } catch (_) {
+      ok = legacyCopy(text);
+    }
+
+    btn.textContent = ok ? '已複製' : '複製失敗';
+    btn.setAttribute(ok ? 'data-copied' : 'data-failed', '');
+    entry.timer = setTimeout(() => {
+      btn.textContent = entry.originalText;
+      btn.removeAttribute('data-copied');
+      btn.removeAttribute('data-failed');
+      entry.timer = null;
+    }, 1500);
+    return ok;
   };
   dom.copyOrigBtn.addEventListener('click', () => copyFeedback(dom.copyOrigBtn, state.activeComparePara?.orig));
   dom.copyTransBtn.addEventListener('click', () => copyFeedback(dom.copyTransBtn, state.activeComparePara?.trans));
+
+  // Header status badge & Quick Setup onboarding actions
+  dom.globalStatusBadge?.addEventListener('click', () => {
+    const st = dom.globalStatusBadge.dataset.state;
+    if (st === 'warn' || st === 'error') {
+      switchTab('settings');
+    }
+  });
+
+  const handleQuickSyncTokenImport = (rawInput, statusEl, inputEl = null) => {
+    const token = extractNrSyncTokenFromInput(rawInput);
+    if (!token || !applyNrSyncToken(token)) {
+      if (statusEl) {
+        statusEl.hidden = false;
+        statusEl.textContent = '無法辨識同步連結，請確認已完整複製包含 #nr_sync=... 與金鑰的電腦端同步網址。';
+      }
+      return false;
+    }
+    if (inputEl) inputEl.value = '';
+    if (statusEl) {
+      statusEl.hidden = false;
+      statusEl.textContent = '✅ 已成功匯入電腦端設定並同步至本機。';
+    }
+    refreshAllPwaSettingsViews();
+    const pid = PROVIDER_PRESETS[state.settings.providerId] ? state.settings.providerId : 'custom';
+    const label = PROVIDER_PRESETS[pid]?.label || pid;
+    showSyncBanner(`✅ 已匯入 ${label}${state.settings.model ? ` · ${state.settings.model}` : ''}，現在即可直接使用！`);
+
+    if (state.pdfDoc) {
+      resumePdfAfterProviderSwitch();
+    }
+    if (state.currentWebArticle) {
+      renderAndStreamWebArticle(state.currentWebArticle);
+    } else if (state.activeTab === 'web' && dom.webRawInput?.value.trim()) {
+      const parsed = parseMarkdownOrTextBlocks(dom.webRawInput.value.trim(), '外文段落翻譯');
+      renderAndStreamWebArticle({
+        title: parsed.title,
+        sourceLabel: 'Mobile Share',
+        blocks: parsed.blocks
+      });
+    } else if (state.activeTab === 'web' && dom.webUrlInput?.value.trim()) {
+      dom.webUrlForm?.requestSubmit();
+    }
+    return true;
+  };
+
+  dom.quickSyncImportBtn?.addEventListener('click', () => {
+    handleQuickSyncTokenImport(
+      dom.quickSyncInput?.value.trim() || '',
+      dom.quickSyncStatus,
+      dom.quickSyncInput
+    );
+  });
+
+  dom.quickSyncPasteBtn?.addEventListener('click', async () => {
+    let clipText = '';
+    try {
+      clipText = (await navigator.clipboard?.readText?.()) || '';
+    } catch (_) {}
+    const token = extractNrSyncTokenFromInput(clipText);
+    if (token) {
+      handleQuickSyncTokenImport(clipText, dom.quickSyncStatus, dom.quickSyncInput);
+      return;
+    }
+    if (dom.quickSyncStatus) {
+      dom.quickSyncStatus.hidden = false;
+      dom.quickSyncStatus.textContent = clipText
+        ? '剪貼簿內容不包含 #nr_sync=... 同步連結，請長按下方輸入框手動貼上。'
+        : '瀏覽器未授予讀取剪貼簿權限，請點擊上方輸入框長按「貼上」後再點「一鍵匯入」。';
+    }
+    dom.quickSyncInput?.focus();
+  });
+
+  dom.quickOpenSettingsBtn?.addEventListener('click', () => {
+    switchTab('settings');
+  });
 
   // Web Tab events
   dom.webModeSegmented.addEventListener('click', (e) => {
@@ -4163,6 +4438,7 @@ function bindEvents() {
       if (fetchCtrl.signal.aborted && state.webFetchController !== fetchCtrl) return;
       dom.webArticleTitle.textContent = '無法直接擷取該網址';
       dom.webArticleProgress.textContent = err?.message || '請改展開上方「直接貼上外文段落」進行翻譯';
+      if (dom.webPasteDetails) dom.webPasteDetails.open = true;
     } finally {
       if (state.webFetchController === fetchCtrl) {
         state.webFetchController = null;
@@ -4212,8 +4488,12 @@ function bindEvents() {
       }
       return;
     }
-    await copyFeedback(btn, url);
-    showSyncBanner('✅ 已複製同步連結！可在其他瀏覽器、iOS 主畫面 App 或外掛設定中一鍵貼上匯入。');
+    const ok = await copyFeedback(btn, url);
+    if (ok) {
+      showSyncBanner('✅ 已複製同步連結！可在其他瀏覽器、iOS 主畫面 App 或外掛設定中一鍵貼上匯入。');
+    } else {
+      showSyncBanner('⚠️ 瀏覽器阻擋剪貼簿寫入，請改至下方設定欄手動複製同步連結。');
+    }
   };
 
   dom.btnInstallCopySync?.addEventListener('click', () => {
@@ -4225,30 +4505,23 @@ function bindEvents() {
   });
 
   dom.pwaSyncImportBtn?.addEventListener('click', () => {
-    const raw = dom.pwaSyncImportInput?.value.trim() || '';
-    const token = extractNrSyncTokenFromInput(raw);
-    const statusEl = dom.pwaSyncImportStatus;
-    if (!token || !applyNrSyncToken(token)) {
-      if (statusEl) {
-        statusEl.hidden = false;
-        statusEl.textContent = '無法辨識同步連結，請確認已完整複製包含 #nr_sync=... 與金鑰的電腦端同步網址。';
-      }
-      return;
+    handleQuickSyncTokenImport(
+      dom.pwaSyncImportInput?.value.trim() || '',
+      dom.pwaSyncImportStatus,
+      dom.pwaSyncImportInput
+    );
+  });
+
+  dom.btnCopyShortcutPrefix?.addEventListener('click', async () => {
+    const ok = await copyFeedback(dom.btnCopyShortcutPrefix, SHORTCUT_URL_PREFIX);
+    if (ok) {
+      showSyncBanner('✅ 已複製 iOS 捷徑網址前綴，請貼到 iPhone「捷徑」App 的「URL」動作中。');
     }
-    if (dom.pwaSyncImportInput) dom.pwaSyncImportInput.value = '';
-    if (statusEl) {
-      statusEl.hidden = false;
-      statusEl.textContent = '✅ 已成功匯入電腦端設定並同步至本機。';
-    }
-    refreshAllPwaSettingsViews();
-    const pid = PROVIDER_PRESETS[state.settings.providerId] ? state.settings.providerId : 'custom';
-    const label = PROVIDER_PRESETS[pid]?.label || pid;
-    showSyncBanner(`✅ 已匯入 ${label}${state.settings.model ? ` · ${state.settings.model}` : ''}，現在即可直接使用！`);
   });
 
   dom.bookmarkletCodeBox.textContent = BOOKMARKLET_SNIPPET;
   dom.copyBookmarkletBtn.addEventListener('click', () => {
-    copyFeedback(dom.copyBookmarkletBtn, BOOKMARKLET_SNIPPET);
+    void copyFeedback(dom.copyBookmarkletBtn, BOOKMARKLET_SNIPPET);
   });
 
   // Settings Tab events
@@ -4403,6 +4676,7 @@ function bindEvents() {
     renderFallbackProviderSelect(state.settings.fallbackProviderId || '');
     applyRootLanguageFonts(state.settings);
     renderInstallSyncCard();
+    renderQuickSetupCard();
     showSyncBanner('✅ 設定已儲存至本機！');
     if (state.pdfDoc && prev) {
       const langChanged =
@@ -4479,6 +4753,9 @@ async function init() {
   applyRootLanguageFonts(state.settings);
   bindEvents();
   renderInstallSyncCard();
+  renderQuickSetupCard();
+  applyMobileBrowserHighlights();
+  setupPwaInstallButton();
   updateCacheCountUI();
 
   let postInstallSynced = false;
@@ -4517,6 +4794,7 @@ async function init() {
   const params = new URLSearchParams(window.location.search);
   const srcPdf = params.get('src');
   const rawShare = params.get('url') || params.get('text') || params.get('title');
+  const sharedText = String(params.get('text') || '').trim();
 
   if (srcPdf && srcPdf.trim()) {
     switchTab('pdf');
@@ -4532,6 +4810,18 @@ async function init() {
       switchTab('web');
       dom.webUrlInput.value = cleanUrl;
       dom.webUrlForm.requestSubmit();
+    }
+  } else if (sharedText && sharedText.length >= 4) {
+    switchTab('web');
+    if (dom.webPasteDetails) dom.webPasteDetails.open = true;
+    if (dom.webRawInput) dom.webRawInput.value = sharedText;
+    if (hasReadyProvider(state.settings)) {
+      const parsed = parseMarkdownOrTextBlocks(sharedText, params.get('title')?.trim() || '系統分享段落翻譯');
+      renderAndStreamWebArticle({
+        title: parsed.title,
+        sourceLabel: 'Mobile Share',
+        blocks: parsed.blocks
+      });
     }
   } else {
     showPdfStage('empty');

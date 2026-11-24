@@ -1,4 +1,4 @@
-const CACHE_NAME = 'nativeread-pwa-v2.8.3';
+const CACHE_NAME = 'nativeread-pwa-v2.8.4';
 const NETWORK_FIRST_TIMEOUT_MS = 4000;
 
 const APP_SHELL_ASSETS = [
