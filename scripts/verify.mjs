@@ -10,7 +10,14 @@ const ROOT = path.resolve(__dirname, '..');
 
 function walkFiles(dir, filterFn, acc = []) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (entry.name === 'node_modules' || entry.name === 'vendor' || entry.name === '.git') continue;
+    if (
+      entry.name === 'node_modules' ||
+      entry.name === 'vendor' ||
+      entry.name === '.git' ||
+      entry.name === '.gradle' ||
+      entry.name === 'build' ||
+      entry.name === 'DerivedData'
+    ) continue;
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
       walkFiles(full, filterFn, acc);
@@ -111,6 +118,7 @@ function runContractTests() {
     'tests/userscript-runtime.test.mjs',
     'tests/pwa-sw.test.mjs',
     'tests/pwa-sync.test.mjs',
+    'tests/native-mobile.test.mjs',
     'tests/workflow-integrity.test.mjs'
   ];
   execFileSync(process.execPath, ['--test', ...suites.map((s) => path.join(ROOT, s))], {

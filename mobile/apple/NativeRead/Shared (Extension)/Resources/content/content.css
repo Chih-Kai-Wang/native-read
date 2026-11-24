@@ -1,0 +1,517 @@
+/* Universal AI Web & Notebook Translator v2.0 - Page Typography & Mode Rules */
+/* Note: Floating control pill & selection popover are encapsulated in Shadow DOM. */
+
+:root {
+  --kct-accent: #0284c7;
+  --kct-accent-soft: rgba(2, 132, 199, 0.08);
+  --kct-hairline: rgba(148, 163, 184, 0.45);
+  --kct-border: rgba(15, 23, 42, 0.12);
+  --kct-text: #1e293b;
+  --kct-bilingual-ink: #475569;
+  --kct-bg: rgba(255, 255, 255, 0.9);
+
+  /* Default target language: Traditional Chinese (zh-TW) */
+  --kct-font-serif: "Noto Serif TC", "Songti TC", "PMingLiU", "Source Han Serif TC", Georgia, serif;
+  --kct-font-sans: "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", "Heiti TC", -apple-system, BlinkMacSystemFont, sans-serif;
+  --kct-font-mono: "JetBrains Mono", "SFMono-Regular", Menlo, Monaco, Consolas, "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", monospace;
+}
+
+html.kct-lang-sc {
+  --kct-font-serif: "Noto Serif SC", "Songti SC", "STSong", "SimSun", "Source Han Serif SC", Georgia, serif;
+  --kct-font-sans: "PingFang SC", "Noto Sans SC", "Hiragino Sans GB", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, sans-serif;
+  --kct-font-mono: "JetBrains Mono", "SFMono-Regular", Menlo, Monaco, Consolas, "PingFang SC", "Noto Sans SC", "Microsoft YaHei", monospace;
+}
+
+html.kct-lang-ja {
+  --kct-font-serif: "Hiragino Mincho ProN", "Yu Mincho", "Noto Serif JP", "MS PMincho", Georgia, serif;
+  --kct-font-sans: "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Yu Gothic", -apple-system, BlinkMacSystemFont, sans-serif;
+  --kct-font-mono: "JetBrains Mono", "SFMono-Regular", Menlo, Monaco, Consolas, "Hiragino Sans", "Noto Sans JP", monospace;
+}
+
+html.kct-lang-ko {
+  --kct-font-serif: "Noto Serif KR", "AppleMyungjo", "Batang", Georgia, serif;
+  --kct-font-sans: "Apple SD Gothic Neo", "Noto Sans KR", "Malgun Gothic", -apple-system, BlinkMacSystemFont, sans-serif;
+  --kct-font-mono: "JetBrains Mono", "SFMono-Regular", Menlo, Monaco, Consolas, "Apple SD Gothic Neo", "Noto Sans KR", monospace;
+}
+
+html.kct-lang-latin {
+  --kct-font-serif: Georgia, "Charter", "Times New Roman", serif;
+  --kct-font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", sans-serif;
+  --kct-font-mono: "JetBrains Mono", "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
+}
+
+html.kct-page-dark,
+body[data-jp-theme-light="false"],
+html[data-theme="dark"],
+html.dark,
+body.theme-dark {
+  --kct-accent: #38bdf8;
+  --kct-accent-soft: rgba(56, 189, 248, 0.12);
+  --kct-hairline: rgba(148, 163, 184, 0.34);
+  --kct-border: rgba(255, 255, 255, 0.16);
+  --kct-text: #f1f5f9;
+  --kct-bilingual-ink: #cbd5e1;
+  --kct-bg: rgba(15, 23, 42, 0.9);
+}
+
+/* Preserve table & Infobox column widths when CJK labels sit next to long unbroken URLs */
+html.kct-active:not(.kct-mode-original) table th[data-kct-has-trans="1"] {
+  min-width: 4.5em;
+  word-break: keep-all;
+  overflow-wrap: break-word;
+}
+
+html.kct-active:not(.kct-mode-original) table td[data-kct-has-trans="1"],
+html.kct-active:not(.kct-mode-original) .infobox td {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* =========================================================
+   1. Replace Mode (Native-Feel Typography Matching)
+   ========================================================= */
+html.kct-mode-replace .kct-orig-wrap {
+  display: none !important;
+}
+
+html.kct-mode-replace .kct-trans-wrap {
+  display: contents;
+}
+
+/* Bilingual mode shows the original too: hide media/box copies so they are not shown twice. */
+html.kct-mode-bilingual .kct-trans-wrap [data-kct-atomic="box"] {
+  display: none !important;
+}
+
+/* Flex/grid hosts: each translated text run is ONE item (.kct-flex-run), atomic clones stay items. */
+.kct-flex-run {
+  min-width: 0;
+}
+
+html.kct-mode-replace [data-kct-has-trans="1"] {
+  line-break: strict;
+  font-kerning: normal;
+  text-wrap: pretty;
+  text-autospace: normal;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Native mode: keep original site Latin font first (when non-generic), fall back to matched Serif/Sans/Mono CJK */
+html.kct-typo-native.kct-mode-replace [data-kct-has-trans="1"][data-kct-typo="serif"] {
+  font-family: var(--kct-font-serif) !important;
+}
+
+html.kct-typo-native.kct-mode-replace [data-kct-has-trans="1"][data-kct-typo="sans"] {
+  font-family: var(--kct-font-sans) !important;
+}
+
+html.kct-typo-native.kct-mode-replace [data-kct-has-trans="1"][data-kct-typo="mono"] {
+  font-family: var(--kct-font-mono) !important;
+}
+
+html.kct-typo-native.kct-mode-replace [data-kct-has-trans="1"][data-kct-has-orig-font="1"][data-kct-typo="serif"] {
+  font-family: var(--kct-orig-font), var(--kct-font-serif) !important;
+}
+
+html.kct-typo-native.kct-mode-replace [data-kct-has-trans="1"][data-kct-has-orig-font="1"][data-kct-typo="sans"] {
+  font-family: var(--kct-orig-font), var(--kct-font-sans) !important;
+}
+
+html.kct-typo-native.kct-mode-replace [data-kct-has-trans="1"][data-kct-has-orig-font="1"][data-kct-typo="mono"] {
+  font-family: var(--kct-orig-font), var(--kct-font-mono) !important;
+}
+
+/* System mode: uniform clean sans font */
+html.kct-typo-system.kct-mode-replace [data-kct-has-trans="1"] {
+  font-family: var(--kct-font-sans) !important;
+}
+
+/* Preserve mode: do not override font-family or line-height */
+
+/* Selective line-height lift ONLY on dense multi-line reading prose */
+html.kct-mode-replace:not(.kct-typo-preserve) [data-kct-has-trans="1"][data-kct-lh-lift="1"] {
+  line-height: 1.72 !important;
+}
+
+/* =========================================================
+   2. Original Mode (Instant Zero-Cost Compare)
+   ========================================================= */
+html.kct-mode-original .kct-trans-wrap {
+  display: none !important;
+}
+
+html.kct-mode-original .kct-orig-wrap {
+  display: contents;
+}
+
+/* =========================================================
+   3. Bilingual Mode (Clean Hairline Contrast)
+   ========================================================= */
+html.kct-mode-bilingual .kct-orig-wrap {
+  display: contents;
+}
+
+html.kct-mode-bilingual .kct-trans-wrap {
+  display: block;
+  color: var(--kct-bilingual-ink);
+  margin-top: 0.35em;
+  padding-left: 10px;
+  border-left: 2px solid var(--kct-hairline);
+  font-size: 0.94em;
+  line-height: 1.7;
+  font-weight: 400;
+  line-break: strict;
+  font-kerning: normal;
+  text-wrap: pretty;
+  text-autospace: normal;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+html.kct-typo-native.kct-mode-bilingual [data-kct-has-trans="1"][data-kct-typo="serif"] > .kct-trans-wrap {
+  font-family: var(--kct-font-serif);
+}
+
+html.kct-typo-native.kct-mode-bilingual [data-kct-has-trans="1"][data-kct-typo="sans"] > .kct-trans-wrap {
+  font-family: var(--kct-font-sans);
+}
+
+html.kct-typo-native.kct-mode-bilingual [data-kct-has-trans="1"][data-kct-typo="mono"] > .kct-trans-wrap {
+  font-family: var(--kct-font-mono);
+}
+
+html.kct-typo-native.kct-mode-bilingual [data-kct-has-trans="1"][data-kct-has-orig-font="1"][data-kct-typo="serif"] > .kct-trans-wrap {
+  font-family: var(--kct-orig-font), var(--kct-font-serif);
+}
+
+html.kct-typo-native.kct-mode-bilingual [data-kct-has-trans="1"][data-kct-has-orig-font="1"][data-kct-typo="sans"] > .kct-trans-wrap {
+  font-family: var(--kct-orig-font), var(--kct-font-sans);
+}
+
+html.kct-typo-native.kct-mode-bilingual [data-kct-has-trans="1"][data-kct-has-orig-font="1"][data-kct-typo="mono"] > .kct-trans-wrap {
+  font-family: var(--kct-orig-font), var(--kct-font-mono);
+}
+
+html.kct-typo-system.kct-mode-bilingual .kct-trans-wrap {
+  font-family: var(--kct-font-sans);
+}
+
+html.kct-mode-bilingual [data-kct-inline-layout="1"] > .kct-trans-wrap {
+  display: inline;
+  margin-top: 0;
+  margin-left: 0.45em;
+  padding-left: 0.45em;
+  border-left: 1px solid var(--kct-hairline);
+}
+
+/* =========================================================
+   Non-destructive Code Comment Translation
+   - Static <pre>: CSS attr() + font-size:0 swap
+   - CodeMirror 6 (.cm-editor): non-intrusive .cm-scroller overlay layer
+   ========================================================= */
+html.kct-comments-on:not(.kct-mode-original) pre span[data-kct-comment-trans] {
+  font-size: 0 !important;
+  letter-spacing: 0 !important;
+}
+
+html.kct-comments-on:not(.kct-mode-original) pre span[data-kct-comment-trans]::after {
+  content: attr(data-kct-comment-trans);
+  font-size: var(--kct-code-font-size, 13px);
+  letter-spacing: normal;
+  font-family: var(--kct-font-mono);
+}
+
+.kct-cm-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 4;
+  overflow: visible;
+}
+
+.kct-cm-comment {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  white-space: pre;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: var(--kct-font-mono);
+  pointer-events: none;
+  box-sizing: border-box;
+}
+
+html.kct-mode-original .kct-cm-layer,
+html:not(.kct-comments-on) .kct-cm-layer,
+html .cm-editor.cm-focused .kct-cm-layer {
+  display: none !important;
+}
+
+/* =========================================================
+   Jupyter Code Cell Output Quick Translate Button & Result
+   ========================================================= */
+.kct-output-host {
+  position: relative;
+}
+
+.kct-output-btn {
+  all: unset;
+  box-sizing: border-box;
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  z-index: 10;
+  cursor: pointer;
+  font-family: var(--kct-font-sans);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--kct-bg);
+  color: var(--kct-accent);
+  border: 1px solid var(--kct-border);
+  box-shadow: 0 2px 6px rgba(15, 23, 42, 0.08);
+  opacity: 0.85;
+  transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+
+.kct-output-btn:hover {
+  opacity: 1;
+  background: var(--kct-accent);
+  color: #ffffff;
+  border-color: transparent;
+}
+
+.kct-output-trans {
+  font-family: var(--kct-font-sans);
+  color: var(--kct-text);
+  background: var(--kct-accent-soft);
+  border-left: 2px solid var(--kct-accent);
+  border-radius: 0 6px 6px 0;
+  padding: 8px 12px;
+  margin-top: 8px;
+  font-size: 13px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* =========================================================
+   5. Image/Canvas-Backed PDF Text Layer Overlay (Google Drive PDF Viewer)
+   ========================================================= */
+html.kct-active:not(.kct-mode-original) [data-kct-pdf-layer="1"] {
+  z-index: 2 !important;
+  opacity: 1 !important;
+  pointer-events: none !important;
+  overflow: visible !important;
+}
+
+html.kct-active:not(.kct-mode-original) [data-kct-pdf-layer="1"] > :not([data-kct-has-trans="1"]),
+html.kct-active:not(.kct-mode-original) [data-kct-pdf-layer="1"] > [data-kct-pdf-merged="absorbed"] {
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+html.kct-active:not(.kct-mode-original) [data-kct-pdf-layer="1"] > p[data-kct-pdf-block="1"][data-kct-has-trans="1"] {
+  opacity: 1 !important;
+  pointer-events: auto !important;
+  background-color: var(--kct-pdf-bg, #ffffff) !important;
+  box-shadow: 0 0 0 2px var(--kct-pdf-bg, #ffffff) !important;
+  color: var(--kct-pdf-fg, #1e293b) !important;
+  font-size: var(--kct-pdf-fs, 13px) !important;
+  line-height: var(--kct-pdf-lh, 1.42) !important;
+  font-weight: var(--kct-pdf-fw, 400) !important;
+  box-sizing: border-box !important;
+  margin: 0 !important;
+  padding: 1px 4px !important;
+  border-radius: 2px !important;
+  display: block !important;
+  white-space: normal !important;
+  word-break: break-word !important;
+  overflow: hidden !important;
+  transition: box-shadow 0.14s ease;
+}
+
+html.kct-active:not(.kct-mode-original) [data-kct-pdf-layer="1"] > p[data-kct-pdf-block="1"][data-kct-has-trans="1"]:hover {
+  z-index: 30 !important;
+  overflow: visible !important;
+  height: auto !important;
+}
+
+/* In fixed-coordinate PDF overlay layers, keep layout clean in Bilingual mode and expand full bilingual card on hover */
+html.kct-active.kct-mode-bilingual [data-kct-pdf-layer="1"] > p[data-kct-pdf-block="1"][data-kct-has-trans="1"] > .kct-orig-wrap {
+  display: none !important;
+}
+
+html.kct-active.kct-mode-bilingual [data-kct-pdf-layer="1"] > p[data-kct-pdf-block="1"][data-kct-has-trans="1"] > .kct-trans-wrap {
+  display: contents !important;
+  color: var(--kct-pdf-fg, #1e293b) !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: none !important;
+  font-size: inherit !important;
+  line-height: inherit !important;
+  font-weight: inherit !important;
+}
+
+html.kct-active.kct-mode-bilingual [data-kct-pdf-layer="1"] > p[data-kct-pdf-block="1"][data-kct-has-trans="1"]:hover {
+  z-index: 30 !important;
+  height: auto !important;
+  padding: 8px 10px !important;
+  border-radius: 6px !important;
+  border: 1px solid var(--kct-accent) !important;
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.25) !important;
+}
+
+html.kct-active.kct-mode-bilingual [data-kct-pdf-layer="1"] > p[data-kct-pdf-block="1"][data-kct-has-trans="1"]:hover > .kct-orig-wrap {
+  display: block !important;
+  font-size: 0.86em !important;
+  line-height: 1.4 !important;
+  opacity: 0.76 !important;
+  margin-bottom: 6px !important;
+  padding-bottom: 6px !important;
+  border-bottom: 1px dashed rgba(148, 163, 184, 0.45) !important;
+}
+
+/* =========================================================
+   Google Drive PDF: table-of-contents rows
+   (translated title + native dot leader + right-aligned page number).
+   Placed last so it overrides the generic overlay / bilingual hover rules above.
+   ========================================================= */
+html.kct-active:not(.kct-mode-original) [data-kct-pdf-layer="1"] > p[data-kct-pdf-block="1"][data-kct-pdf-toc="1"][data-kct-has-trans="1"] {
+  display: flex !important;
+  align-items: baseline !important;
+  white-space: nowrap !important;
+  overflow: hidden !important;
+}
+
+html.kct-active:not(.kct-mode-original) [data-kct-pdf-layer="1"] > p[data-kct-pdf-block="1"][data-kct-pdf-toc="1"][data-kct-has-trans="1"] > .kct-orig-wrap,
+html.kct-active:not(.kct-mode-original) [data-kct-pdf-layer="1"] > p[data-kct-pdf-block="1"][data-kct-pdf-toc="1"][data-kct-has-trans="1"]:hover > .kct-orig-wrap {
+  display: none !important;
+}
+
+html.kct-active:not(.kct-mode-original) [data-kct-pdf-layer="1"] > p[data-kct-pdf-block="1"][data-kct-pdf-toc="1"][data-kct-has-trans="1"] > .kct-trans-wrap {
+  display: block !important;
+  flex: 0 1 auto !important;
+  min-width: 0 !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  white-space: nowrap !important;
+}
+
+html.kct-active.kct-mode-bilingual [data-kct-pdf-layer="1"] > p[data-kct-pdf-block="1"][data-kct-pdf-toc="1"][data-kct-has-trans="1"]:hover {
+  height: auto !important;
+  padding: 1px 4px !important;
+}
+
+[data-kct-pdf-layer="1"] > p > .kct-pdf-toc-tail {
+  display: none;
+}
+
+html.kct-active:not(.kct-mode-original) [data-kct-pdf-layer="1"] > p[data-kct-pdf-block="1"][data-kct-pdf-toc="1"][data-kct-has-trans="1"] > .kct-pdf-toc-tail {
+  display: flex !important;
+  flex: 1 1 auto !important;
+  align-items: baseline !important;
+  min-width: 2.2em !important;
+}
+
+[data-kct-pdf-layer="1"] .kct-pdf-toc-leader {
+  flex: 1 1 auto;
+  height: 0;
+  margin: 0 0.5em;
+  border-bottom: 0.13em dotted currentColor;
+  opacity: 0.6;
+}
+
+[data-kct-pdf-layer="1"] > p[data-kct-pdf-toc-leader="none"] .kct-pdf-toc-leader {
+  border-bottom-color: transparent;
+}
+
+[data-kct-pdf-layer="1"] .kct-pdf-toc-num {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+
+/* =========================================================
+   6. R4: On-Demand Vision Image Overlay Translation
+   ========================================================= */
+.kct-img-overlay-host {
+  position: relative;
+  line-height: 0;
+}
+
+.kct-img-overlay-layer {
+  position: absolute;
+  pointer-events: none;
+  z-index: 6;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+html.kct-mode-original .kct-img-overlay-layer,
+.kct-img-overlay-host > img[data-kct-img-mode="original"] ~ .kct-img-overlay-layer {
+  display: none !important;
+}
+
+.kct-img-overlay-block {
+  position: absolute;
+  box-sizing: border-box;
+  background-color: var(--kct-img-bg, #ffffff);
+  box-shadow: 0 0 0 2px var(--kct-img-bg, #ffffff);
+  color: var(--kct-img-fg, #1e293b);
+  font-family: var(--kct-font-sans);
+  line-height: 1.28;
+  padding: 1px 3px;
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+  white-space: normal;
+  word-break: break-word;
+  overflow: hidden;
+  pointer-events: auto;
+}
+
+.kct-img-overlay-block.kct-img-role-title {
+  font-weight: 700;
+  line-height: 1.22;
+}
+
+.kct-img-overlay-block.kct-img-role-badge {
+  font-weight: 600;
+  justify-content: center;
+  text-align: center;
+  border-radius: 999px;
+}
+
+.kct-img-overlay-block:hover {
+  z-index: 20;
+  overflow: visible;
+  height: auto !important;
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.18), 0 0 0 1px var(--kct-accent);
+}
+
+/* =========================================================
+   Structure guard: when a translation lost a link or protected node,
+   keep the clickable original visible next to the translation.
+   ========================================================= */
+html.kct-mode-replace [data-kct-structure-fallback="1"] > .kct-orig-wrap {
+  display: contents !important;
+}
+
+html.kct-mode-replace [data-kct-structure-fallback="1"] > .kct-trans-wrap {
+  display: block;
+  color: var(--kct-bilingual-ink);
+  margin-top: 0.35em;
+  padding-left: 10px;
+  border-left: 2px solid var(--kct-hairline);
+  font-size: 0.94em;
+  line-height: 1.7;
+  font-weight: 400;
+  line-break: strict;
+  font-kerning: normal;
+  text-wrap: pretty;
+  text-autospace: normal;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}

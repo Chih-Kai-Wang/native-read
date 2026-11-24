@@ -2523,6 +2523,12 @@ async function injectAndCommandTab(tabId, action, payload = null) {
 // ============================================================
 
 function setupContextMenus() {
+  if (
+    typeof chrome?.contextMenus?.removeAll !== 'function' ||
+    typeof chrome?.contextMenus?.create !== 'function'
+  ) {
+    return;
+  }
   try {
     chrome.contextMenus.removeAll(() => {
       void chrome.runtime.lastError;
@@ -2588,14 +2594,17 @@ chrome.runtime.onInstalled.addListener(() => {
   setupContextMenus();
   CacheDB.migrateFromLegacyStorage().catch(() => {});
   trySyncFromOpenTrustedPwaTabs().catch(() => {});
+  trySyncFromNativeHost().catch(() => {});
 });
 
 chrome.runtime.onStartup.addListener(() => {
   setupContextMenus();
   CacheDB.migrateFromLegacyStorage().catch(() => {});
+  trySyncFromNativeHost().catch(() => {});
 });
 
-chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+if (chrome?.contextMenus?.onClicked?.addListener) {
+  chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (!tab?.id) return;
   try {
     if (info.menuItemId === 'kct-translate-page') {
@@ -2665,31 +2674,34 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   } catch (err) {
     console.warn('[KCT] contextMenus action failed:', err?.message);
   }
-});
+  });
+}
 
-chrome.commands.onCommand.addListener(async (command) => {
-  if (command !== 'toggle-translate-page') return;
-  try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab?.id) return;
-    if (isPdfUrl(tab.url)) {
-      await openPdfViewer(tab.url, tab);
-      return;
+if (chrome?.commands?.onCommand?.addListener) {
+  chrome.commands.onCommand.addListener(async (command) => {
+    if (command !== 'toggle-translate-page') return;
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tab?.id) return;
+      if (isPdfUrl(tab.url)) {
+        await openPdfViewer(tab.url, tab);
+        return;
+      }
+      if (!isInjectableUrl(tab.url)) return;
+      const inj = await ensureInjected(tab.id);
+      if (inj?.isPdf) {
+        await openPdfViewer(tab.url, tab);
+        return;
+      }
+      await chrome.tabs.sendMessage(tab.id, {
+        type: 'KCT_COMMAND',
+        action: 'TOGGLE_OR_TRANSLATE'
+      });
+    } catch (err) {
+      console.warn('[KCT] command toggle-translate-page failed:', err?.message);
     }
-    if (!isInjectableUrl(tab.url)) return;
-    const inj = await ensureInjected(tab.id);
-    if (inj?.isPdf) {
-      await openPdfViewer(tab.url, tab);
-      return;
-    }
-    await chrome.tabs.sendMessage(tab.id, {
-      type: 'KCT_COMMAND',
-      action: 'TOGGLE_OR_TRANSLATE'
-    });
-  } catch (err) {
-    console.warn('[KCT] command toggle-translate-page failed:', err?.message);
-  }
-});
+  });
+}
 
 const TRUSTED_PWA_ORIGIN = 'https://chih-kai-wang.github.io';
 const TRUSTED_PWA_PATH_PREFIX = '/native-read';
@@ -2972,6 +2984,122 @@ async function tryImportFromTrustedPwaTab(tabId, tabUrl) {
 
     const patch = validateAndBuildSyncPatch(parsed);
     if (!patch || !patch.apiKey) return false;
+    patch.syncedAt = incomingTs || Date.now();
+    await saveSettings(patch);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function openOptionsPageSafe() {
+  try {
+    if (typeof chrome?.runtime?.openOptionsPage === 'function') {
+      await chrome.runtime.openOptionsPage();
+      return;
+    }
+  } catch (_) {}
+  if (typeof chrome?.tabs?.create === 'function') {
+    await chrome.tabs.create({ url: chrome.runtime.getURL('options/options.html') });
+  }
+}
+
+const NATIVE_HOST_APP_ID = 'com.chihkaiwang.nativeread';
+
+function sendNativeSyncRequest() {
+  if (typeof chrome?.runtime?.sendNativeMessage !== 'function') {
+    return Promise.resolve(null);
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (val) => {
+      if (settled) return;
+      settled = true;
+      resolve(val || null);
+    };
+    const timer = setTimeout(() => finish(null), 3000);
+    try {
+      const maybePromise = chrome.runtime.sendNativeMessage(
+        NATIVE_HOST_APP_ID,
+        { type: 'GET_SYNC_SETTINGS' },
+        (resp) => {
+          void chrome?.runtime?.lastError;
+          clearTimeout(timer);
+          finish(resp);
+        }
+      );
+      if (maybePromise && typeof maybePromise.then === 'function') {
+        maybePromise.then(
+          (resp) => {
+            clearTimeout(timer);
+            finish(resp);
+          },
+          () => {
+            clearTimeout(timer);
+            finish(null);
+          }
+        );
+      }
+    } catch (_) {
+      try {
+        const maybePromise = chrome.runtime.sendNativeMessage(
+          NATIVE_HOST_APP_ID,
+          { type: 'GET_SYNC_SETTINGS' }
+        );
+        if (maybePromise && typeof maybePromise.then === 'function') {
+          maybePromise.then(
+            (resp) => {
+              clearTimeout(timer);
+              finish(resp);
+            },
+            () => {
+              clearTimeout(timer);
+              finish(null);
+            }
+          );
+        } else {
+          clearTimeout(timer);
+          finish(maybePromise || null);
+        }
+      } catch (_) {
+        clearTimeout(timer);
+        finish(null);
+      }
+    }
+  });
+}
+
+async function trySyncFromNativeHost() {
+  try {
+    const resp = await sendNativeSyncRequest();
+    if (!resp || resp.ok !== true) return false;
+    let parsed = null;
+    if (typeof resp.settingsJson === 'string' && resp.settingsJson.trim()) {
+      parsed = JSON.parse(resp.settingsJson);
+    } else if (resp.payload && typeof resp.payload === 'object' && !Array.isArray(resp.payload)) {
+      parsed = resp.payload;
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+
+    const cleanKey = sanitizeApiKey(parsed.apiKey ?? parsed.k ?? '');
+    const candidateBase = parsed.baseUrl ?? parsed.u ?? '';
+    const candidateModel = String(parsed.model ?? parsed.m ?? '').trim();
+    if (!cleanKey && !(isLocalEndpoint(candidateBase) && candidateModel)) {
+      return false;
+    }
+
+    const current = await getSettings();
+    const currentHasCreds =
+      Boolean(sanitizeApiKey(current.apiKey)) ||
+      (isLocalEndpoint(current.baseUrl) && Boolean(String(current.model || '').trim()));
+    const incomingTs = Number(parsed.syncedAt || 0);
+    const currentTs = Number(current.syncedAt || 0);
+    if (currentHasCreds && incomingTs <= currentTs) {
+      return false;
+    }
+
+    const patch = validateAndBuildSyncPatch(parsed);
+    if (!patch) return false;
     patch.syncedAt = incomingTs || Date.now();
     await saveSettings(patch);
     return true;
@@ -5204,8 +5332,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           break;
         }
         case 'OPEN_OPTIONS': {
-          await chrome.runtime.openOptionsPage();
+          await openOptionsPageSafe();
           sendResponse({ ok: true });
+          break;
+        }
+        case 'SYNC_FROM_NATIVE_HOST': {
+          if (!isExtensionSender(sender)) {
+            sendResponse({ ok: false, error: '拒絕未授權來源呼叫' });
+            break;
+          }
+          const synced = await trySyncFromNativeHost();
+          sendResponse({ ok: true, synced, settings: await getSettings() });
           break;
         }
         case 'OPEN_PDF_VIEWER': {

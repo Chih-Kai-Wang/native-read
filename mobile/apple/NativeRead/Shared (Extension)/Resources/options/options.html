@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>NativeRead — 設定</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <main class="container">
+    <header class="page-header">
+      <img src="../icons/icon-128.png" alt="Logo" width="40" height="40">
+      <div>
+        <h1>NativeRead 設定</h1>
+      </div>
+    </header>
+
+    <section class="panel">
+      <h2>翻譯與排版</h2>
+
+      <div class="grid-2">
+        <div class="field">
+          <label for="lang-select">目標語言</label>
+          <select id="lang-select"></select>
+        </div>
+        <div class="field">
+          <label for="mode-select">顯示模式</label>
+          <select id="mode-select">
+            <option value="replace">譯文（推薦）</option>
+            <option value="original">僅原文</option>
+            <option value="bilingual">簡潔雙語</option>
+          </select>
+        </div>
+      </div>
+
+      <div id="custom-lang-wrap" class="field hidden" hidden>
+        <label for="custom-lang-input">自訂目標語言名稱</label>
+        <input id="custom-lang-input" type="text" placeholder="例如：Traditional Chinese (Hong Kong), Thai">
+      </div>
+
+      <div class="grid-2">
+        <div class="field">
+          <label for="typography-match">字體排版策略</label>
+          <select id="typography-match">
+            <option value="native">原版自動配對（推薦）</option>
+            <option value="system">系統清晰黑體</option>
+            <option value="preserve">沿用原站字體</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="thinking-effort">模型思考強度</label>
+          <select id="thinking-effort">
+            <option value="fastest">極速 · 最低思考強度（推薦）</option>
+            <option value="balanced">平衡 · 低思考強度</option>
+            <option value="deep">深度 · 中等思考強度</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="check-stack">
+        <label class="inline-check">
+          <input id="translate-code-comments" type="checkbox">
+          <span>自動翻譯程式碼區塊中的 <code>#</code> / <code>//</code> 註解</span>
+        </label>
+        <label class="inline-check">
+          <input id="show-output-btn" type="checkbox">
+          <span>互動式程式碼輸出旁顯示「譯」按鈕</span>
+        </label>
+        <label class="inline-check">
+          <input id="check-for-updates" type="checkbox">
+          <span>開啟彈出視窗時檢查新版本（每天最多一次，只讀取 GitHub Pages 上的 version.json）</span>
+        </label>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>大模型 API 設定</h2>
+
+      <div class="field">
+        <label for="provider-select">服務商預設</label>
+        <select id="provider-select"></select>
+        <p id="provider-hint" class="hint"></p>
+      </div>
+
+      <div id="saved-providers-wrap" class="field">
+        <label>已設定供應商（點擊快速切換，各供應商 API Key 與模型獨立保存）</label>
+        <div id="saved-providers-list" class="provider-chips"></div>
+      </div>
+
+      <div class="grid-2">
+        <div class="field">
+          <label for="protocol-select">介面協定</label>
+          <select id="protocol-select">
+            <option value="openai">OpenAI 相容</option>
+            <option value="gemini">Google Gemini 原生</option>
+            <option value="anthropic">Anthropic Claude 原生</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="model-input">模型名稱</label>
+          <div class="input-with-btn">
+            <input id="model-input" type="text" list="model-suggestions" placeholder="例如 gemini-3.5-flash-lite">
+            <button id="btn-list-models" type="button" class="btn secondary">取得模型清單</button>
+          </div>
+          <datalist id="model-suggestions"></datalist>
+          <p id="model-list-status" class="hint" hidden></p>
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="baseurl-input">API Base URL</label>
+        <input id="baseurl-input" type="url" placeholder="https://api.deepseek.com/v1">
+      </div>
+
+      <div class="field">
+        <label for="apikey-input">API Key</label>
+        <div class="input-with-btn">
+          <input id="apikey-input" type="password" autocomplete="off" placeholder="sk-...">
+          <button id="btn-toggle-key" type="button" class="btn secondary">顯示</button>
+        </div>
+      </div>
+
+      <div class="btn-row">
+        <button id="btn-test" type="button" class="btn secondary">測試連線</button>
+      </div>
+      <div id="test-result" class="test-box hidden" hidden></div>
+
+      <div class="field fallback-field">
+        <label for="fallback-provider-select">高負載自動備援供應商（503 / 過載時選用）</label>
+        <select id="fallback-provider-select"></select>
+        <p class="hint">僅當主供應商經退避重試仍發生 503／過載／連線逾時時自動切換（不涵蓋 401/403 金鑰錯誤），預設停用。</p>
+      </div>
+    </section>
+
+    <details class="panel details-panel">
+      <summary>進階引擎參數</summary>
+      <div class="details-body">
+        <div class="check-stack field">
+          <label class="inline-check">
+            <input id="lazy-viewport" type="checkbox">
+            <span>視口優先懶翻譯（捲動到哪翻到哪）</span>
+          </label>
+          <label class="inline-check">
+            <input id="stream-translation" type="checkbox">
+            <span>SSE 串流逐段即時上屏</span>
+          </label>
+        </div>
+
+        <div class="grid-3 field">
+          <div class="field">
+            <label for="batch-size">每批段落數 (1-40)</label>
+            <input id="batch-size" type="number" min="1" max="40" step="1">
+          </div>
+          <div class="field">
+            <label for="max-batch-chars">每批字元上限 (800-20000)</label>
+            <input id="max-batch-chars" type="number" min="800" max="20000" step="100">
+          </div>
+          <div class="field">
+            <label for="temperature-input">Temperature (0.0-1.0)</label>
+            <input id="temperature-input" type="number" min="0" max="1" step="0.1">
+          </div>
+        </div>
+
+        <div class="field">
+          <p class="hint">請求端點：<code id="endpoint-preview"></code></p>
+        </div>
+      </div>
+    </details>
+
+    <section class="panel">
+      <h2>自動翻譯白名單</h2>
+
+      <div class="field">
+        <label class="inline-check">
+          <input id="global-auto-translate" type="checkbox">
+          <span>預設對所有網站自動翻譯（關閉則僅翻譯下方白名單網站）</span>
+        </label>
+      </div>
+
+      <div class="field">
+        <label for="whitelist-host-input">網站清單</label>
+        <div class="input-with-btn">
+          <input id="whitelist-host-input" type="text" placeholder="新增網域，例如 www.kaggle.com 或 docs.python.org">
+          <button id="btn-add-host" type="button" class="btn secondary">新增網域</button>
+        </div>
+        <p id="whitelist-feedback" class="hint"></p>
+        <div id="whitelist-list" class="host-chips" aria-label="已加入自動翻譯白名單的網站"></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>領域術語表</h2>
+
+      <div class="field">
+        <div class="label-row">
+          <label for="glossary-input">自訂術語表（每行一筆：英文 -&gt; 譯詞）</label>
+          <button id="btn-reset-glossary" type="button" class="link-btn">恢復預設</button>
+        </div>
+        <textarea id="glossary-input" rows="6"></textarea>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>翻譯快取</h2>
+      <div class="cache-bar">
+        <span id="cache-stats">正在讀取快取統計...</span>
+        <button id="btn-clear-cache" type="button" class="btn danger-outline">清空快取</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>手機端與同步</h2>
+
+      <div class="mobile-links-grid">
+        <a class="mobile-link-card" href="https://chih-kai-wang.github.io/native-read/" target="_blank" rel="noopener noreferrer">
+          <strong>手機版 PWA ↗</strong>
+          <span>網頁與 PDF 閱讀器</span>
+        </a>
+        <a class="mobile-link-card" href="https://chih-kai-wang.github.io/native-read/nativeread.user.js" target="_blank" rel="noopener noreferrer">
+          <strong>Userscript 腳本 ↗</strong>
+          <span>Android / iOS Safari</span>
+        </a>
+        <a class="mobile-link-card" href="https://chih-kai-wang.github.io/native-read/nativeread-android-extension.zip" target="_blank" rel="noopener noreferrer">
+          <strong>Android 擴充包 ↓</strong>
+          <span>Lemur / Kiwi / Edge / Firefox</span>
+        </a>
+      </div>
+
+      <div class="btn-row">
+        <button id="btn-generate-mobile-sync" type="button" class="btn primary">產生同步 QR Code</button>
+        <span id="mobile-sync-status" class="inline-status" aria-live="polite"></span>
+      </div>
+
+      <div id="mobile-sync-box" class="mobile-sync-box hidden" hidden>
+        <div class="mobile-qr-wrap">
+          <canvas id="mobile-sync-qr" width="220" height="220" aria-label="手機同步 QR Code"></canvas>
+          <span class="hint">使用手機相機掃描</span>
+        </div>
+        <div class="mobile-url-wrap">
+          <label for="mobile-sync-url">同步連結</label>
+          <div class="input-with-btn">
+            <input id="mobile-sync-url" type="text" readonly placeholder="尚未產生同步連結">
+            <button id="btn-copy-mobile-sync" type="button" class="btn secondary" disabled>複製</button>
+          </div>
+          <p class="hint sync-guide-note">
+            1. <strong>Android / iOS Chrome &amp; Safari</strong>：直接用目標瀏覽器掃描 QR Code 即可開啟 PWA 使用；若加入 iOS 主畫面成為獨立 App，需先複製同步連結並在主畫面 App 首頁點「從剪貼簿匯入」（iOS 獨立儲存空間限制）。<br>
+            2. <strong>快速直譯</strong>：Android Chrome 安裝 PWA 後可從系統「分享 → NativeRead」直譯；iOS Safari 推薦安裝 Userscripts（或用 Apple 捷徑／零攔截書籤 `nr`）。若擴充外掛尚未帶入金鑰，貼於下方「一鍵匯入」即可。
+          </p>
+        </div>
+      </div>
+
+      <div class="field sync-import-field">
+        <label for="import-sync-input">或貼上電腦端同步連結匯入（手機擴充包適用）</label>
+        <div class="input-with-btn">
+          <input id="import-sync-input" type="text" placeholder="https://chih-kai-wang.github.io/native-read/#nr_sync=..." autocomplete="off">
+          <button id="btn-import-mobile-sync" type="button" class="btn secondary">一鍵匯入設定</button>
+        </div>
+        <span id="import-sync-status" class="inline-status" aria-live="polite"></span>
+      </div>
+    </section>
+
+    <div class="save-bar">
+      <span id="save-status" class="inline-status" aria-live="polite"></span>
+      <button id="btn-save" type="button" class="btn primary">儲存設定</button>
+    </div>
+  </main>
+
+  <script src="../shared/config.js"></script>
+  <script src="../shared/cache-db.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>

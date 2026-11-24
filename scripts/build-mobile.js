@@ -1128,6 +1128,25 @@ function buildUserscript(version) {
         let retryAfterMs = 0;
 
         try {
+          const preferGmXhr =
+            Boolean(globalThis.__NATIVEREAD_PREFER_GM_XHR__) &&
+            (typeof GM_xmlhttpRequest === 'function' ||
+              (typeof GM !== 'undefined' && typeof GM.xmlHttpRequest === 'function'));
+          if (preferGmXhr) {
+            if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
+            const rawResp = await callViaGmXhr(nonStreamConfig, signal, settings);
+            try {
+              const parsed = JSON.parse(rawResp);
+              const fullText = extractDelta(settings.protocol, parsed);
+              for (const l of String(fullText || '').split('\\n')) handleLine(l);
+            } catch (_) {
+              for (const l of String(rawResp || '').split('\\n')) handleLine(l);
+            }
+            succeeded = true;
+            lastAttemptErr = null;
+            break;
+          }
+
           const response = await fetch(reqConfig.url, {
             method: 'POST',
             headers: reqConfig.headers,
@@ -1226,7 +1245,11 @@ function buildUserscript(version) {
             tErr.errorCode = 'TIMEOUT';
             tErr.retryable = true;
             attemptErr = tErr;
-          } else if (!err?.isHttpError && err?.name !== 'AbortError') {
+          } else if (
+            !globalThis.__NATIVEREAD_PREFER_GM_XHR__ &&
+            !err?.isHttpError &&
+            err?.name !== 'AbortError'
+          ) {
             // Transport / CSP connect-src error ONLY: fall back to GM_xmlhttpRequest!
             try {
               const rawResp = await callViaGmXhr(nonStreamConfig, signal, settings);
@@ -2038,6 +2061,36 @@ function buildUserscript(version) {
       }
     };
 
+    globalThis.__NATIVEREAD_TRANSLATE_NOW__ = () => {
+      if (state.isPageActive) {
+        revertPageTranslation();
+      }
+      startPageTranslation();
+    };
+    globalThis.__NATIVEREAD_SET_MODE__ = (mode) => {
+      const normalized = mode === 'bilingual' || mode === 'original' ? mode : 'replace';
+      setDisplayMode(normalized);
+    };
+    globalThis.__NATIVEREAD_RELOAD_SETTINGS__ = async () => {
+      await initStoredSettings();
+      state.settings = readStoredSettings();
+      updatePillStatus();
+      return {
+        hasKey: Boolean(sanitizeApiKey(state.settings?.apiKey)) || isLocalEndpoint(state.settings?.baseUrl || ''),
+        mode: state.settings?.displayMode || 'replace',
+        targetLang: state.settings?.targetLang || 'zh-TW'
+      };
+    };
+    globalThis.__NATIVEREAD_GET_STATE__ = () => ({
+      isPageActive: Boolean(state.isPageActive),
+      isTranslating: Boolean(state.isTranslating),
+      totalTranslated: Number(state.totalTranslated || 0),
+      totalDetected: Number(state.totalDetected || 0),
+      mode: state.settings?.displayMode || 'replace',
+      hasKey: Boolean(sanitizeApiKey(state.settings?.apiKey)) || isLocalEndpoint(state.settings?.baseUrl || ''),
+      lastErrorMsg: String(state.lastErrorMsg || '')
+    });
+
     modeReplaceBtn.addEventListener('click', () => setDisplayMode('replace'));
     modeBilingualBtn.addEventListener('click', () => setDisplayMode('bilingual'));
     modeOrigBtn.addEventListener('click', () => setDisplayMode('original'));
@@ -2216,7 +2269,7 @@ function buildUserscript(version) {
         })();
       });
     }
-    if (isHostWhitelisted(location.hostname, state.settings)) {
+    if (globalThis.__NATIVEREAD_AUTO_START__ === true || isHostWhitelisted(location.hostname, state.settings)) {
       startPageTranslation();
     }
   }
@@ -2301,6 +2354,55 @@ function writePwaProviders() {
   console.log(`[build-mobile] Generated ${outPath} (${Object.keys(presets).length} providers)`);
 }
 
+function syncNativeMobileAssets() {
+  const androidAssetsDir = path.join(ROOT, 'mobile', 'android', 'app', 'src', 'main', 'assets');
+  if (fs.existsSync(path.join(ROOT, 'mobile', 'android', 'app', 'src', 'main'))) {
+    ensureDir(androidAssetsDir);
+    fs.copyFileSync(
+      path.join(DOCS_DIR, 'nativeread.user.js'),
+      path.join(androidAssetsDir, 'nativeread.user.js')
+    );
+    const pwaDest = path.join(androidAssetsDir, 'pwa');
+    ensureDir(pwaDest);
+    for (const file of ['index.html', 'app.js', 'app.css', 'providers.js', 'pdf-layout.mjs', 'manifest.webmanifest']) {
+      const src = path.join(DOCS_DIR, file);
+      if (fs.existsSync(src)) {
+        fs.copyFileSync(src, path.join(pwaDest, file));
+      }
+    }
+    copyDirectory(path.join(DOCS_DIR, 'icons'), path.join(pwaDest, 'icons'));
+    copyDirectory(path.join(DOCS_DIR, 'vendor', 'pdfjs'), path.join(pwaDest, 'vendor', 'pdfjs'));
+    console.log(`[build-mobile] Synced Android native assets -> ${androidAssetsDir}`);
+  }
+
+  const appleExtRes = path.join(ROOT, 'mobile', 'apple', 'NativeRead', 'Shared (Extension)', 'Resources');
+  if (fs.existsSync(appleExtRes)) {
+    const extManifest = JSON.parse(readUtf8('manifest.json'));
+    delete extManifest.minimum_chrome_version;
+    fs.writeFileSync(
+      path.join(appleExtRes, 'manifest.json'),
+      JSON.stringify(extManifest, null, 2) + '\n',
+      'utf8'
+    );
+    for (const dir of ['shared', 'background', 'content', 'popup', 'options', 'viewer', 'vendor', 'icons']) {
+      const srcDir = path.join(ROOT, dir);
+      if (fs.existsSync(srcDir)) {
+        copyDirectory(srcDir, path.join(appleExtRes, dir));
+      }
+    }
+    console.log(`[build-mobile] Synced Safari Web Extension resources -> ${appleExtRes}`);
+  }
+
+  const appleAppRes = path.join(ROOT, 'mobile', 'apple', 'NativeRead', 'Shared (App)', 'Resources');
+  if (fs.existsSync(appleAppRes)) {
+    fs.copyFileSync(
+      path.join(DOCS_DIR, 'nativeread.user.js'),
+      path.join(appleAppRes, 'nativeread.user.js')
+    );
+    console.log(`[build-mobile] Synced Apple host app userscript -> ${appleAppRes}`);
+  }
+}
+
 function main() {
   const version = readReleaseVersion();
   console.log(`[build-mobile] Release version ${version}`);
@@ -2329,6 +2431,9 @@ function main() {
 
   // 6. Write docs/version.json
   writeVersionJson(version);
+
+  // 7. Sync native mobile app assets when mobile/ workspaces are present
+  syncNativeMobileAssets();
 }
 
 main();

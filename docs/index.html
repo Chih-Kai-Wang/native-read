@@ -28,7 +28,7 @@
       <img src="./icons/icon-48.png" alt="NativeRead" width="28" height="28" class="nr-brand-logo">
       <div class="nr-brand-titles">
         <span class="nr-brand-title">NativeRead</span>
-        <span class="nr-brand-tag">v2.8.5 Mobile &amp; PWA</span>
+        <span class="nr-brand-tag">v2.9.0 Mobile &amp; PWA</span>
       </div>
     </div>
 
@@ -226,12 +226,27 @@
           <h3 id="installSyncStatusTitle" class="nr-install-title">等待同步電腦端 API 金鑰與模型</h3>
         </div>
         <p id="installSyncStatusDesc" class="nr-card-desc">
-          安裝下方瀏覽器外掛或擴充包後，請回到本頁點擊「立即同步設定」，外掛即可自動帶入金鑰與模型，無需重複手動填寫。
+          安裝下方原生 App 或瀏覽器外掛後，即可直接共享或同步電腦端 API 金鑰與模型，無需重複手動填寫。
         </p>
         <div class="nr-install-actions">
           <button id="btnInstallApplySync" type="button" class="nr-primary-btn">🔄 我已裝好外掛，立即同步設定</button>
           <button id="btnInstallCopySync" type="button" class="nr-secondary-btn">📋 複製同步連結（跨瀏覽器／主畫面用）</button>
         </div>
+      </div>
+
+      <!-- Native 1-Tap Apps Card (iOS/macOS Xcode + Android Native APK) -->
+      <div id="cardNativeApps" class="nr-card nr-install-card" data-browser-card="native">
+        <div class="nr-install-header">
+          <span class="nr-install-badge">推薦 · 免裝任何第三方外掛</span>
+          <h3 class="nr-install-title">原生 App（iOS / Safari · Android APK）一鍵安裝即用</h3>
+        </div>
+        <p class="nr-card-desc">
+          電腦已有 Xcode 或 Android Studio／CLI 時，可直接安裝官方原生 App，徹底省去 Userscripts、Stay、捷徑或第三方瀏覽器流程：
+        </p>
+        <ul class="nr-guide-list">
+          <li><strong>iOS / macOS（Xcode 原生 App + Safari 延伸功能）</strong>：開啟 <code>mobile/apple/NativeRead/NativeRead.xcodeproj</code> 連接 iPhone 執行，即內建 <strong>Safari 原生延伸功能</strong>、<strong>App 內建 QR Code 掃描同步</strong> 與 <strong>原版網頁一鍵直譯瀏覽器</strong>。</li>
+          <li><strong>Android（原生 Compose APK）</strong>：專案位於 <code>mobile/android/</code>；安裝 APK 後可直接在 Chrome／X 點 <strong>分享 → NativeRead</strong> 原位保留網頁排版自動翻譯，並內建離線 PDF 白皮書閱讀器。</li>
+        </ul>
       </div>
 
       <!-- Chrome Mobile Card (Android Chrome + iOS Chrome) -->

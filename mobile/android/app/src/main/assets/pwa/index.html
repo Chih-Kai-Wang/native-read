@@ -1,0 +1,518 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#0284c7" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0b1120" media="(prefers-color-scheme: dark)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="NativeRead">
+  <meta name="description" content="NativeRead — 保留原版 Serif / Sans 排版美感的 AI 串流 PDF 白皮書與網頁翻譯器（支援 iOS 與 Android）">
+  <title>NativeRead — 手機與全平台 AI 原版排版翻譯</title>
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="icon" type="image/png" sizes="48x48" href="./icons/icon-48.png">
+  <link rel="apple-touch-icon" href="./icons/icon-128.png">
+  <link rel="stylesheet" href="./app.css">
+</head>
+<body>
+  <!-- Sync / Toast Banner -->
+  <div id="syncBanner" class="nr-sync-banner" role="status" aria-live="polite" hidden>
+    <span id="syncBannerText" class="nr-sync-banner-text"></span>
+    <button id="syncBannerClose" type="button" class="nr-sync-banner-close" aria-label="關閉通知">✕</button>
+  </div>
+
+  <!-- Top App Bar -->
+  <header class="nr-app-header">
+    <div class="nr-header-brand">
+      <img src="./icons/icon-48.png" alt="NativeRead" width="28" height="28" class="nr-brand-logo">
+      <div class="nr-brand-titles">
+        <span class="nr-brand-title">NativeRead</span>
+        <span class="nr-brand-tag">v2.9.0 Mobile &amp; PWA</span>
+      </div>
+    </div>
+
+    <div class="nr-header-actions">
+      <button id="globalStatusBadge" type="button" class="nr-status-pill" data-state="idle">
+        <span class="nr-status-dot"></span>
+        <span id="globalStatusText" class="nr-status-label">就緒</span>
+      </button>
+      <select id="globalProviderSelect" class="nr-header-select nr-header-provider" aria-label="快速切換 AI 供應商" title="快速切換 AI 供應商"></select>
+      <select id="globalLangSelect" class="nr-header-select" aria-label="目標翻譯語言"></select>
+    </div>
+  </header>
+
+  <!-- Main Tab Views -->
+  <main class="nr-app-main">
+    <!-- First-Screen Quick Sync & Setup Card (shown until an active provider is ready) -->
+    <section id="quickSetupCard" class="nr-card nr-quick-setup-card" aria-label="快速匯入設定" hidden>
+      <div class="nr-sync-status-header">
+        <span class="nr-sync-status-badge">尚未匯入 API 設定</span>
+        <h2 class="nr-install-title">一秒匯入電腦端設定即可開始翻譯</h2>
+      </div>
+      <p id="quickSetupDesc" class="nr-card-desc">
+        請用手機掃描電腦端「📱 手機同步」QR Code，或直接從剪貼簿貼上同步連結；若已加入主畫面成為獨立 App，請再次匯入一次同步連結。
+      </p>
+      <div class="nr-input-row">
+        <input
+          id="quickSyncInput"
+          type="text"
+          class="nr-text-input"
+          placeholder="貼上電腦端同步連結（https://...#nr_sync=...）"
+          autocomplete="off"
+        >
+        <button id="quickSyncImportBtn" type="button" class="nr-primary-btn">一鍵匯入</button>
+      </div>
+      <div class="nr-install-actions">
+        <button id="quickSyncPasteBtn" type="button" class="nr-secondary-btn">📋 從剪貼簿匯入</button>
+        <button id="quickOpenSettingsBtn" type="button" class="nr-outline-btn">手動填寫 API 金鑰</button>
+      </div>
+      <p id="quickSyncStatus" class="nr-field-hint" role="status" hidden></p>
+    </section>
+
+    <!-- ==========================================================
+         TAB 1: 📄 PDF 白皮書翻譯 (Default Active Tab)
+         ========================================================== -->
+    <section id="tab-pdf" class="nr-tab-panel is-active" data-mode="overlay" aria-label="PDF 白皮書翻譯">
+      <!-- Sticky PDF Sub-Toolbar -->
+      <div class="nr-subtoolbar">
+        <div class="nr-segmented" id="pdfModeSegmented" role="tablist" aria-label="PDF 檢視模式">
+          <button type="button" class="nr-seg-btn is-active" data-mode="overlay" role="tab" aria-selected="true">原位譯文</button>
+          <button type="button" class="nr-seg-btn" data-mode="split" role="tab" aria-selected="false">上下對照</button>
+          <button type="button" class="nr-seg-btn" data-mode="original" role="tab" aria-selected="false">原版 PDF</button>
+        </div>
+
+        <div class="nr-pdf-tools">
+          <span id="pdfPageIndicator" class="nr-page-badge" hidden>1 / 1</span>
+          <div class="nr-zoom-bar">
+            <button id="pdfZoomOutBtn" type="button" class="nr-mini-btn" aria-label="縮小">−</button>
+            <button id="pdfZoomResetBtn" type="button" class="nr-zoom-pct">100%</button>
+            <button id="pdfZoomInBtn" type="button" class="nr-mini-btn" aria-label="放大">+</button>
+          </div>
+          <button id="pdfOpenFileTopBtn" type="button" class="nr-outline-btn">開啟 PDF</button>
+          <input id="pdfFileInput" type="file" accept="application/pdf,.pdf" hidden>
+        </div>
+      </div>
+
+      <!-- PDF Empty / Picker State -->
+      <div id="pdfEmptyState" class="nr-card nr-hero-card">
+        <div class="nr-pill-tag">Mobile PDF Native-Feel Reader</div>
+        <h1 class="nr-card-title">手機 PDF 白皮書與論文原位翻譯</h1>
+        <p class="nr-card-desc">
+          自動偵測雙欄學術排版與底色取樣，提供「原位覆蓋譯文」、「上下雙語卡片對照」與「點擊段落查看原文」三種無縫閱讀體驗。
+        </p>
+
+        <div class="nr-upload-zone" id="pdfDropZone">
+          <div class="nr-upload-icon">PDF</div>
+          <p class="nr-upload-title">從手機選擇 PDF 檔案，或貼上公開論文連結</p>
+          <button id="pdfEmptyOpenBtn" type="button" class="nr-primary-btn nr-btn-lg">
+            📂 選擇手機內的 PDF 檔案
+          </button>
+        </div>
+
+        <form id="pdfUrlForm" class="nr-input-row" autocomplete="off">
+          <input
+            id="pdfUrlInput"
+            type="url"
+            class="nr-text-input"
+            placeholder="貼上 arXiv / 公開 PDF 網址 (例如 https://arxiv.org/pdf/1706.03762.pdf)"
+          >
+          <button type="submit" class="nr-secondary-btn">載入網址</button>
+        </form>
+      </div>
+
+      <!-- PDF Loading State -->
+      <div id="pdfLoadingState" class="nr-card nr-center-card" hidden>
+        <div class="nr-spinner"></div>
+        <h2 id="pdfLoadingTitle" class="nr-card-subtitle">正在解析 PDF 文件...</h2>
+        <p id="pdfLoadingSub" class="nr-muted-text"></p>
+      </div>
+
+      <!-- PDF Error State -->
+      <div id="pdfErrorState" class="nr-card nr-center-card" hidden>
+        <div class="nr-error-circle">!</div>
+        <h2 id="pdfErrorTitle" class="nr-card-subtitle">無法載入 PDF</h2>
+        <p id="pdfErrorDetail" class="nr-card-desc"></p>
+        <div class="nr-btn-group">
+          <button id="pdfRetryUrlBtn" type="button" class="nr-secondary-btn" hidden>重試網址</button>
+          <button id="pdfOpenSourceBtn" type="button" class="nr-secondary-btn" hidden>在新分頁開啟 PDF</button>
+          <button id="pdfErrorOpenFileBtn" type="button" class="nr-primary-btn">改選本機 PDF 檔案</button>
+        </div>
+      </div>
+
+      <!-- PDF Pages Stream Container -->
+      <div id="pdfPagesContainer" class="nr-pdf-pages" hidden></div>
+    </section>
+
+    <!-- ==========================================================
+         TAB 2: 🌐 網頁／文章原版翻譯
+         ========================================================== -->
+    <section id="tab-web" class="nr-tab-panel" aria-label="網頁與文章原版翻譯" hidden>
+      <div class="nr-subtoolbar">
+        <div class="nr-segmented" id="webModeSegmented" role="tablist" aria-label="文章顯示模式">
+          <button type="button" class="nr-seg-btn is-active" data-webmode="replace">譯文</button>
+          <button type="button" class="nr-seg-btn" data-webmode="bilingual">雙語對照</button>
+          <button type="button" class="nr-seg-btn" data-webmode="original">原文</button>
+        </div>
+
+        <div class="nr-segmented" id="webFontSegmented" role="tablist" aria-label="文章字體風格">
+          <button type="button" class="nr-seg-btn is-active" data-webfont="serif">襯線 Serif</button>
+          <button type="button" class="nr-seg-btn" data-webfont="sans">無襯線 Sans</button>
+        </div>
+      </div>
+
+      <div class="nr-card">
+        <h2 class="nr-section-title">🌐 網頁網址或外文段落即時翻譯</h2>
+        <p class="nr-card-desc">
+          貼上任何外文新聞、技術文件、部落格網址（支援從手機瀏覽器「分享」至此 App），或直接貼上外文內容／Markdown，即可享受原版美感串流翻譯。
+        </p>
+
+        <form id="webUrlForm" class="nr-input-row" autocomplete="off">
+          <input
+            id="webUrlInput"
+            type="url"
+            class="nr-text-input"
+            placeholder="貼上網頁連結 (https://...)"
+          >
+          <button id="webFetchBtn" type="submit" class="nr-primary-btn">擷取並翻譯</button>
+        </form>
+
+        <details class="nr-paste-collapse" id="webPasteDetails">
+          <summary class="nr-paste-summary">✏️ 或直接貼上外文文章／Markdown 段落翻譯</summary>
+          <div class="nr-paste-box">
+            <textarea
+              id="webRawInput"
+              class="nr-textarea"
+              rows="5"
+              placeholder="在此貼上任何英文、日文、韓文或外文段落，保留程式碼與專有名詞..."
+            ></textarea>
+            <div class="nr-btn-row-end">
+              <button id="webClearRawBtn" type="button" class="nr-secondary-btn">清空</button>
+              <button id="webTranslateRawBtn" type="button" class="nr-primary-btn">立即串流翻譯</button>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <!-- Article Reader Output -->
+      <article id="webArticleCard" class="nr-card nr-article-reader" data-webmode="replace" data-webfont="serif" hidden>
+        <header class="nr-article-header">
+          <div class="nr-article-meta">
+            <span id="webArticleSource" class="nr-article-domain">Article</span>
+            <span id="webArticleProgress" class="nr-article-progress">準備中...</span>
+          </div>
+          <h1 id="webArticleTitle" class="nr-article-title"></h1>
+        </header>
+        <div id="webArticleBody" class="nr-article-body"></div>
+      </article>
+    </section>
+
+    <!-- ==========================================================
+         TAB 3: 📲 手機瀏覽器外掛安裝
+         ========================================================== -->
+    <section id="tab-install" class="nr-tab-panel" aria-label="手機瀏覽器外掛安裝" hidden>
+      <div class="nr-card">
+        <div class="nr-pill-tag">Mobile Browser Integration</div>
+        <h2 class="nr-card-title">在手機瀏覽器內直接啟用 NativeRead 懸浮球</h2>
+        <p class="nr-card-desc">
+          除了直接使用本 PWA 閱讀 PDF 與文章外，您也可以將 NativeRead 安裝進 iOS Safari 或 Android 瀏覽器，在任何網站右下角喚出 <strong>NR 原版排版翻譯懸浮膠囊</strong>！
+        </p>
+      </div>
+
+      <!-- Sync Readiness & Post-Install Bridge Card -->
+      <div id="installSyncStatusCard" class="nr-card nr-sync-status-card" data-ready="false">
+        <div class="nr-sync-status-header">
+          <span id="installSyncStatusBadge" class="nr-sync-status-badge">尚未偵測到設定</span>
+          <h3 id="installSyncStatusTitle" class="nr-install-title">等待同步電腦端 API 金鑰與模型</h3>
+        </div>
+        <p id="installSyncStatusDesc" class="nr-card-desc">
+          安裝下方原生 App 或瀏覽器外掛後，即可直接共享或同步電腦端 API 金鑰與模型，無需重複手動填寫。
+        </p>
+        <div class="nr-install-actions">
+          <button id="btnInstallApplySync" type="button" class="nr-primary-btn">🔄 我已裝好外掛，立即同步設定</button>
+          <button id="btnInstallCopySync" type="button" class="nr-secondary-btn">📋 複製同步連結（跨瀏覽器／主畫面用）</button>
+        </div>
+      </div>
+
+      <!-- Native 1-Tap Apps Card (iOS/macOS Xcode + Android Native APK) -->
+      <div id="cardNativeApps" class="nr-card nr-install-card" data-browser-card="native">
+        <div class="nr-install-header">
+          <span class="nr-install-badge">推薦 · 免裝任何第三方外掛</span>
+          <h3 class="nr-install-title">原生 App（iOS / Safari · Android APK）一鍵安裝即用</h3>
+        </div>
+        <p class="nr-card-desc">
+          電腦已有 Xcode 或 Android Studio／CLI 時，可直接安裝官方原生 App，徹底省去 Userscripts、Stay、捷徑或第三方瀏覽器流程：
+        </p>
+        <ul class="nr-guide-list">
+          <li><strong>iOS / macOS（Xcode 原生 App + Safari 延伸功能）</strong>：開啟 <code>mobile/apple/NativeRead/NativeRead.xcodeproj</code> 連接 iPhone 執行，即內建 <strong>Safari 原生延伸功能</strong>、<strong>App 內建 QR Code 掃描同步</strong> 與 <strong>原版網頁一鍵直譯瀏覽器</strong>。</li>
+          <li><strong>Android（原生 Compose APK）</strong>：專案位於 <code>mobile/android/</code>；安裝 APK 後可直接在 Chrome／X 點 <strong>分享 → NativeRead</strong> 原位保留網頁排版自動翻譯，並內建離線 PDF 白皮書閱讀器。</li>
+        </ul>
+      </div>
+
+      <!-- Chrome Mobile Card (Android Chrome + iOS Chrome) -->
+      <div id="cardChromeGuide" class="nr-card nr-install-card" data-browser-card="chrome">
+        <div class="nr-install-header">
+          <span class="nr-install-badge">Chrome 專用 · Android &amp; iOS</span>
+          <h3 class="nr-install-title">手機版 Chrome（Android / iOS）快速翻譯</h3>
+        </div>
+        <p class="nr-card-desc">
+          官方手機版 Chrome 本身不開放安裝 <code>.zip</code> 擴充包，請改用下方兩種方式在 Chrome 內免打字即時翻譯（或安裝本 PWA 使用系統分享）：
+        </p>
+        <ul class="nr-guide-list">
+          <li><strong>Android Chrome（最推薦 · 系統「分享」直譯）</strong>：將本頁安裝到手機主畫面後，在 Chrome 瀏覽任何外文網頁、arXiv／PDF 或選取外文段落，點右上角 <strong>分享 → NativeRead</strong> 即可直接開始翻譯。</li>
+          <li><strong>Android &amp; iOS Chrome 通用（地址列書籤秒譯）</strong>：複製下方「零攔截書籤」存成 Chrome 書籤並將書籤命名為 <strong><code>nr</code></strong>；瀏覽任何外文網站時點一下網址列輸入 <strong><code>nr</code></strong> → 點擊星號書籤建議，即可將該頁或論文直接送入 NativeRead 翻譯。</li>
+          <li><strong>Android 若需網頁右下角常駐懸浮球</strong>：可改用支援 Chrome 擴充包的 <strong>Edge、狐猴 (Lemur)、Kiwi 或 Quetta</strong> 下載下方擴充包。</li>
+        </ul>
+        <div class="nr-install-actions">
+          <button id="btnPwaInstall" type="button" class="nr-primary-btn" hidden>📲 安裝 NativeRead 到手機主畫面</button>
+          <p id="pwaInstallStatus" class="nr-field-hint nr-install-status-text" role="status" hidden></p>
+        </div>
+      </div>
+
+      <!-- Safari Card (iOS Safari Userscript + Shortcuts) -->
+      <div id="cardSafariGuide" class="nr-card nr-install-card" data-browser-card="safari">
+        <div class="nr-install-header">
+          <span class="nr-install-badge">iOS / iPadOS Safari 完整支援</span>
+          <h3 class="nr-install-title">Safari 原網頁懸浮球與「分享」一鍵翻譯</h3>
+        </div>
+        <p class="nr-card-desc">
+          iPhone 與 iPad 上的 Safari 同時支援原網頁內嵌翻譯與系統分享表單：
+        </p>
+        <ul class="nr-guide-list">
+          <li><strong>方案 A（最推薦 · 原網頁懸浮球即點即譯）</strong>：在 App Store 安裝免費開源的 <strong>Userscripts</strong>（或 <strong>Stay 2</strong>）→ 至手機「設定 → Safari → 延伸功能」開啟並設為允許「所有網站」→ 點下方「⚡ 安裝 Userscript」→ 回到本頁點「🔄 我已裝好外掛，立即同步設定」。</li>
+          <li><strong>方案 B（免裝 App · Apple 快捷指令分享翻譯，Safari 與 iOS Chrome 皆適用）</strong>：在「捷徑」App 新增捷徑，於「ⓘ」資訊內開啟「在分享表單中顯示」（接收 URL 與 Safari 網頁）→ 加入動作「URL」填入下方的捷徑前綴再接上「捷徑輸入」→ 加入「打開 URL」，之後按 <strong>分享 → NativeRead 翻譯</strong> 即可一鍵送譯。</li>
+          <li><strong>主畫面 App 同步提醒</strong>：若在 Safari 按「加入主畫面」，獨立 App 與 Safari 資料夾分開儲存，請先點上方「📋 複製同步連結」，打開主畫面 App 後點「從剪貼簿匯入」。</li>
+        </ul>
+        <div class="nr-install-actions">
+          <button id="btnCopyShortcutPrefix" type="button" class="nr-secondary-btn">📋 複製 iOS 捷徑網址前綴</button>
+        </div>
+      </div>
+
+      <!-- Card 1: Universal Userscript -->
+      <div class="nr-card nr-install-card">
+        <div class="nr-install-header">
+          <span class="nr-install-badge">推薦 · iOS Safari &amp; Android 擴充瀏覽器</span>
+          <h3 class="nr-install-title">1. 全平台 Userscript 腳本 (<code>nativeread.user.js</code>)</h3>
+        </div>
+        <p class="nr-card-desc">
+          預設零干擾，僅在網頁右下角顯示極簡 <strong>NR</strong> 標籤；點擊即可展開翻譯膠囊、切換「譯文／原文／雙語」與管理白名單。
+        </p>
+        <ul class="nr-guide-list">
+          <li><strong>iOS Safari</strong>：安裝免費開源的 <strong>Userscripts</strong> 或 <strong>Stay 2</strong> App → 點擊下方按鈕即可一鍵匯入腳本。</li>
+          <li><strong>Android</strong>：支援 <strong>Tampermonkey</strong>、<strong>狐猴瀏覽器 (Lemur)</strong>、<strong>Kiwi Browser</strong>、<strong>Firefox Nightly</strong>、<strong>Via 瀏覽器</strong>（官方手機 Chrome 請用上方 PWA／書籤）。</li>
+        </ul>
+        <div class="nr-install-actions">
+          <a href="./nativeread.user.js" class="nr-primary-btn nr-link-btn">⚡ 安裝 Userscript (.user.js)</a>
+        </div>
+      </div>
+
+      <!-- Card 2: Android Extension Zip -->
+      <div class="nr-card nr-install-card">
+        <div class="nr-install-header">
+          <span class="nr-install-badge">Android 完整擴充功能</span>
+          <h3 class="nr-install-title">2. Android 瀏覽器擴充功能包 (<code>.zip</code>)</h3>
+        </div>
+        <p class="nr-card-desc">
+          包含完整 Chrome MV3 擴充功能與內建 PDF.js 原位閱讀器，適合支援載入擴充功能 ZIP 的 Android 瀏覽器。
+        </p>
+        <ul class="nr-guide-list">
+          <li><strong>支援瀏覽器</strong>：<strong>狐猴瀏覽器 (Lemur Browser)</strong>、<strong>Kiwi Browser</strong>、<strong>Quetta</strong>、<strong>Edge Canary</strong>（官方手機 Chrome 無法載入擴充包）。</li>
+          <li><strong>安裝步驟</strong>：下載下方 ZIP 檔 → 打開瀏覽器的「擴充功能 (Extensions)」頁面 → 開啟「開發人員模式」→ 點選「載入已打包的 `.zip`」選擇該檔案即可。</li>
+        </ul>
+        <div class="nr-install-actions">
+          <a href="./nativeread-android-extension.zip" download="nativeread-android-extension.zip" class="nr-secondary-btn nr-link-btn">
+            📦 下載 Android 擴充功能安裝包 (.zip)
+          </a>
+        </div>
+      </div>
+
+      <!-- Card 3: Zero-CSP Jump Bookmarklet -->
+      <div class="nr-card nr-install-card">
+        <div class="nr-install-header">
+          <span class="nr-install-badge">Android Chrome · iOS Chrome · Safari 全支援</span>
+          <h3 class="nr-install-title">3. 零攔截跳轉書籤 (Zero-CSP Bookmarklet)</h3>
+        </div>
+        <p class="nr-card-desc">
+          不受網站 CSP 限制、也絕不會將 API Key 暴露給第三方網頁。將下方程式碼存成手機 Chrome 或 Safari 書籤（建議命名為 <strong><code>nr</code></strong>）；瀏覽外文或 arXiv 頁面時點書籤即可自動帶入並串流翻譯！手機 Chrome 請從網址列輸入書籤名稱 <code>nr</code> 並點擊星號建議觸發。
+        </p>
+        <pre id="bookmarkletCodeBox" class="nr-code-box"></pre>
+        <div class="nr-install-actions">
+          <button id="copyBookmarkletBtn" type="button" class="nr-secondary-btn">📋 複製書籤小工具程式碼</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==========================================================
+         TAB 4: ⚙ 模型與 API 設定
+         ========================================================== -->
+    <section id="tab-settings" class="nr-tab-panel" aria-label="模型與 API 設定" hidden>
+      <div class="nr-card">
+        <div class="nr-pill-tag">Zero-Typing Sync Ready</div>
+        <h2 class="nr-section-title">⚙ AI 模型與翻譯偏好設定</h2>
+        <p class="nr-card-desc">
+          支援從電腦版 NativeRead 點擊「📱 手機同步」掃描 QR Code 一秒免打字匯入設定。
+        </p>
+
+        <div id="pwaSyncBridgeBox" class="nr-sync-bridge-box">
+          <label for="pwaSyncImportInput" class="nr-label">快速同步橋接（支援 iOS 主畫面獨立 App / 跨瀏覽器轉移）</label>
+          <div class="nr-input-row">
+            <input
+              id="pwaSyncImportInput"
+              type="text"
+              class="nr-text-input"
+              placeholder="貼上電腦端同步連結（https://...#nr_sync=...）"
+              autocomplete="off"
+            >
+            <button id="pwaSyncImportBtn" type="button" class="nr-primary-btn">一鍵匯入</button>
+          </div>
+          <div class="nr-install-actions">
+            <button id="pwaSyncCopyBtn" type="button" class="nr-secondary-btn">📋 複製目前設定同步連結</button>
+          </div>
+          <p id="pwaSyncImportStatus" class="nr-field-hint" hidden></p>
+        </div>
+
+        <form id="settingsForm" class="nr-settings-form" autocomplete="off">
+          <div class="nr-field">
+            <label for="setProvider" class="nr-label">AI 服務商 (Provider Preset)</label>
+            <select id="setProvider" class="nr-select-full"></select>
+            <p id="setProviderHint" class="nr-field-hint"></p>
+          </div>
+
+          <div class="nr-field">
+            <label class="nr-label">已設定供應商（點擊切換，金鑰獨立保存）</label>
+            <div id="savedProvidersRow" class="nr-chip-row nr-provider-chip-row"></div>
+          </div>
+
+          <div class="nr-field">
+            <label for="setApiKey" class="nr-label">API Key 金鑰</label>
+            <div class="nr-input-row">
+              <input id="setApiKey" type="password" class="nr-text-input" placeholder="填入 API Key..." autocomplete="off">
+              <button id="toggleApiKeyVisBtn" type="button" class="nr-secondary-btn">顯示</button>
+            </div>
+          </div>
+
+          <div class="nr-field-grid">
+            <div class="nr-field">
+              <label for="setProtocol" class="nr-label">API 協定 (Protocol)</label>
+              <select id="setProtocol" class="nr-select-full">
+                <option value="openai">OpenAI 相容 (/v1/chat/completions)</option>
+                <option value="gemini">Google Gemini 原生</option>
+                <option value="anthropic">Anthropic Messages API</option>
+              </select>
+            </div>
+
+            <div class="nr-field">
+              <label for="setBaseUrl" class="nr-label">API Base URL</label>
+              <input id="setBaseUrl" type="url" class="nr-text-input" placeholder="https://...">
+            </div>
+          </div>
+
+          <div class="nr-field">
+            <label for="setModel" class="nr-label">模型名稱 (Model ID)</label>
+            <div class="nr-input-row">
+              <input id="setModel" type="text" list="modelSuggestions" class="nr-text-input" placeholder="例如 gemini-3.5-flash-lite 或 deepseek-chat">
+              <button id="fetchModelsBtn" type="button" class="nr-secondary-btn">取得清單</button>
+            </div>
+            <datalist id="modelSuggestions"></datalist>
+            <p id="modelListHint" class="nr-field-hint" hidden></p>
+            <div id="modelChipsRow" class="nr-chip-row"></div>
+          </div>
+
+          <div class="nr-field-grid">
+            <div class="nr-field">
+              <label for="setTargetLang" class="nr-label">預設目標語言</label>
+              <select id="setTargetLang" class="nr-select-full"></select>
+            </div>
+
+            <div class="nr-field" id="customLangField" hidden>
+              <label for="setCustomTargetLang" class="nr-label">自訂目標語言名稱</label>
+              <input id="setCustomTargetLang" type="text" class="nr-text-input" placeholder="例如 Bahasa Indonesia">
+            </div>
+
+            <div class="nr-field">
+              <label for="setThinkingEffort" class="nr-label">Gemini 思考深度 (Thinking Effort)</label>
+              <select id="setThinkingEffort" class="nr-select-full">
+                <option value="fastest">極速直出 (fastest · 0 思考延遲)</option>
+                <option value="balanced">均衡品質 (balanced · 輕量思考)</option>
+                <option value="deep">深度推理 (deep · 適合複雜學術長句)</option>
+              </select>
+            </div>
+
+            <div class="nr-field">
+              <label for="setTypographyMatch" class="nr-label">排版字體配對模式</label>
+              <select id="setTypographyMatch" class="nr-select-full">
+                <option value="native">原版氣質配對 (Serif 對映宋體/明體 · Sans 對映黑體)</option>
+                <option value="system">系統黑體優先 (全站統一俐落無襯線體)</option>
+                <option value="preserve">保留網站原始 CSS 字型</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="nr-field">
+            <label for="setFallbackProvider" class="nr-label">高負載自動備援供應商（503 / 過載時選用）</label>
+            <select id="setFallbackProvider" class="nr-select-full"></select>
+            <p class="nr-field-hint">僅當主供應商經退避重試仍發生 503／過載／連線逾時時自動切換（不涵蓋 401/403 金鑰錯誤），預設停用。</p>
+          </div>
+
+          <div class="nr-field">
+            <label for="setGlossary" class="nr-label">自訂術語表 (每行一條：<code>原文 -> 譯文</code>)</label>
+            <textarea id="setGlossary" class="nr-textarea" rows="4"></textarea>
+          </div>
+
+          <div class="nr-settings-actions">
+            <button id="saveSettingsBtn" type="submit" class="nr-primary-btn">💾 儲存設定</button>
+            <button id="testApiBtn" type="button" class="nr-secondary-btn">⚡ 測試 API 連線</button>
+            <button id="clearCacheBtn" type="button" class="nr-outline-btn">🧹 清除翻譯快取 (<span id="cacheCountLabel">0</span>)</button>
+          </div>
+
+          <div id="settingsTestResult" class="nr-test-box" hidden></div>
+        </form>
+      </div>
+    </section>
+  </main>
+
+  <!-- Original-vs-Translation Bottom Sheet / Popover for PDF paragraphs -->
+  <aside id="comparePopover" class="nr-compare-sheet" role="dialog" aria-label="原文與譯文對照" hidden>
+    <div class="nr-compare-header">
+      <span class="nr-compare-title">段落原文對照</span>
+      <div class="nr-compare-actions">
+        <button id="copyOrigBtn" type="button" class="nr-mini-action">複製原文</button>
+        <button id="copyTransBtn" type="button" class="nr-mini-action">複製譯文</button>
+        <button id="compareCloseBtn" type="button" class="nr-compare-close" aria-label="關閉">✕</button>
+      </div>
+    </div>
+    <div class="nr-compare-body">
+      <div class="nr-compare-block">
+        <div class="nr-compare-tag">ORIGINAL</div>
+        <p id="compareOrigText" class="nr-compare-orig"></p>
+      </div>
+      <div class="nr-compare-block">
+        <div class="nr-compare-tag">TRANSLATION</div>
+        <p id="compareTransText" class="nr-compare-trans"></p>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Mobile Bottom Navigation Bar -->
+  <nav class="nr-bottom-nav" aria-label="主導覽列">
+    <button type="button" class="nr-nav-tab is-active" data-tab="pdf">
+      <span class="nr-nav-icon">📄</span>
+      <span class="nr-nav-label">PDF 閱讀</span>
+    </button>
+    <button type="button" class="nr-nav-tab" data-tab="web">
+      <span class="nr-nav-icon">🌐</span>
+      <span class="nr-nav-label">網頁翻譯</span>
+    </button>
+    <button type="button" class="nr-nav-tab" data-tab="install">
+      <span class="nr-nav-icon">📲</span>
+      <span class="nr-nav-label">瀏覽器外掛</span>
+    </button>
+    <button type="button" class="nr-nav-tab" data-tab="settings">
+      <span class="nr-nav-icon">⚙</span>
+      <span class="nr-nav-label">模型設定</span>
+    </button>
+  </nav>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

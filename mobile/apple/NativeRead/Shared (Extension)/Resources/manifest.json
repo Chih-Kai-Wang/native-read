@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "NativeRead — 原版美感 AI 網頁與 PDF 翻譯",
+  "version": "2.9.0",
+  "description": "適用於所有網站與 PDF 文件的原版排版 AI 翻譯擴充功能：預設靜默按需啟動、SSE 串流逐段上屏、通用 DOM 遍歷與母語級字體配對，支援程式碼註解與 PDF 原位翻譯。",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "NativeRead — 原版美感 AI 翻譯",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "options_page": "options/options.html",
+  "background": {
+    "service_worker": "background/service-worker.js"
+  },
+  "permissions": [
+    "storage",
+    "tabs",
+    "scripting",
+    "contextMenus",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "https://*/*",
+    "http://*/*"
+  ],
+  "commands": {
+    "toggle-translate-page": {
+      "suggested_key": {
+        "default": "Alt+T",
+        "mac": "Alt+T"
+      },
+      "description": "立即翻譯 / 切換目前頁面"
+    }
+  }
+}

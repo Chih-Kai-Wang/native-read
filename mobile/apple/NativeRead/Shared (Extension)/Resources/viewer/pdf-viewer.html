@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NativeRead PDF · 原版排版 AI 翻譯閱讀器</title>
+  <link rel="icon" type="image/png" href="../icons/icon-48.png">
+  <link rel="stylesheet" href="pdf-viewer.css">
+</head>
+<body>
+  <header class="nr-toolbar" id="toolbar">
+    <div class="nr-toolbar-left">
+      <div class="nr-brand">
+        <img class="nr-brand-icon" src="../icons/icon-48.png" alt="" width="24" height="24">
+        <span class="nr-brand-name">NativeRead</span>
+      </div>
+      <span class="nr-divider" aria-hidden="true"></span>
+      <span class="nr-doc-title" id="docTitle" title="尚未載入 PDF">尚未載入 PDF</span>
+      <span class="nr-page-pill" id="pageIndicator" hidden>第 1 / 1 頁</span>
+    </div>
+
+    <div class="nr-toolbar-center">
+      <div class="nr-segmented" id="modeSegmented" role="tablist" aria-label="閱讀模式">
+        <button type="button" class="nr-seg-btn is-active" data-mode="overlay" role="tab" aria-selected="true" title="原位覆蓋譯文（快捷鍵 1）">原位譯文</button>
+        <button type="button" class="nr-seg-btn" data-mode="split" role="tab" aria-selected="false" title="左原版右譯文雙欄對照（快捷鍵 2）">雙欄對照</button>
+        <button type="button" class="nr-seg-btn" data-mode="original" role="tab" aria-selected="false" title="純原版 PDF（快捷鍵 3）">原版</button>
+      </div>
+
+      <label class="nr-provider-wrap" id="providerSelectWrap" aria-label="快速切換 AI 供應商" hidden>
+        <select id="providerSelect" class="nr-select nr-select-provider" title="快速切換 AI 供應商"></select>
+      </label>
+
+      <label class="nr-lang-wrap" aria-label="目標翻譯語言">
+        <select id="langSelect" class="nr-select"></select>
+      </label>
+
+      <div class="nr-zoom-group" aria-label="縮放控制">
+        <button type="button" id="zoomOutBtn" class="nr-icon-btn" title="縮小 (−)" aria-label="縮小">−</button>
+        <button type="button" id="zoomResetBtn" class="nr-zoom-val" title="重設為 100% 適配寬度 (0)">100%</button>
+        <button type="button" id="zoomInBtn" class="nr-icon-btn" title="放大 (+)" aria-label="放大">+</button>
+      </div>
+    </div>
+
+    <div class="nr-toolbar-right">
+      <div class="nr-status" id="statusBadge" data-state="idle" aria-live="polite">
+        <span class="nr-status-dot" aria-hidden="true"></span>
+        <span class="nr-status-text" id="statusText">就緒</span>
+        <button type="button" class="nr-status-action" id="statusActionBtn" hidden>前往設定</button>
+      </div>
+
+      <button type="button" id="openFileBtn" class="nr-action-btn" title="開啟本機 PDF 檔案" aria-label="開啟本機 PDF 檔案">
+        開啟 PDF
+      </button>
+      <input type="file" id="fileInput" accept="application/pdf,.pdf" hidden>
+
+      <button type="button" id="settingsBtn" class="nr-icon-btn" title="開啟翻譯設定" aria-label="開啟翻譯設定">⚙</button>
+    </div>
+  </header>
+
+  <main class="nr-main" id="viewerMain" data-mode="overlay">
+    <!-- Empty / Dropzone State -->
+    <section class="nr-state-card nr-empty-state" id="emptyState">
+      <h1 class="nr-empty-title">PDF 沉浸翻譯閱讀器</h1>
+      <p class="nr-empty-desc">
+        拖放或載入線上 PDF 網址，自動保留原版排版進行翻譯。
+      </p>
+
+      <div class="nr-drop-hint-box" id="dropHintBox">
+        <div class="nr-drop-icon" aria-hidden="true">PDF</div>
+        <p class="nr-drop-primary">將 PDF 檔案拖曳至此，或點選下方按鈕開啟</p>
+        <button type="button" class="nr-primary-btn" id="emptyOpenBtn">選擇本機 PDF 檔案</button>
+      </div>
+
+      <form class="nr-url-form" id="urlForm" novalidate>
+        <input
+          type="url"
+          id="urlInput"
+          class="nr-url-input"
+          placeholder="或貼上公開 PDF 網址（例如 https://arxiv.org/pdf/...）"
+          autocomplete="off"
+          spellcheck="false"
+        >
+        <button type="submit" class="nr-secondary-btn" id="urlLoadBtn">載入網址</button>
+      </form>
+    </section>
+
+    <!-- Loading State -->
+    <section class="nr-state-card nr-loading-state" id="loadingState" hidden>
+      <div class="nr-spinner" aria-hidden="true"></div>
+      <h2 class="nr-loading-title" id="loadingTitle">正在載入 PDF 文件...</h2>
+      <p class="nr-loading-sub" id="loadingSub"></p>
+    </section>
+
+    <!-- Error State -->
+    <section class="nr-state-card nr-error-state" id="errorState" hidden>
+      <div class="nr-error-icon" aria-hidden="true">!</div>
+      <h2 class="nr-error-title" id="errorTitle">無法載入此 PDF 文件</h2>
+      <p class="nr-error-detail" id="errorDetail"></p>
+      <div class="nr-error-actions">
+        <button type="button" class="nr-secondary-btn" id="retryUrlBtn" hidden>重試載入</button>
+        <button type="button" class="nr-secondary-btn" id="openSourceUrlBtn" hidden>前往原網頁開啟／登入</button>
+        <button type="button" class="nr-primary-btn" id="errorOpenFileBtn">開啟本機 PDF 檔案</button>
+      </div>
+    </section>
+
+    <!-- Pages Stage -->
+    <div class="nr-pages-container" id="pagesContainer" hidden></div>
+  </main>
+
+  <!-- Full-window Drag Overlay -->
+  <div class="nr-drag-overlay" id="dragOverlay" hidden>
+    <div class="nr-drag-box">
+      <div class="nr-drag-icon" aria-hidden="true">PDF</div>
+      <p class="nr-drag-title">放開滑鼠以開啟並翻譯 PDF</p>
+    </div>
+  </div>
+
+  <!-- Original-English Compare Popover -->
+  <div class="nr-compare-popover" id="comparePopover" role="dialog" aria-label="原文與譯文對照" hidden>
+    <div class="nr-compare-header">
+      <span class="nr-compare-tag">原文對照</span>
+      <div class="nr-compare-tools">
+        <button type="button" class="nr-compare-copy" id="copyOrigBtn" title="複製英文原文">複製原文</button>
+        <button type="button" class="nr-compare-copy" id="copyTransBtn" title="複製譯文">複製譯文</button>
+        <button type="button" class="nr-compare-close" id="compareCloseBtn" aria-label="關閉">×</button>
+      </div>
+    </div>
+    <div class="nr-compare-body">
+      <div class="nr-compare-section">
+        <div class="nr-compare-label">Original</div>
+        <p class="nr-compare-orig" id="compareOrigText"></p>
+      </div>
+      <div class="nr-compare-section">
+        <div class="nr-compare-label">譯文</div>
+        <p class="nr-compare-trans" id="compareTransText"></p>
+      </div>
+    </div>
+  </div>
+
+  <script src="../shared/config.js"></script>
+  <script type="module" src="pdf-viewer.js"></script>
+</body>
+</html>

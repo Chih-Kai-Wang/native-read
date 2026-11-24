@@ -9,7 +9,17 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, '..');
 
-function loadServiceWorker({ initialSettings = {}, fetchImpl, tabsById = {}, tabsList = null, executeScriptImpl } = {}) {
+function loadServiceWorker({
+  initialSettings = {},
+  fetchImpl,
+  tabsById = {},
+  tabsList = null,
+  executeScriptImpl,
+  omitContextMenus = false,
+  omitCommands = false,
+  openOptionsImpl = null,
+  sendNativeMessageImpl = null
+} = {}) {
   const configCode = fs.readFileSync(path.join(REPO_ROOT, 'shared/config.js'), 'utf8');
   const swCode = fs.readFileSync(path.join(REPO_ROOT, 'background/service-worker.js'), 'utf8');
   const store = { ...initialSettings };
@@ -52,6 +62,8 @@ function loadServiceWorker({ initialSettings = {}, fetchImpl, tabsById = {}, tab
         onStartup: noopEvent(),
         onConnect: { addListener(fn) { onConnectListeners.push(fn); } },
         onMessage: { addListener(fn) { onMessageListener = fn; } },
+        ...(openOptionsImpl ? { openOptionsPage: openOptionsImpl } : {}),
+        ...(sendNativeMessageImpl ? { sendNativeMessage: sendNativeMessageImpl } : {}),
         connect(connectInfo = {}) {
           const clientMsgListeners = [];
           const clientDiscListeners = [];
@@ -79,12 +91,16 @@ function loadServiceWorker({ initialSettings = {}, fetchImpl, tabsById = {}, tab
       extension: {
         isAllowedFileSchemeAccess(cb) { if (typeof cb === 'function') cb(fileSchemeAllowed); }
       },
-      contextMenus: {
-        create() {},
-        removeAll(cb) { if (typeof cb === 'function') cb(); },
-        onClicked: noopEvent()
-      },
-      commands: { onCommand: noopEvent() },
+      ...(omitContextMenus
+        ? {}
+        : {
+            contextMenus: {
+              create() {},
+              removeAll(cb) { if (typeof cb === 'function') cb(); },
+              onClicked: noopEvent()
+            }
+          }),
+      ...(omitCommands ? {} : { commands: { onCommand: noopEvent() } }),
       tabs: {
         onUpdated: noopEvent(),
         onRemoved: noopEvent(),
@@ -689,4 +705,52 @@ test('FETCH_PDF_VIA_BG_TAB falls back to wrapper detectedHref transfer when top 
   assert.equal(chunks.length, 1);
   assert.equal(Buffer.from(chunks[0].data, 'base64').toString('utf8'), '%PDF-1.7\nwrapper-ok\n');
   assert.equal(viewerMessages[viewerMessages.length - 1]?.type, 'PDF_END');
+});
+
+test('iOS Safari MV3 missing contextMenus/commands boots cleanly, syncs from Native Host, and falls back OPEN_OPTIONS to tab', async () => {
+  const nativeCalls = [];
+  const env = loadServiceWorker({
+    omitContextMenus: true,
+    omitCommands: true,
+    openOptionsImpl: async () => {
+      throw new Error('openOptionsPage unsupported on iOS Safari');
+    },
+    sendNativeMessageImpl: async (appId, msg) => {
+      nativeCalls.push({ appId, msg });
+      return {
+        ok: true,
+        settingsJson: JSON.stringify({
+          providerId: 'openai',
+          protocol: 'openai',
+          baseUrl: 'https://api.openai.com/v1',
+          apiKey: 'sk-safari-native-bridge-001',
+          model: 'gpt-4o-mini',
+          targetLang: 'zh-TW',
+          syncedAt: 1700000999000
+        })
+      };
+    }
+  });
+
+  // setupContextMenus must be a silent no-op when contextMenus API is absent
+  assert.doesNotThrow(() => env.context.setupContextMenus());
+
+  // SYNC_FROM_NATIVE_HOST pulls validated config from App Group host
+  const syncRes = await env.sendMessage({ type: 'SYNC_FROM_NATIVE_HOST' });
+  assert.equal(syncRes.ok, true);
+  assert.equal(syncRes.synced, true);
+  assert.equal(nativeCalls.length, 1);
+  assert.equal(nativeCalls[0].appId, 'com.chihkaiwang.nativeread');
+  assert.equal(env.store.kct_settings_v1.apiKey, 'sk-safari-native-bridge-001');
+  assert.equal(env.store.kct_settings_v1.model, 'gpt-4o-mini');
+
+  // Untrusted tab sender is blocked from invoking SYNC_FROM_NATIVE_HOST
+  const badSync = await env.sendMessage({ type: 'SYNC_FROM_NATIVE_HOST' }, { id: 'evil-other', tab: { id: 1 } });
+  assert.equal(badSync.ok, false);
+
+  // OPEN_OPTIONS falls back to tabs.create(options/options.html)
+  const optRes = await env.sendMessage({ type: 'OPEN_OPTIONS' });
+  assert.equal(optRes.ok, true);
+  assert.equal(env.createdTabs.length, 1);
+  assert.ok(env.createdTabs[0].url.endsWith('/options/options.html'));
 });

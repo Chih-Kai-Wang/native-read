@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>NativeRead</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header class="header">
+    <div class="brand">
+      <img src="../icons/icon-48.png" alt="Logo" width="24" height="24">
+      <div class="brand-text">
+        <h1>NativeRead</h1>
+        <p id="model-badge" class="sub">載入中...</p>
+      </div>
+    </div>
+  </header>
+
+  <div class="provider-bar" title="一鍵切換已設定的 AI 供應商（切換不遺失金鑰）">
+    <span class="provider-tag">AI</span>
+    <select id="provider-quick-select" class="provider-select" aria-label="快速切換 AI 供應商"></select>
+  </div>
+
+  <div id="site-bar" class="site-bar">
+    <div class="site-info">
+      <span id="site-dot" class="site-dot" aria-hidden="true"></span>
+      <span id="site-host" class="site-host" title="">讀取網址中...</span>
+    </div>
+    <label id="site-auto-label" class="site-auto-toggle" title="將此網站加入自動翻譯白名單">
+      <input type="checkbox" id="toggle-site-auto">
+      <span>自動翻譯此站</span>
+    </label>
+  </div>
+
+  <div id="api-alert" class="alert hidden">
+    <span>尚未設定 API Key，無法翻譯</span>
+    <button id="btn-go-config" class="link-btn" type="button">立即設定</button>
+  </div>
+
+  <div id="update-banner" class="update-banner hidden" role="status"></div>
+
+  <div id="error-banner" class="error-banner hidden" role="alert"></div>
+
+  <section class="actions">
+    <button id="btn-translate-now" class="btn primary" type="button">立即翻譯此頁面 (Alt+T)</button>
+    <div class="action-row">
+      <button id="btn-retranslate" class="btn secondary" type="button">強制重譯</button>
+      <button id="btn-clear-page" class="btn secondary" type="button">還原原文</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="row-label">目標語言</div>
+    <select id="lang-select" class="select-input" aria-label="目標語言"></select>
+    <input id="custom-lang-input" class="text-input hidden" type="text" placeholder="請輸入語言名稱，例如：Thai 或 粵語">
+
+    <div class="row-label">顯示模式</div>
+    <div class="segmented" id="mode-group" role="group" aria-label="顯示模式">
+      <button type="button" data-mode="replace">譯文</button>
+      <button type="button" data-mode="original">僅原文</button>
+      <button type="button" data-mode="bilingual">簡潔雙語</button>
+    </div>
+
+    <div class="row-label">翻譯範圍</div>
+    <div class="segmented scope-segmented" id="scope-group" role="group" aria-label="翻譯範圍">
+      <button type="button" data-scope="course">智慧主文</button>
+      <button type="button" data-scope="all">整頁文字</button>
+    </div>
+
+    <div class="toggles">
+      <label class="check-row">
+        <input type="checkbox" id="toggle-code-comments">
+        <span>翻譯程式碼註解</span>
+      </label>
+      <label class="check-row">
+        <input type="checkbox" id="toggle-selection">
+        <span>劃詞翻譯</span>
+      </label>
+      <label class="check-row">
+        <input type="checkbox" id="toggle-ball">
+        <span>顯示懸浮控制列</span>
+      </label>
+    </div>
+  </section>
+
+  <footer class="footer">
+    <span id="status-text" class="status" title="">待命 · Alt+T 翻譯</span>
+    <div class="footer-links">
+      <button id="btn-open-pdf" class="link-btn link-btn-muted" type="button" title="開啟本機或線上 PDF 原版翻譯閱讀器">PDF 閱讀器</button>
+      <span class="footer-sep" aria-hidden="true">·</span>
+      <button id="btn-open-options" class="link-btn" type="button">設定 ↗</button>
+    </div>
+  </footer>
+
+  <script src="../shared/config.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

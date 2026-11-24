@@ -24,12 +24,30 @@ let shortcutLabel = IS_MAC ? '⌥T' : 'Alt+T';
 
 async function loadShortcutLabel() {
   try {
+    if (typeof chrome?.commands?.getAll !== 'function') {
+      shortcutLabel = '';
+      return;
+    }
     const commands = await chrome.commands.getAll();
     const cmd = commands.find((c) => c.name === 'toggle-translate-page');
     if (cmd) shortcutLabel = String(cmd.shortcut || '').trim();
   } catch (_) {
     // keep the platform default
   }
+}
+
+async function openOptionsPageSafe() {
+  try {
+    if (typeof chrome?.runtime?.openOptionsPage === 'function') {
+      await openOptionsPageSafe();
+      return;
+    }
+  } catch (_) {}
+  try {
+    if (typeof chrome?.tabs?.create === 'function') {
+      await chrome.tabs.create({ url: chrome.runtime.getURL('options/options.html') });
+    }
+  } catch (_) {}
 }
 
 function idleStatusText() {
@@ -180,7 +198,7 @@ function renderErrorBanner(rawErrorMsg, settings, errorCode = '') {
           return;
         }
       }
-      void chrome.runtime.openOptionsPage();
+      void openOptionsPageSafe();
     });
     actionsEl.appendChild(manageBtn);
   }
@@ -650,6 +668,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     return initial;
   });
+  if (!settings?.apiKey && !isLocalEndpoint(settings?.baseUrl)) {
+    try {
+      const nativeSync = await chrome.runtime.sendMessage({ type: 'SYNC_FROM_NATIVE_HOST' });
+      if (nativeSync?.ok && nativeSync?.synced && nativeSync?.settings) {
+        settings = nativeSync.settings;
+      }
+    } catch (_) {}
+  }
   currentSettings = settings;
   renderUI(settings);
   updateActionButtonsForTab();
@@ -732,7 +758,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const val = e.target.value;
     if (val === '__manage__') {
       e.target.value = currentSettings?.providerId || 'gemini';
-      await chrome.runtime.openOptionsPage();
+      await openOptionsPageSafe();
       return;
     }
     await switchProviderFromPopup(val);

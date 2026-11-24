@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NativeRead — 原版美感 AI 網頁翻譯 (Mobile & Desktop)
 // @namespace    https://chih-kai-wang.github.io/native-read/
-// @version      2.8.5
+// @version      2.9.0
 // @description  保留原網站 Serif / Sans 排版氣質的 AI 串流網頁與程式碼註解翻譯器（支援 iOS Safari Stay / Userscripts 與 Android Tampermonkey / 狐猴 / Kiwi）
 // @author       Chih-Kai Wang
 // @homepageURL  https://github.com/Chih-Kai-Wang/native-read
@@ -6863,6 +6863,25 @@
         let retryAfterMs = 0;
 
         try {
+          const preferGmXhr =
+            Boolean(globalThis.__NATIVEREAD_PREFER_GM_XHR__) &&
+            (typeof GM_xmlhttpRequest === 'function' ||
+              (typeof GM !== 'undefined' && typeof GM.xmlHttpRequest === 'function'));
+          if (preferGmXhr) {
+            if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
+            const rawResp = await callViaGmXhr(nonStreamConfig, signal, settings);
+            try {
+              const parsed = JSON.parse(rawResp);
+              const fullText = extractDelta(settings.protocol, parsed);
+              for (const l of String(fullText || '').split('\n')) handleLine(l);
+            } catch (_) {
+              for (const l of String(rawResp || '').split('\n')) handleLine(l);
+            }
+            succeeded = true;
+            lastAttemptErr = null;
+            break;
+          }
+
           const response = await fetch(reqConfig.url, {
             method: 'POST',
             headers: reqConfig.headers,
@@ -6961,7 +6980,11 @@
             tErr.errorCode = 'TIMEOUT';
             tErr.retryable = true;
             attemptErr = tErr;
-          } else if (!err?.isHttpError && err?.name !== 'AbortError') {
+          } else if (
+            !globalThis.__NATIVEREAD_PREFER_GM_XHR__ &&
+            !err?.isHttpError &&
+            err?.name !== 'AbortError'
+          ) {
             // Transport / CSP connect-src error ONLY: fall back to GM_xmlhttpRequest!
             try {
               const rawResp = await callViaGmXhr(nonStreamConfig, signal, settings);
@@ -7773,6 +7796,36 @@
       }
     };
 
+    globalThis.__NATIVEREAD_TRANSLATE_NOW__ = () => {
+      if (state.isPageActive) {
+        revertPageTranslation();
+      }
+      startPageTranslation();
+    };
+    globalThis.__NATIVEREAD_SET_MODE__ = (mode) => {
+      const normalized = mode === 'bilingual' || mode === 'original' ? mode : 'replace';
+      setDisplayMode(normalized);
+    };
+    globalThis.__NATIVEREAD_RELOAD_SETTINGS__ = async () => {
+      await initStoredSettings();
+      state.settings = readStoredSettings();
+      updatePillStatus();
+      return {
+        hasKey: Boolean(sanitizeApiKey(state.settings?.apiKey)) || isLocalEndpoint(state.settings?.baseUrl || ''),
+        mode: state.settings?.displayMode || 'replace',
+        targetLang: state.settings?.targetLang || 'zh-TW'
+      };
+    };
+    globalThis.__NATIVEREAD_GET_STATE__ = () => ({
+      isPageActive: Boolean(state.isPageActive),
+      isTranslating: Boolean(state.isTranslating),
+      totalTranslated: Number(state.totalTranslated || 0),
+      totalDetected: Number(state.totalDetected || 0),
+      mode: state.settings?.displayMode || 'replace',
+      hasKey: Boolean(sanitizeApiKey(state.settings?.apiKey)) || isLocalEndpoint(state.settings?.baseUrl || ''),
+      lastErrorMsg: String(state.lastErrorMsg || '')
+    });
+
     modeReplaceBtn.addEventListener('click', () => setDisplayMode('replace'));
     modeBilingualBtn.addEventListener('click', () => setDisplayMode('bilingual'));
     modeOrigBtn.addEventListener('click', () => setDisplayMode('original'));
@@ -7951,7 +8004,7 @@
         })();
       });
     }
-    if (isHostWhitelisted(location.hostname, state.settings)) {
+    if (globalThis.__NATIVEREAD_AUTO_START__ === true || isHostWhitelisted(location.hostname, state.settings)) {
       startPageTranslation();
     }
   }

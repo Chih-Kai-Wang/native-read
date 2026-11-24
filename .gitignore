@@ -12,3 +12,11 @@ node_modules/
 tests/corpus/pages/
 tests/corpus/results/
 tests/corpus/.rev/
+mobile/android/.gradle/
+mobile/android/build/
+mobile/android/app/build/
+mobile/android/local.properties
+mobile/apple/NativeRead/build/
+DerivedData/
+*.xcuserdata/
+*.apk

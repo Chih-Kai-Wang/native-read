@@ -2,7 +2,7 @@
 
 [English](README.md) · **繁體中文** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · [Español](README.es.md) · [Français](README.fr.md) · [Deutsch](README.de.md)
 
-**NativeRead（v2.8.5）** 是一款 Manifest V3 瀏覽器擴充功能與行動版 PWA，可翻譯網頁、PDF、程式碼註解與嵌入式資訊圖表，同時完整保留原始頁面字體與排版。它預設保持靜默，僅在使用者主動觸發時透過自備的 LLM API 金鑰運作，並逐段串流輸出譯文，不中斷閱讀節奏。
+**NativeRead（v2.9.0）** 是一款整合 Manifest V3 瀏覽器擴充功能、iOS/macOS 原生 App ＋ Safari 延伸功能、Android 原生 APK 與行動版 PWA 的翻譯工具，可翻譯網頁、PDF、程式碼註解與嵌入式資訊圖表，同時完整保留原始頁面字體與排版。它預設保持靜默，僅在使用者主動觸發時透過自備的 LLM API 金鑰運作，並逐段串流輸出譯文，不中斷閱讀節奏。
 
 ---
 
@@ -17,7 +17,7 @@
 | **Google Drive PDF 頁內覆蓋** | 直接偵測 `.ndfHFb-c4YZDc-cYSp0e-DARUcf` 檢視層，合併同欄文字框、重建目錄導引點線，並從頁面點陣圖量測原生字形尺寸。 | 不必離開分頁，即可在 Google Drive 內直接翻譯多頁 PDF。 |
 | **按需圖片與資訊圖表覆蓋** | 嚴格採按需觸發，僅於右鍵點選（**NativeRead 翻譯圖片文字**）或懸停標籤（**譯圖**）且圖片尺寸 `>= 200x140` px 時執行；絕不自動掃描頁面圖片。 | 取樣背景與前景色原地替換文字區塊，同時保留 3D 圖解與插畫。 |
 | **程式碼註解與 Notebook 輸出** | 靜態 `<pre>` 區塊採非破壞性 CSS `attr()` 替換（支援 Pygments、Prism、Highlight.js、GitHub `.pl-c`），CodeMirror 6（`.cm-editor`）採唯讀覆蓋層，並為 Jupyter 輸出提供快速翻譯按鈕。 | 程式碼仍可編輯與執行；聚焦編輯器或切回原文模式時覆蓋層會自動隱藏。 |
-| **行動裝置與跨平台** | 隨附獨立行動版 PWA（`docs/`）、通用 Userscript（`docs/nativeread.user.js`）、Android 擴充功能 ZIP（`docs/nativeread-android-extension.zip`）與本地 QR Code `#nr_sync` 同步。 | 在 iOS Safari 與 Android 瀏覽器上享受完整翻譯流程，無須重複輸入 API 金鑰。 |
+| **行動裝置與原生 App（一鍵直譯）** | 內建 iOS/macOS Xcode 原生 App ＋ Safari 延伸功能（`mobile/apple/NativeRead/`）、Android Kotlin/Compose APK（`mobile/android/`）、行動版 PWA（`docs/`）、通用 Userscript 與 `#nr_sync` QR 同步。 | 無需再安裝 Userscripts／Stay／Kiwi 等第三方工具，手機點一下或從 Chrome／Safari 分享即可保留原版排版直接翻譯。 |
 
 ### 快速開始（桌面版擴充功能）
 
@@ -222,6 +222,9 @@ native-read/
 ├── popup/                        # 擴充功能彈出視窗、白名單切換、更新通知、PDF 閱讀器啟動鈕
 ├── options/                      # 設定頁、供應商／模型設定、術語表、本地 QR 同步、快取管理
 ├── icons/                        # 擴充功能圖示（16 / 48 / 128 px）
+├── mobile/
+│   ├── apple/NativeRead/         # Xcode iOS / macOS 原生 App ＋ Safari 延伸功能（內建相機 QR 同步與 App Group 共享）
+│   └── android/                  # Kotlin / Compose Android APK（系統分享直譯、原網頁注入橋接與離線 PDF 閱讀器）
 ├── scripts/
 │   └── build-mobile.js           # 同步版本號；產出 Userscript、meta.js、version.json、Android ZIP 與 PDF.js／圖示
 ├── docs/                         # GitHub Pages 行動版 PWA（index.html、app.js、app.css、sw.js、自動產生的 providers.js 與建置產物）
@@ -261,6 +264,10 @@ for f in shared/*.js background/*.js content/*.js popup/*.js options/*.js viewer
 `manifest.json` 中的 `"version"` 為版本號單一來源（`MAJOR.MINOR.PATCH`）。執行 `node scripts/build-mobile.js` 會驗證格式並自動寫入 Userscript 的 `@version`、`docs/sw.js` 的 `CACHE_NAME`（`nativeread-pwa-v<version>`），以及 `docs/index.html` 的 PWA 版本徽章。
 
 `docs/nativeread.user.js`、`docs/nativeread.meta.js`、`docs/version.json`、`docs/nativeread-android-extension.zip`、`docs/vendor/pdfjs/`、`docs/icons/` 與 `docs/.nojekyll` 皆由 `scripts/build-mobile.js` 自動產生——請編輯 `shared/`、`content/`、`viewer/` 與 `docs/app.js` 下的原始模組後再重新執行建置腳本。
+
+**手機原生 App 建置方式**：
+- **iOS / macOS（Xcode）**：打開 `mobile/apple/NativeRead/NativeRead.xcodeproj`，選擇你的開發者帳號後即可直接編譯安裝到 iPhone／iPad／Mac（無需再裝 Userscripts 或捷徑）。
+- **Android（APK）**：執行 `node scripts/build-mobile.js` 後，於 `mobile/android/` 執行 `./gradlew assembleDebug` 產出 `app/build/outputs/apk/debug/app-debug.apk`。
 
 **發佈流程（維護者）**：更新 `manifest.json` 的 `"version"` → 執行 `node scripts/build-mobile.js` → 提交並推送至遠端，GitHub Pages 即會提供最新的 PWA、Userscript、中繼檔、`version.json` 與 Android ZIP。
 

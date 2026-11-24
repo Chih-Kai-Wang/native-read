@@ -15,7 +15,8 @@ function runUserscriptInSandbox({
   initialLocalStorage = null,
   withGm = true,
   fetchImpl,
-  gmXhrImpl
+  gmXhrImpl,
+  globalsBeforeRun = null
 } = {}) {
   const usCode = fs.readFileSync(path.join(REPO_ROOT, 'docs/nativeread.user.js'), 'utf8');
   const parsedUrl = new URL(pageUrl);
@@ -286,6 +287,9 @@ function runUserscriptInSandbox({
   context.addEventListener = () => {};
   context.removeEventListener = () => {};
   context.document.defaultView = context;
+  if (globalsBeforeRun && typeof globalsBeforeRun === 'object') {
+    Object.assign(context, globalsBeforeRun);
+  }
 
   vm.runInNewContext(usCode, context, { filename: 'docs/nativeread.user.js' });
   return {
@@ -457,4 +461,56 @@ test('Userscript settings modal 1-tap #nr_sync paste import saves cleanly to GM 
   assert.equal(saved.apiKey, 'sk-modal-import-001');
   assert.equal(saved.model, 'gpt-4o-mini');
   assert.equal(env.getLocalStorageWrites(), 0, 'Zero writes to untrusted page localStorage on modal import');
+});
+
+test('Native WebView bridge hooks auto-start, prefer GM_xmlhttpRequest, switch modes, and never leak apiKey', async () => {
+  let fetchCalls = 0;
+  const seededSettings = JSON.stringify({
+    settingsSchemaVersion: 6,
+    providerId: 'openai',
+    protocol: 'openai',
+    baseUrl: 'https://api.openai.com/v1',
+    apiKey: 'sk-native-webview-secret-001',
+    model: 'gpt-4o-mini',
+    targetLang: 'zh-TW',
+    displayMode: 'replace'
+  });
+
+  const env = runUserscriptInSandbox({
+    pageUrl: 'https://example.org/research-article',
+    withGm: true,
+    initialGm: { kct_settings_v1: seededSettings },
+    globalsBeforeRun: {
+      __NATIVEREAD_PREFER_GM_XHR__: true,
+      __NATIVEREAD_AUTO_START__: true
+    },
+    fetchImpl: async () => {
+      fetchCalls += 1;
+      throw new Error('fetch should not be called when __NATIVEREAD_PREFER_GM_XHR__ is true');
+    },
+    gmXhrImpl: (opts) => {
+      opts.onload?.({
+        status: 200,
+        statusText: 'OK',
+        responseText: JSON.stringify({
+          choices: [{ message: { content: '{"i":0,"t":"原生瀏覽器橋接譯文"}\n' } }]
+        })
+      });
+    }
+  });
+
+  await new Promise((r) => setTimeout(r, 80));
+
+  assert.equal(fetchCalls, 0, '__NATIVEREAD_PREFER_GM_XHR__ bypasses page fetch cleanly');
+  assert.equal(env.getGmXhrCalls(), 1, '__NATIVEREAD_AUTO_START__ triggered GM_xmlhttpRequest translation automatically');
+  assert.equal(typeof env.context.__NATIVEREAD_TRANSLATE_NOW__, 'function');
+  assert.equal(typeof env.context.__NATIVEREAD_SET_MODE__, 'function');
+  assert.equal(typeof env.context.__NATIVEREAD_RELOAD_SETTINGS__, 'function');
+  assert.equal(typeof env.context.__NATIVEREAD_GET_STATE__, 'function');
+
+  env.context.__NATIVEREAD_SET_MODE__('bilingual');
+  const st = env.context.__NATIVEREAD_GET_STATE__();
+  assert.equal(st.mode, 'bilingual');
+  assert.equal(st.hasKey, true);
+  assert.equal('apiKey' in st, false, '__NATIVEREAD_GET_STATE__ must NEVER expose raw apiKey');
 });
