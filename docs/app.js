@@ -1356,7 +1356,7 @@ function buildStreamSystemPrompt(settings, title = '') {
     title ? `Document topic: ${String(title).slice(0, 120)}` : '',
     buildLanguageGuidance(lang),
     'Rules:',
-    '1. Keep atomic placeholders [[C0]] (code), [[M0]] (math/citations), [[L0]] (untranslatable link) verbatim; keep code identifiers, math formulas, variables, URLs, and standard abbreviations (MAE, RMSE, AUC, LLM, API, Transformer) intact.',
+    '1. Keep atomic placeholders [[C0]] (code), [[M0]] (math/citations), [[L0]] (untranslatable link) verbatim; paired tags [[A0]]…[[/A0]] (link) and [[S0]]…[[/S0]] (bold/italic) must each appear properly nested around the translated words corresponding to the original wrapped words—never rename, renumber, or remove them.',
     '2. Output STRICT NDJSON: exactly ONE JSON object per line in the format {"i":0,"t":"..."} matching every input index `i`, in order.',
     '3. NO markdown code fences (no ```), NO surrounding array [...], NO extra commentary.',
     '4. NEVER leave natural-language prose untranslated or echo the source text even if it starts with formulas or [[M0]] placeholders; ALWAYS translate all prose sentences into the target language.',
@@ -3396,20 +3396,195 @@ function resumePdfAfterProviderSwitch() {
 // ============================================================
 // 8. Web URL & Raw Article Reader (Tab 2)
 // ============================================================
+function sanitizeSafeHttpUrl(rawUrl) {
+  const s = String(rawUrl || '').trim();
+  if (!s) return '';
+  try {
+    const parsed = new URL(s);
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+      return parsed.toString();
+    }
+  } catch (_) {}
+  return '';
+}
+
+function stripMarkdownImages(line) {
+  return String(line || '')
+    .replace(/\[\s*!\[[^\]]*\]\([^)\n]*\)\s*\]\([^)\n]*\)/g, '')
+    .replace(/!\[[^\]]*\]\([^)\n]*\)/g, '');
+}
+
+function isNoiseReaderLine(rawTrimmed) {
+  const s = String(rawTrimmed || '').trim();
+  if (!s || /^[\s\u200B-\u200D\uFEFF]+$/.test(s)) return true;
+  if (/^[-*_=]{3,}$/.test(s)) return true;
+  if (/^\[?\s*skip\s+to\s+(?:main\s+)?content\s*\]?(?:\([^)\n]*\))?$/i.test(s)) return true;
+  if (/^(?:more_horiz|more_vert|menu|close|search|expand_more|expand_less|chevron_right|chevron_left|arrow_forward|arrow_back|keyboard_arrow_down|account_circle|notifications)$/i.test(s)) {
+    return true;
+  }
+  const links = s.match(/\[[^\]\n]*\]\([^)\n]*\)/g) || [];
+  if (links.length >= 2) {
+    const remainder = s.replace(/\[[^\]\n]*\]\([^)\n]*\)/g, '').replace(/[|/·•,;:\-—–\s]+/g, '');
+    if (!remainder) return true;
+  }
+  return false;
+}
+
+function extractMarkdownInlineTokens(rawText) {
+  const tokens = {};
+  let codeSeq = 0;
+  let linkSeq = 0;
+  let styleSeq = 0;
+
+  let out = String(rawText || '').replace(/`([^`\n]+)`/g, (_m, codeBody) => {
+    const id = `C${codeSeq++}`;
+    tokens[id] = { type: 'code', text: codeBody };
+    return `[[${id}]]`;
+  });
+
+  out = out.replace(/\[([^\]\n]+)\]\(([^)\n]+)\)/g, (_m, label, rawUrl) => {
+    const cleanLabel = String(label || '').trim();
+    if (!cleanLabel) return '';
+    const href = sanitizeSafeHttpUrl(rawUrl);
+    if (!href) return cleanLabel;
+    const id = `A${linkSeq++}`;
+    tokens[id] = { type: 'link', href };
+    return `[[${id}]]${cleanLabel}[[/${id}]]`;
+  });
+
+  out = out.replace(/\*\*([^*\n]+?)\*\*|__([^_\n]+?)__/g, (_m, g1, g2) => {
+    const inner = g1 !== undefined ? g1 : g2;
+    const id = `S${styleSeq++}`;
+    tokens[id] = { type: 'strong' };
+    return `[[${id}]]${inner}[[/${id}]]`;
+  });
+
+  out = out.replace(/(^|[\s(>])\*([^*\s\n][^*\n]*?)\*(?=$|[\s).,!?:;])/g, (_m, lead, inner) => {
+    const id = `S${styleSeq++}`;
+    tokens[id] = { type: 'em' };
+    return `${lead}[[${id}]]${inner}[[/${id}]]`;
+  });
+
+  return {
+    text: out.replace(/[ \t]+/g, ' ').trim(),
+    tokens
+  };
+}
+
+function normalizeInlineBracketTokens(str) {
+  return String(str || '')
+    .replace(/【【/g, '[[')
+    .replace(/】】/g, ']]')
+    .replace(/\[\[\s*(\/?)\s*([aAsScCmMlL])\s*(\d+)\s*\]\]/g, (_m, slash, letter, num) => {
+      return `[[${slash}${letter.toUpperCase()}${num}]]`;
+    });
+}
+
+function renderInlineTokensIntoElement(container, text, tokens = null) {
+  container.replaceChildren();
+  const normalized = normalizeInlineBracketTokens(text);
+  if (!normalized) return;
+
+  const stack = [{ tag: null, node: container }];
+  const tagRe = /\[\[(\/?)([ASC])(\d+)\]\]|\[\[(?:\/)?[ML]\d+\]\]/g;
+  let lastIdx = 0;
+  let match;
+
+  const appendText = (chunk) => {
+    if (!chunk) return;
+    stack[stack.length - 1].node.appendChild(document.createTextNode(chunk));
+  };
+
+  while ((match = tagRe.exec(normalized)) !== null) {
+    if (match.index > lastIdx) {
+      appendText(normalized.slice(lastIdx, match.index));
+    }
+    lastIdx = match.index + match[0].length;
+
+    const slash = match[1];
+    const kind = match[2];
+    const num = match[3];
+    if (!kind) continue;
+
+    const id = `${kind}${num}`;
+    if (slash) {
+      for (let i = stack.length - 1; i >= 1; i--) {
+        if (stack[i].tag === id) {
+          stack.length = i;
+          break;
+        }
+      }
+      continue;
+    }
+
+    const tok = tokens && tokens[id];
+    if (kind === 'C') {
+      const codeText = tok?.type === 'code' ? tok.text : '';
+      if (codeText) {
+        const codeEl = document.createElement('code');
+        codeEl.className = 'nr-web-inline-code';
+        codeEl.textContent = codeText;
+        stack[stack.length - 1].node.appendChild(codeEl);
+      }
+    } else if (kind === 'A') {
+      const href = tok?.type === 'link' ? sanitizeSafeHttpUrl(tok.href) : '';
+      if (href && stack.length <= 5) {
+        const a = document.createElement('a');
+        a.className = 'nr-web-link';
+        a.href = href;
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+        stack[stack.length - 1].node.appendChild(a);
+        stack.push({ tag: id, node: a });
+      }
+    } else if (kind === 'S') {
+      if (stack.length <= 5) {
+        const tag = tok?.type === 'em' ? 'em' : 'strong';
+        const el = document.createElement(tag);
+        stack[stack.length - 1].node.appendChild(el);
+        stack.push({ tag: id, node: el });
+      }
+    }
+  }
+
+  if (lastIdx < normalized.length) {
+    appendText(normalized.slice(lastIdx));
+  }
+}
+
 function parseMarkdownOrTextBlocks(rawText, fallbackTitle = '外文文章翻譯') {
   const lines = String(rawText || '').replace(/\r\n/g, '\n').split('\n');
   let title = fallbackTitle;
+  let titleTokens = null;
+  let hasExplicitTitle = false;
   const blocks = [];
+  const seenShortText = new Set();
+  let lastBlockKey = '';
   let inCode = false;
   let codeLines = [];
   let paraLines = [];
 
+  const pushSemanticBlock = (kind, rawBody) => {
+    const cleanBody = stripMarkdownImages(rawBody).replace(/\s+/g, ' ').trim();
+    if (!cleanBody || isNoiseReaderLine(cleanBody)) return;
+    const { text, tokens } = extractMarkdownInlineTokens(cleanBody);
+    const plainCheck = text.replace(/\[\[\/?[ASC]\d+\]\]/g, '').trim();
+    if (plainCheck.length < 2) return;
+    const key = hashText(`${kind}:${text}`);
+    if (key === lastBlockKey) return;
+    if (plainCheck.length < 60 && !/[.?!。？！]/.test(plainCheck)) {
+      if (seenShortText.has(key)) return;
+      seenShortText.add(key);
+    }
+    lastBlockKey = key;
+    blocks.push({ kind, text, tokens, key: hashText(text) });
+  };
+
   const flushPara = () => {
     if (paraLines.length === 0) return;
-    const joined = paraLines.join(' ').replace(/\s+/g, ' ').trim();
+    const joined = paraLines.join(' ');
     paraLines = [];
-    if (!joined) return;
-    blocks.push({ kind: 'p', text: joined, key: hashText(joined) });
+    pushSemanticBlock('p', joined);
   };
 
   for (const rawLine of lines) {
@@ -3433,31 +3608,63 @@ function parseMarkdownOrTextBlocks(rawText, fallbackTitle = '外文文章翻譯'
       flushPara();
       continue;
     }
-    if (/^Title:\s+/i.test(trimmed) && title === fallbackTitle) {
-      title = trimmed.replace(/^Title:\s+/i, '').trim();
-      continue;
-    }
-    if (/^(?:URL Source|Markdown Content|Published Time):/i.test(trimmed)) {
-      continue;
-    }
-    const hMatch = trimmed.match(/^(#{1,4})\s+(.*)$/);
-    if (hMatch) {
-      flushPara();
-      const hText = hMatch[2].trim();
-      if (hMatch[1].length === 1 && title === fallbackTitle) {
-        title = hText;
-      } else if (hText) {
-        blocks.push({ kind: 'heading', text: hText, key: hashText(hText) });
+    if (/^Title:\s+/i.test(trimmed) && !hasExplicitTitle) {
+      const rawTitle = stripMarkdownImages(trimmed.replace(/^Title:\s+/i, '')).trim();
+      if (rawTitle) {
+        const tokTitle = extractMarkdownInlineTokens(rawTitle);
+        title = tokTitle.text || rawTitle;
+        titleTokens = tokTitle.tokens;
+        hasExplicitTitle = true;
       }
       continue;
     }
-    paraLines.push(trimmed);
+    if (/^(?:URL Source|Final URL|Target URL|Markdown Content|Published Time|Warning):/i.test(trimmed)) {
+      continue;
+    }
+
+    const noImgLine = stripMarkdownImages(trimmed).trim();
+    if (!noImgLine || isNoiseReaderLine(noImgLine)) {
+      continue;
+    }
+
+    const hMatch = noImgLine.match(/^(#{1,4})\s+(.*)$/);
+    if (hMatch) {
+      flushPara();
+      const hRaw = hMatch[2].trim();
+      if (hMatch[1].length === 1 && !hasExplicitTitle) {
+        const tokTitle = extractMarkdownInlineTokens(hRaw);
+        if (tokTitle.text) {
+          title = tokTitle.text;
+          titleTokens = tokTitle.tokens;
+          hasExplicitTitle = true;
+        }
+      } else if (hRaw) {
+        pushSemanticBlock('heading', hRaw);
+      }
+      continue;
+    }
+
+    const qMatch = noImgLine.match(/^>\s*(.+)$/);
+    if (qMatch) {
+      flushPara();
+      pushSemanticBlock('quote', qMatch[1]);
+      continue;
+    }
+
+    const liMatch = noImgLine.match(/^(?:[-*•]|\d+[.)])\s+(.+)$/);
+    if (liMatch) {
+      flushPara();
+      pushSemanticBlock('li', liMatch[1]);
+      continue;
+    }
+
+    paraLines.push(noImgLine);
   }
   flushPara();
   if (codeLines.length > 0) {
     blocks.push({ kind: 'code', text: codeLines.join('\n') });
   }
-  return { title, blocks };
+  return { title, titleTokens, blocks };
 }
 
 const WEB_FETCH_TIMEOUT_MS = 15000;
@@ -3502,22 +3709,32 @@ async function fetchReadableArticleFromUrl(targetUrl, signal = null) {
     throw new Error('僅支援 http:// 或 https:// 網址');
   }
 
-  // 1. Try r.jina.ai clean reader first
-  try {
-    const jinaRes = await fetchWithTimeoutSignal(
-      `https://r.jina.ai/${targetUrl}`,
-      { headers: { Accept: 'text/plain' } },
-      WEB_FETCH_TIMEOUT_MS,
-      signal
-    );
-    if (jinaRes.ok) {
-      const txt = await jinaRes.text();
-      if (txt && txt.trim().length > 80) {
-        return parseMarkdownOrTextBlocks(txt, parsedUrl.hostname);
+  // 1. Try r.jina.ai clean reader first (chrome-free headers, then plain Accept fallback)
+  const jinaAttempts = [
+    {
+      Accept: 'text/plain',
+      'X-Retain-Images': 'none',
+      'X-Remove-Selector': 'header, footer, nav, aside, [role="navigation"], [role="banner"], [role="contentinfo"], .cookie-banner, #onetrust-banner-sdk'
+    },
+    { Accept: 'text/plain' }
+  ];
+  for (const jinaHeaders of jinaAttempts) {
+    try {
+      const jinaRes = await fetchWithTimeoutSignal(
+        `https://r.jina.ai/${targetUrl}`,
+        { headers: jinaHeaders },
+        WEB_FETCH_TIMEOUT_MS,
+        signal
+      );
+      if (jinaRes.ok) {
+        const txt = await jinaRes.text();
+        if (txt && txt.trim().length > 80) {
+          return parseMarkdownOrTextBlocks(txt, parsedUrl.hostname);
+        }
       }
+    } catch (err) {
+      if (signal?.aborted) throw err;
     }
-  } catch (err) {
-    if (signal?.aborted) throw err;
   }
 
   // 2. Fallback to AllOrigins HTML + DOMParser
@@ -3528,7 +3745,9 @@ async function fetchReadableArticleFromUrl(targetUrl, signal = null) {
   }
   const html = await htmlRes.text();
   const doc = new DOMParser().parseFromString(html, 'text/html');
-  const title = (doc.querySelector('h1')?.textContent || doc.title || parsedUrl.hostname).trim();
+  const rawTitle = (doc.querySelector('h1')?.textContent || doc.title || parsedUrl.hostname).trim();
+  const tokTitle = extractMarkdownInlineTokens(rawTitle);
+  const title = tokTitle.text || rawTitle;
   const root = doc.querySelector('article, main, [role="main"]') || doc.body;
   const blocks = [];
   const seenTexts = new Set();
@@ -3548,18 +3767,27 @@ async function fetchReadableArticleFromUrl(targetUrl, signal = null) {
     if (txt.length < 8 || seenTexts.has(txt)) continue;
     seenTexts.add(txt);
     const isH = /^H[1-4]$/.test(node.tagName);
+    const kind = isH
+      ? 'heading'
+      : node.tagName === 'LI'
+        ? 'li'
+        : node.tagName === 'BLOCKQUOTE'
+          ? 'quote'
+          : 'p';
+    const tokRes = extractMarkdownInlineTokens(txt);
     blocks.push({
-      kind: isH ? 'heading' : 'p',
-      text: txt,
-      key: hashText(txt)
+      kind,
+      text: tokRes.text,
+      tokens: tokRes.tokens,
+      key: hashText(tokRes.text)
     });
   }
 
-  return { title, blocks };
+  return { title, titleTokens: tokTitle.tokens, blocks };
 }
 
-async function renderAndStreamWebArticle({ title, sourceLabel, blocks }) {
-  state.currentWebArticle = { title, sourceLabel, blocks };
+async function renderAndStreamWebArticle({ title, titleTokens = null, sourceLabel, blocks }) {
+  state.currentWebArticle = { title, titleTokens, sourceLabel, blocks };
   if (state.webAbortController) {
     state.webAbortController.abort();
   }
@@ -3568,11 +3796,24 @@ async function renderAndStreamWebArticle({ title, sourceLabel, blocks }) {
 
   dom.webArticleCard.hidden = false;
   dom.webArticleSource.textContent = sourceLabel || 'Reader';
-  dom.webArticleTitle.textContent = title || '文章翻譯';
+  dom.webArticleTitle.replaceChildren();
+  const titleOrigSpan = document.createElement('span');
+  titleOrigSpan.className = 'nr-article-title-orig';
+  const titleTransSpan = document.createElement('span');
+  titleTransSpan.className = 'nr-article-title-trans';
+  const resolvedTitle = title || '文章翻譯';
+  renderInlineTokensIntoElement(titleOrigSpan, resolvedTitle, titleTokens);
+  renderInlineTokensIntoElement(titleTransSpan, resolvedTitle, titleTokens);
+  dom.webArticleTitle.append(titleOrigSpan, titleTransSpan);
   dom.webArticleBody.replaceChildren();
 
   const translatableItems = [];
   const transNodesByKey = new Map();
+  const titleKey = hashText(resolvedTitle);
+  if (title && shouldTranslatePdfText(resolvedTitle, state.settings.targetLang || 'zh-TW', { isHeading: true })) {
+    translatableItems.push({ key: titleKey, text: resolvedTitle });
+    transNodesByKey.set(titleKey, [{ node: titleTransSpan, tokens: titleTokens }]);
+  }
 
   for (const blk of blocks) {
     if (blk.kind === 'code') {
@@ -3583,16 +3824,24 @@ async function renderAndStreamWebArticle({ title, sourceLabel, blocks }) {
       continue;
     }
 
-    const wrap = document.createElement(blk.kind === 'heading' ? 'h2' : 'div');
-    wrap.className = `nr-web-block${blk.kind === 'heading' ? ' is-heading' : ''}`;
+    const wrapTag = blk.kind === 'heading' ? 'h2' : blk.kind === 'quote' ? 'blockquote' : 'div';
+    const kindClass = blk.kind === 'heading'
+      ? ' is-heading'
+      : blk.kind === 'li'
+        ? ' is-li'
+        : blk.kind === 'quote'
+          ? ' is-quote'
+          : '';
+    const wrap = document.createElement(wrapTag);
+    wrap.className = `nr-web-block${kindClass}`;
 
     const origSpan = document.createElement('div');
     origSpan.className = 'nr-web-orig';
-    origSpan.textContent = blk.text;
+    renderInlineTokensIntoElement(origSpan, blk.text, blk.tokens || null);
 
     const transSpan = document.createElement('div');
     transSpan.className = 'nr-web-trans';
-    transSpan.textContent = blk.text;
+    renderInlineTokensIntoElement(transSpan, blk.text, blk.tokens || null);
 
     wrap.append(origSpan, transSpan);
     dom.webArticleBody.appendChild(wrap);
@@ -3602,7 +3851,7 @@ async function renderAndStreamWebArticle({ title, sourceLabel, blocks }) {
         transNodesByKey.set(blk.key, []);
         translatableItems.push({ key: blk.key, text: blk.text });
       }
-      transNodesByKey.get(blk.key).push(transSpan);
+      transNodesByKey.get(blk.key).push({ node: transSpan, tokens: blk.tokens || null });
     }
   }
 
@@ -3617,8 +3866,8 @@ async function renderAndStreamWebArticle({ title, sourceLabel, blocks }) {
 
   const onItem = (key, zh) => {
     const targets = transNodesByKey.get(key) || [];
-    for (const node of targets) {
-      node.textContent = zh;
+    for (const target of targets) {
+      renderInlineTokensIntoElement(target.node, zh, target.tokens);
     }
     doneCount += 1;
     dom.webArticleProgress.textContent = doneCount >= translatableItems.length
@@ -4347,6 +4596,7 @@ function bindEvents() {
       const parsed = parseMarkdownOrTextBlocks(dom.webRawInput.value.trim(), '外文段落翻譯');
       renderAndStreamWebArticle({
         title: parsed.title,
+        titleTokens: parsed.titleTokens,
         sourceLabel: 'Mobile Share',
         blocks: parsed.blocks
       });
@@ -4431,6 +4681,7 @@ function bindEvents() {
       if (fetchCtrl.signal.aborted || state.webFetchController !== fetchCtrl) return;
       await renderAndStreamWebArticle({
         title: parsed.title,
+        titleTokens: parsed.titleTokens,
         sourceLabel: new URL(url).hostname,
         blocks: parsed.blocks
       });
@@ -4456,6 +4707,7 @@ function bindEvents() {
     const parsed = parseMarkdownOrTextBlocks(raw, '自訂外文段落翻譯');
     renderAndStreamWebArticle({
       title: parsed.title,
+      titleTokens: parsed.titleTokens,
       sourceLabel: 'Direct Paste',
       blocks: parsed.blocks
     });
@@ -4819,6 +5071,7 @@ async function init() {
       const parsed = parseMarkdownOrTextBlocks(sharedText, params.get('title')?.trim() || '系統分享段落翻譯');
       renderAndStreamWebArticle({
         title: parsed.title,
+        titleTokens: parsed.titleTokens,
         sourceLabel: 'Mobile Share',
         blocks: parsed.blocks
       });

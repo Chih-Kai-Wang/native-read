@@ -238,3 +238,121 @@ test('docs/index.html & docs/app.js support quick setup, Chrome/Safari workflows
     'desktop'
   );
 });
+
+test('docs/app.js parses Kaggle-like Jina Markdown cleanly and renders safe inline tokens without raw brackets or URLs', () => {
+  const appJs = fs.readFileSync(path.join(REPO_ROOT, 'docs/app.js'), 'utf8');
+  const parserMatch = appJs.match(
+    /function sanitizeSafeHttpUrl[\s\S]*?function parseMarkdownOrTextBlocks[\s\S]*?\n\}/
+  );
+  assert.ok(parserMatch, 'Could not extract web Markdown parser helpers from docs/app.js');
+
+  const makeNode = (tag) => {
+    const node = {
+      tagName: tag.toUpperCase(),
+      childNodes: [],
+      className: '',
+      href: '',
+      target: '',
+      rel: '',
+      _text: '',
+      appendChild(child) {
+        this.childNodes.push(child);
+        return child;
+      },
+      replaceChildren(...nodes) {
+        this.childNodes = [...nodes];
+      },
+      set textContent(v) {
+        this.childNodes = [{ nodeType: 3, textContent: String(v) }];
+      },
+      get textContent() {
+        return this.childNodes.map((c) => c.textContent).join('');
+      }
+    };
+    return node;
+  };
+
+  const ctx = {
+    URL,
+    hashText: (s) => `h_${s.length}`,
+    document: {
+      createElement: (tag) => makeNode(tag),
+      createTextNode: (txt) => ({ nodeType: 3, textContent: String(txt) })
+    }
+  };
+  vm.runInNewContext(parserMatch[0], ctx);
+
+  const sampleJina = [
+    'Title: Kaggle: The World’s AI Proving Ground',
+    '',
+    'Final URL: https://www.kaggle.com/',
+    '',
+    'Markdown Content:',
+    '[Skip to content](https://www.kaggle.com/#site-content)',
+    '',
+    '[![Image 5](https://www.kaggle.com/static/images/new-site-logo-light.svg)](https://www.kaggle.com/)',
+    '',
+    '[Competitions](https://www.kaggle.com/competitions)[Benchmarks](https://www.kaggle.com/benchmarks)[Arenas](https://www.kaggle.com/arenas)',
+    '',
+    'more_horiz',
+    '',
+    '## Evaluating what works at AI’s frontier',
+    '',
+    'Crowdsourced **benchmarks** and `Python` notebooks.',
+    '',
+    '### [Models](https://www.kaggle.com/models)',
+    '',
+    '* Explore over 54K models with [Docs](https://www.kaggle.com/docs)',
+    '> Built for the **ML** community'
+  ].join('\n');
+
+  const parsed = ctx.parseMarkdownOrTextBlocks(sampleJina, 'kaggle.com');
+  assert.equal(parsed.title, 'Kaggle: The World’s AI Proving Ground');
+  assert.ok(parsed.blocks.length >= 5);
+
+  const serializedAll = JSON.stringify(parsed.blocks);
+  assert.equal(serializedAll.includes('Final URL'), false);
+  assert.equal(serializedAll.includes('Image 5'), false);
+  assert.equal(serializedAll.includes('Skip to content'), false);
+  assert.equal(serializedAll.includes('more_horiz'), false);
+  assert.equal(serializedAll.includes('Competitions'), false);
+
+  const paraBlk = parsed.blocks.find((b) => b.kind === 'p');
+  assert.ok(paraBlk);
+  assert.equal(paraBlk.text, 'Crowdsourced [[S0]]benchmarks[[/S0]] and [[C0]] notebooks.');
+  assert.deepEqual({ ...paraBlk.tokens.C0 }, { type: 'code', text: 'Python' });
+
+  const headingLinkBlk = parsed.blocks.find((b) => b.kind === 'heading' && b.text.includes('Models'));
+  assert.ok(headingLinkBlk);
+  assert.equal(headingLinkBlk.tokens.A0?.href, 'https://www.kaggle.com/models');
+
+  const liBlk = parsed.blocks.find((b) => b.kind === 'li');
+  assert.ok(liBlk);
+  assert.equal(liBlk.tokens.A0?.href, 'https://www.kaggle.com/docs');
+
+  const quoteBlk = parsed.blocks.find((b) => b.kind === 'quote');
+  assert.ok(quoteBlk);
+
+  // Render translated output into DOM container & verify safety
+  const container = makeNode('div');
+  ctx.renderInlineTokensIntoElement(
+    container,
+    '探索超過 54K 個模型與 【【a0】】文件[[/a0]][[A9]]幽靈[[/A9]]',
+    liBlk.tokens
+  );
+  const renderedLinks = container.childNodes.filter((n) => n.tagName === 'A');
+  assert.equal(renderedLinks.length, 1);
+  assert.equal(renderedLinks[0].href, 'https://www.kaggle.com/docs');
+  assert.equal(renderedLinks[0].textContent, '文件');
+  assert.equal(container.textContent, '探索超過 54K 個模型與 文件幽靈');
+
+  // Unsafe non-HTTP URL in token metadata must never emit <a href="javascript:...">
+  const unsafeContainer = makeNode('div');
+  ctx.renderInlineTokensIntoElement(
+    unsafeContainer,
+    '點擊 [[A0]]惡意連結[[/A0]]',
+    { A0: { type: 'link', href: 'javascript:alert(1)' } }
+  );
+  assert.equal(unsafeContainer.childNodes.filter((n) => n.tagName === 'A').length, 0);
+  assert.equal(unsafeContainer.textContent, '點擊 惡意連結');
+});
